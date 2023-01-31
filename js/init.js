@@ -59,7 +59,9 @@ function init(canvas) {
 		// controls
 		controls = new THREE.TrackballControls( camera, renderer.domElement );
 		controls.dynamicDampingFactor = params.friction;
-	 	controls.zoomSpeed = params.zoomSpeed;
+		controls.zoomSpeed = params.zoomSpeed;
+		controls.panSpeed = params.panSpeed;
+		controls.rotateSpeed = params.rotateSpeed;
 
 		//stereo
 		effect = new THREE.StereoEffect( renderer );
@@ -102,9 +104,10 @@ function defineParams(){
 		this.timeYr = minTime;
 		this.maxTime = maxTime;
 		this.minTime = minTime;
-		this.timeStepUnit = 0.;
-		this.timeStepFac = 1.;
+		this.timeStepUnit = 1.;
+		this.timeStepFac = (1.).toFixed(4);
 		this.timeStep = parseFloat(this.timeStepUnit)*parseFloat(this.timeStepFac);
+		this.play = false;
 
 		this.lineAlpha = 1.;
 		this.lineWidth = 0.001;
@@ -116,6 +119,8 @@ function defineParams(){
 		this.stereo = false;
 		this.friction = 0.2;
 		this.zoomSpeed = 1.;
+		this.rotateSpeed = 1.;
+		this.panSpeed = 0.3;
 		this.stereoSep = 0.064;
 		this.filename = "test.png";
 		this.captureWidth = 1024;
@@ -195,7 +200,7 @@ function defineParams(){
 	    }
 
 	    this.updateTime = function() {
-	    	if (params.timeStep > 0 && params.timeYr < params.maxTime){
+	    	if (params.play && params.timeStep > 0 && params.timeYr < params.maxTime){
 	    		params.timeYr += params.timeStep;
 
 	    		params.redraw();
@@ -232,6 +237,16 @@ function defineParams(){
 			controls.update();
         }
 
+        this.updateRotate = function() {
+			controls.rotateSpeed = params.rotateSpeed;
+			controls.update();
+        }
+
+        this.updatePan = function() {
+			controls.panSpeed = params.panSpeed;
+			controls.update();
+        }
+
         this.updateStereo = function() {
             if (params.stereo){
                 effect.setEyeSeparation(params.stereoSep);
@@ -251,8 +266,9 @@ function defineParams(){
 
 		var timeGUI = gui.addFolder('Time controls');
 		timeGUI.add( params, 'timeYr', params.minTime, params.maxTime).listen().onChange(params.redraw);
-		timeGUI.add( params, 'timeStepUnit', { "None": 0,  "Year": 1, "Million Years": 1e6, } ).onChange(params.updateTimeStep);
-		timeGUI.add( params, 'timeStepFac', 0, 1e4 ).onChange(params.updateTimeStep);
+		timeGUI.add( params, 'timeStepUnit', {"Hour": 1./8760., "Day": 1./365.24, "Year": 1, "Million Years": 1e6, } ).onChange(params.updateTimeStep);
+		timeGUI.add( params, 'timeStepFac', 0, 1e4 ).listen().onChange(params.updateTimeStep);
+		timeGUI.add( params, 'play').listen();
 
 		var pointLineGUI = gui.addFolder('Points and Lines');
 		pointLineGUI.add( params, 'lineWidth', 0, 0.01).onChange( params.redraw );
@@ -285,7 +301,9 @@ function defineParams(){
 		cameraGUI.add( params, 'stereo').onChange(params.updateStereo);
 		cameraGUI.add( params, 'stereoSep',0,1).onChange(params.updateStereo);
 		cameraGUI.add( params, 'friction',0,1).onChange(params.updateFriction);
-		cameraGUI.add( params, 'zoomSpeed',0.01,5).onChange(params.updateZoom);
+		cameraGUI.add( params, 'zoomSpeed',0.01,3).onChange(params.updateZoom);
+		cameraGUI.add( params, 'rotateSpeed',0.01,3).onChange(params.updateRotate);
+		cameraGUI.add( params, 'panSpeed',0.01,3).onChange(params.updatePan);
 	}
 }
 
