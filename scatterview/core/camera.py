@@ -1,0 +1,444 @@
+"""Automated camera controller for N-body visualization.
+
+Provides composable camera modes: auto-frame, auto-center,
+auto-rotate, event tracking, target tracking, and manual control.
+
+Framing scope controls which particles drive the camera zoom:
+- ALL: frame every active particle (can chase outliers)
+- CORE_GROUP: ignore outlier particles far from the cluster center
+- NEAREST_NEIGHBORS: frame the target particle + its K nearest neighbors
+"""
+
+from __future__ import annotations
+
+from enum import Enum, auto
+
+import numpy as np
+
+from .. import defaults as D
+
+
+class CameraMode(Enum):
+    MANUAL = auto()
+    AUTO_FRAME = auto()
+    AUTO_ROTATE = auto()
+    EVENT_TRACK = auto()
+    TARGET_REST_FRAME = auto()
+    TARGET_COMOVING = auto()
+
+
+class FramingScope(Enum):
+    ALL = auto()
+    CORE_GROUP = auto()
+    NEAREST_NEIGHBORS = auto()
+
+
+class CameraController:
+    """Manages automated camera behavior.
+
+    Can be attached to a RenderEngine to control the VisPy camera.
+
+    Args:
+        view: VisPy ViewBox whose camera to control.
+        masses: Optional dict of particle ID -> mass array for mass-weighted COM.
+        events: Optional list of detected events for event-tracking mode.
+    """
+
+    def __init__(self, view, masses: dict[int, np.ndarray] | None = None, events=None):
+        self._view = view
+        self._camera = view.camera
+        self._masses = masses
+        self._events = events or []
+
+        # Mode
+        self._mode = CameraMode.MANUAL
+        self._auto_rotate_enabled = False
+
+        # Framing scope
+        self._framing_scope = FramingScope.CORE_GROUP
+        self._keep_all_in_frame = False
+        self._lock_zoom = True
+        self._n_neighbors = D.CAMERA_N_NEIGHBORS
+        self._outlier_sigma = D.CAMERA_OUTLIER_SIGMA
+
+        # Smoothing parameters
+        self._ema_alpha = D.CAMERA_EMA_ALPHA
+        self._zoom_ema_alpha = D.CAMERA_ZOOM_EMA_ALPHA
+        self._com_jump_threshold = D.CAMERA_COM_JUMP_THRESHOLD
+
+        # State
+        self._smoothed_center = np.zeros(3)
+        self._smoothed_distance = 10.0
+        self._center_initialized = False
+        self._distance_initialized = False
+
+        # Auto-rotate
+        self._rotation_speed = D.ROTATION_SPEED
+        self._azimuth_offset = 0.0
+
+        # Target tracking
+        self._target_pid: int | None = None
+        self._target_smoothed_vel = np.zeros(3)
+
+        # Radius percentile for extent (within framed particles)
+        self._radius_percentile = D.CAMERA_RADIUS_PERCENTILE
+
+    # --- Properties ---
+
+    @property
+    def mode(self) -> CameraMode:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: CameraMode) -> None:
+        self._mode = value
+        # Reset smoothing so center and zoom snap to the new target
+        self._center_initialized = False
+        self._distance_initialized = False
+        # Auto-Rotate mode implies rotation enabled
+        if value == CameraMode.AUTO_ROTATE:
+            self._auto_rotate_enabled = True
+
+    @property
+    def auto_rotate(self) -> bool:
+        return self._auto_rotate_enabled
+
+    @auto_rotate.setter
+    def auto_rotate(self, value: bool) -> None:
+        self._auto_rotate_enabled = value
+
+    @property
+    def rotation_speed(self) -> float:
+        return self._rotation_speed
+
+    @rotation_speed.setter
+    def rotation_speed(self, value: float) -> None:
+        self._rotation_speed = value
+
+    @property
+    def target_particle(self) -> int | None:
+        return self._target_pid
+
+    @target_particle.setter
+    def target_particle(self, pid: int | None) -> None:
+        self._target_pid = pid
+        self._center_initialized = False
+        self._distance_initialized = False
+
+    @property
+    def framing_scope(self) -> FramingScope:
+        return self._framing_scope
+
+    @framing_scope.setter
+    def framing_scope(self, value: FramingScope) -> None:
+        self._framing_scope = value
+        self._center_initialized = False
+        self._distance_initialized = False
+
+    @property
+    def keep_all_in_frame(self) -> bool:
+        return self._keep_all_in_frame
+
+    @keep_all_in_frame.setter
+    def keep_all_in_frame(self, value: bool) -> None:
+        self._keep_all_in_frame = value
+
+    @property
+    def lock_zoom(self) -> bool:
+        return self._lock_zoom
+
+    @lock_zoom.setter
+    def lock_zoom(self, value: bool) -> None:
+        self._lock_zoom = value
+
+    @property
+    def n_neighbors(self) -> int:
+        return self._n_neighbors
+
+    @n_neighbors.setter
+    def n_neighbors(self, value: int) -> None:
+        self._n_neighbors = max(1, value)
+
+    # --- Core update ---
+
+    def update(
+        self,
+        sim_time: float,
+        positions: np.ndarray,
+        active_ids: np.ndarray,
+    ) -> None:
+        """Update camera based on current mode and particle positions.
+
+        Called each frame by the RenderEngine.
+        """
+        if self._mode == CameraMode.MANUAL and not self._auto_rotate_enabled:
+            return
+
+        if len(positions) == 0:
+            return
+
+        if self._mode in (CameraMode.AUTO_FRAME, CameraMode.AUTO_ROTATE):
+            self._update_auto_frame(positions, active_ids)
+        elif self._mode == CameraMode.EVENT_TRACK:
+            self._update_event_track(sim_time, positions, active_ids)
+        elif self._mode == CameraMode.TARGET_REST_FRAME:
+            self._update_target_rest(positions, active_ids)
+        elif self._mode == CameraMode.TARGET_COMOVING:
+            self._update_target_comoving(positions, active_ids)
+
+        if self._auto_rotate_enabled:
+            self._apply_rotation()
+
+    # --- Framing logic ---
+
+    def _select_framed_particles(
+        self,
+        positions: np.ndarray,
+        active_ids: np.ndarray,
+        reference_pos: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Select which particles should drive the camera framing (center + extent).
+
+        Args:
+            positions: (N, 3) array of all active particle positions.
+            active_ids: (N,) array of corresponding particle IDs.
+            reference_pos: Optional reference position (e.g. target particle).
+                Used as the center for NEAREST_NEIGHBORS distance calculation.
+
+        Returns:
+            (framed_positions, framed_ids) — the subset to frame.
+        """
+        if self._keep_all_in_frame or len(positions) <= 2:
+            return positions, active_ids
+
+        scope = self._framing_scope
+
+        if scope == FramingScope.ALL:
+            return positions, active_ids
+
+        if scope == FramingScope.CORE_GROUP:
+            return self._select_core_group(positions, active_ids)
+
+        if scope == FramingScope.NEAREST_NEIGHBORS:
+            return self._select_nearest_neighbors(positions, active_ids, reference_pos)
+
+        return positions, active_ids
+
+    def _select_core_group(
+        self, positions: np.ndarray, active_ids: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Reject outlier particles far from the cluster center.
+
+        Uses the median distance from the unweighted centroid as the
+        scale. Particles beyond outlier_sigma × median_distance are
+        excluded from framing (they still render, just don't drive the zoom).
+        """
+        centroid = positions.mean(axis=0)
+        distances = np.linalg.norm(positions - centroid, axis=1)
+        median_dist = np.median(distances)
+
+        if median_dist < 1e-12:
+            return positions, active_ids
+
+        threshold = self._outlier_sigma * median_dist
+        mask = distances <= threshold
+        # Always keep at least 2 particles
+        if mask.sum() < 2:
+            # Keep the closest 2
+            closest = np.argsort(distances)[:2]
+            mask = np.zeros(len(positions), dtype=bool)
+            mask[closest] = True
+
+        return positions[mask], active_ids[mask]
+
+    def _select_nearest_neighbors(
+        self,
+        positions: np.ndarray,
+        active_ids: np.ndarray,
+        reference_pos: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Select the target particle + its K nearest neighbors.
+
+        If no target is set or reference_pos is None, falls back to CORE_GROUP.
+        """
+        if reference_pos is None:
+            return self._select_core_group(positions, active_ids)
+
+        distances = np.linalg.norm(positions - reference_pos, axis=1)
+        # K nearest (including the target itself, which has distance ~0)
+        k = min(self._n_neighbors + 1, len(positions))
+        nearest_idx = np.argsort(distances)[:k]
+        return positions[nearest_idx], active_ids[nearest_idx]
+
+    # --- Helpers ---
+
+    def _compute_com(self, positions: np.ndarray, active_ids: np.ndarray) -> np.ndarray:
+        """Compute center of mass, optionally mass-weighted."""
+        if self._masses is not None:
+            weights = []
+            for pid in active_ids:
+                pid_key = int(pid)
+                if pid_key in self._masses and len(self._masses[pid_key]) > 0:
+                    weights.append(self._masses[pid_key][-1])  # use latest mass
+                else:
+                    weights.append(1.0)
+            weights = np.array(weights)
+            total = weights.sum()
+            if total > 0:
+                return (positions * weights[:, np.newaxis]).sum(axis=0) / total
+        return positions.mean(axis=0)
+
+    def _compute_extent(self, positions: np.ndarray, center: np.ndarray) -> float:
+        """Compute effective extent using percentile radius."""
+        distances = np.linalg.norm(positions - center, axis=1)
+        if len(distances) == 0:
+            return 1.0
+        return float(np.percentile(distances, self._radius_percentile)) or 1.0
+
+    def _smooth_center(self, target_center: np.ndarray) -> np.ndarray:
+        """Apply exponential moving average to center, with jump detection."""
+        if not self._center_initialized:
+            self._smoothed_center = target_center.copy()
+            self._center_initialized = True
+            return self._smoothed_center
+
+        # Jump detection for sudden mass loss / particle removal
+        jump = np.linalg.norm(target_center - self._smoothed_center)
+        if jump > self._smoothed_distance * self._com_jump_threshold:
+            # Snap immediately
+            self._smoothed_center = target_center.copy()
+        else:
+            # Smooth with EMA
+            alpha = self._ema_alpha
+            self._smoothed_center = alpha * target_center + (1 - alpha) * self._smoothed_center
+
+        return self._smoothed_center
+
+    def _smooth_distance(self, target_distance: float) -> float:
+        """Smooth camera distance changes (slower than center smoothing).
+
+        Snaps immediately after a mode/scope change, then resumes EMA.
+        """
+        if not self._distance_initialized:
+            self._smoothed_distance = target_distance
+            self._distance_initialized = True
+            return self._smoothed_distance
+
+        alpha = self._zoom_ema_alpha
+        self._smoothed_distance = alpha * target_distance + (1 - alpha) * self._smoothed_distance
+        return self._smoothed_distance
+
+    def _apply_camera(self, center: np.ndarray, extent: float) -> None:
+        """Set camera center and distance from extent."""
+        self._camera.center = tuple(center)
+        if not self._lock_zoom:
+            fov_rad = np.radians(self._camera.fov / 2)
+            target_distance = extent / np.sin(fov_rad) * 1.25  # 80% fill
+            distance = self._smooth_distance(target_distance)
+            self._camera.distance = distance
+
+    # --- Helpers ---
+
+    def _find_target(
+        self, positions: np.ndarray, active_ids: np.ndarray,
+    ) -> np.ndarray | None:
+        """Return the target particle's position, or None if not active."""
+        if self._target_pid is None:
+            return None
+        for i, pid in enumerate(active_ids):
+            if int(pid) == self._target_pid:
+                return positions[i]
+        return None
+
+    # --- Mode implementations ---
+
+    def _update_auto_frame(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
+        """Auto-frame: frame particles based on current framing scope."""
+        reference_pos = self._find_target(positions, active_ids)
+
+        framed_pos, framed_ids = self._select_framed_particles(
+            positions, active_ids, reference_pos=reference_pos
+        )
+        com = self._compute_com(framed_pos, framed_ids)
+        center = self._smooth_center(com)
+        extent = self._compute_extent(framed_pos, center)
+        self._apply_camera(center, extent)
+
+    def _update_event_track(
+        self, sim_time: float, positions: np.ndarray, active_ids: np.ndarray
+    ) -> None:
+        """Event tracking: zoom into upcoming events."""
+        # Find the closest upcoming event
+        upcoming = [e for e in self._events if e.time >= sim_time]
+        if upcoming:
+            event = min(upcoming, key=lambda e: e.time)
+            # Transition: blend between current framing and event location
+            dt = event.time - sim_time
+            transition_time = 2.0  # seconds of lead time
+            if dt < transition_time and dt > 0:
+                blend = 1.0 - dt / transition_time
+                event_pos = event.position
+                framed_pos, framed_ids = self._select_framed_particles(
+                    positions, active_ids, reference_pos=event_pos
+                )
+                com = self._compute_com(framed_pos, framed_ids)
+                target = (1 - blend) * com + blend * event_pos
+                center = self._smooth_center(target)
+                # Zoom in for the event
+                extent = self._compute_extent(framed_pos, center)
+                event_zoom = extent * (1 - blend * 0.7)  # zoom in up to 70%
+                fov_rad = np.radians(self._camera.fov / 2)
+                distance = self._smooth_distance(event_zoom / np.sin(fov_rad))
+                self._camera.center = tuple(center)
+                self._camera.distance = distance
+                return
+
+        # Fallback to auto-frame
+        self._update_auto_frame(positions, active_ids)
+
+    def _update_target_rest(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
+        """Target rest frame: camera locked to target particle."""
+        target_pos = self._find_target(positions, active_ids)
+        if target_pos is None:
+            self._update_auto_frame(positions, active_ids)
+            return
+
+        center = self._smooth_center(target_pos)
+        framed_pos, _ = self._select_framed_particles(
+            positions, active_ids, reference_pos=target_pos,
+        )
+        extent = self._compute_extent(framed_pos, center)
+        self._apply_camera(center, extent)
+
+    def _update_target_comoving(
+        self, positions: np.ndarray, active_ids: np.ndarray,
+    ) -> None:
+        """Target comoving frame: smooth velocity tracking."""
+        target_pos = self._find_target(positions, active_ids)
+        if target_pos is None:
+            self._update_auto_frame(positions, active_ids)
+            return
+
+        if self._center_initialized:
+            vel_estimate = target_pos - self._smoothed_center
+            vel_alpha = 0.02  # very slow smoothing for velocity
+            self._target_smoothed_vel = (
+                vel_alpha * vel_estimate + (1 - vel_alpha) * self._target_smoothed_vel
+            )
+
+        # Predict center from smoothed velocity
+        predicted_center = target_pos - self._target_smoothed_vel * 0.5
+        center = self._smooth_center(predicted_center)
+
+        # Frame the target's neighborhood
+        framed_pos, _ = self._select_framed_particles(
+            positions, active_ids, reference_pos=target_pos
+        )
+        extent = self._compute_extent(framed_pos, center)
+        self._apply_camera(center, extent)
+
+    def _apply_rotation(self) -> None:
+        """Apply slow auto-rotation around vertical axis."""
+        self._azimuth_offset += self._rotation_speed
+        if hasattr(self._camera, "azimuth"):
+            self._camera.azimuth = self._azimuth_offset
