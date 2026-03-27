@@ -5,36 +5,41 @@ this module rather than hardcoding their own values.
 """
 
 # --- Animation ---
-ANIM_SPEED = 1.0 / 60.0       # fraction of total duration per second (~60s playback)
-GAMMA = 0.0                    # time mapping gamma (0 = uniform sim-time advance)
+ANIM_SPEED = 1.0 / 60.0       # fraction of total sim duration advanced per second
+                               # (1/60 ≈ 60-second full playback at 1x speed)
 
 # --- Appearance ---
-POINT_ALPHA = 1.0
-TRAIL_ALPHA = 0.6
-TRAIL_LENGTH_FRAC = 0.005      # fraction of total simulation time (0.5%)
-TRAIL_WIDTH = 3.0              # pixels
+POINT_ALPHA = 1.0              # particle opacity (0 = invisible, 1 = opaque)
+TRAIL_ALPHA = 0.6              # peak trail opacity (at the head / newest point)
+TRAIL_LENGTH_FRAC = 0.005      # trail window as fraction of total simulation time
+TRAIL_WIDTH = 3.0              # trail line width in pixels
 
-# --- Sizing ---
-RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode
-RELATIVE_SIZE_MAX_PX = 20.0    # largest particle in relative mode
-DEFAULT_SIZE_PX = 10.0         # when no radii are provided
-DEPTH_SCALING = False          # closer particles appear larger (perspective-scaled sizes)
+# --- Particle sizing ---
+RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode (screen pixels)
+RELATIVE_SIZE_MAX_PX = 20.0    # largest particle in relative mode (screen pixels)
+DEFAULT_SIZE_PX = 10.0         # uniform size when no radii are provided
+DEPTH_SCALING = False          # if True, closer particles appear larger (perspective)
 
 # --- Camera ---
-CAMERA_FOV = 45
-CAMERA_EMA_ALPHA = 0.15        # center pan speed (fraction of distance per frame)
-CAMERA_ZOOM_EMA_ALPHA = 0.03   # zoom speed (fraction of distance per frame)
-CAMERA_OUTLIER_SIGMA = 2.0     # core-group rejection: N × median distance
-CAMERA_RADIUS_PERCENTILE = 95.0
-CAMERA_N_NEIGHBORS = 3
-ROTATION_SPEED = 0.5           # degrees per frame
+CAMERA_FOV = 45                # field of view in degrees
+CAMERA_EMA_ALPHA = 0.15        # camera pan speed: max displacement per frame as a
+                               # fraction of the current camera distance
+CAMERA_ZOOM_EMA_ALPHA = 0.03   # camera zoom speed: max distance change per frame
+                               # as a fraction of the current camera distance
+CAMERA_OUTLIER_SIGMA = 2.0     # core-group framing: reject particles farther than
+                               # this many × the median distance from the centroid
+CAMERA_RADIUS_PERCENTILE = 95.0  # framing extent uses this percentile of particle
+                               # distances from center (ignores far outliers)
+CAMERA_N_NEIGHBORS = 3         # nearest-neighbors framing: track the target
+                               # particle plus this many closest neighbors
+ROTATION_SPEED = 0.5           # auto-rotate: degrees of azimuth per frame
 
-# --- Black hole rendering ---
-BH_STARTYPE = 14               # BSE stellar type code for black holes
-BH_FACE_COLOR = (0.02, 0.02, 0.05, 0.15)
-BH_EDGE_WIDTH = 2.0
+# --- Black hole rendering (BSE stellar evolution codes) ---
+BH_STARTYPE = 14               # BSE stellar type code identifying black holes
+BH_FACE_COLOR = (0.02, 0.02, 0.05, 0.15)  # near-black with low opacity
+BH_EDGE_WIDTH = 2.0            # edge ring width in pixels
 
-# --- Lighting ---
+# --- Lighting (VisPy scene lighting for spherical markers) ---
 LIGHT_AMBIENT = 0.2
 LIGHT_COLOR = "white"
 LIGHT_POSITION = (1, -1, 1)
@@ -42,12 +47,14 @@ LIGHT_POSITION = (1, -1, 1)
 # --- Window ---
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
-SUBVIEW_SIZE_FRAC = 0.3
+SUBVIEW_SIZE_FRAC = 0.3        # picture-in-picture size as fraction of main window
 SUBVIEW_FOV = 60
 
-# --- Rendering / export ---
-VIDEO_DURATION = 10.0
-VIDEO_FPS = 30
+# --- Video export ---
+VIDEO_DURATION = 10.0          # default export duration in seconds
+VIDEO_FPS = 30                 # default export frame rate
 
-# --- Adaptive trail refinement ---
-REFINE_ANGLE_DEG = 3.0           # angle threshold in degrees
+# --- Trail refinement ---
+REFINE_ANGLE_DEG = 3.0         # maximum chord angle (degrees) between consecutive
+                               # trail points; segments exceeding this get subdivided
+                               # during precomputation

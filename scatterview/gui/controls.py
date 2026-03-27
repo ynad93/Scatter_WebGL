@@ -174,11 +174,6 @@ class ControlPanel:
             self._on_speed_change,
         )
 
-        # Gamma (variable framerate)
-        self._add_slider(
-            section, "Gamma", 0.0, 1.0, self._engine._time_mapping.gamma,
-            self._on_gamma_change,
-        )
 
     def _on_time_slider_changed(self, value: float) -> None:
         """User dragged the time slider — update engine (but skip if syncing)."""
@@ -208,8 +203,6 @@ class ControlPanel:
         else:
             self._sync_timer.stop()
 
-    def _on_gamma_change(self, value: float) -> None:
-        self._engine._time_mapping.gamma = value
 
     def _on_speed_change(self, speed: float) -> None:
         """Update playback speed."""

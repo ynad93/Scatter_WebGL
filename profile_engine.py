@@ -3,7 +3,7 @@
 Monkey-patches timing wrappers around key methods, steps through
 N frames headlessly, and reports per-component breakdown + cProfile stats.
 
-Simulates normal GUI playback: 120 Hz timer, default anim_speed, gamma=0.
+Simulates normal GUI playback: 60 Hz timer, default anim_speed.
 
 Usage:
     python profile_engine.py [datafile] [--frames N] [--warmup N]
@@ -107,23 +107,22 @@ def main():
     print("Building spline interpolation...")
     interpolator = TrajectoryInterpolator(data)
 
-    from scatterview.core.time_mapping import TimeMapping
-    time_mapping = TimeMapping(data.times, gamma=0.0)
-
     from scatterview.rendering.engine import RenderEngine
     from scatterview.core.camera import CameraController, CameraMode
     from scatterview import defaults as D
 
-    engine = RenderEngine(data, interpolator, time_mapping, size=(1280, 720))
+    engine = RenderEngine(data, interpolator, size=(1280, 720))
     cam = CameraController(engine.view, masses=data.masses)
     cam.mode = CameraMode.AUTO_FRAME
     engine.set_camera_controller(cam)
 
     n_particles = len(data.particle_ids)
 
-    # Match GUI playback: 120 Hz timer, default anim_speed
-    TIMER_HZ = 120.0
+    # Match GUI playback: 60 Hz timer, default anim_speed
+    TIMER_HZ = 60.0
     anim_step = D.ANIM_SPEED / TIMER_HZ  # anim_time advance per frame
+    t_min = float(data.times[0])
+    t_range = float(data.times[-1] - data.times[0])
 
     engine._playing = True
 
@@ -131,7 +130,7 @@ def main():
     print(f"Warmup: {N_WARMUP} frames (anim_step={anim_step:.6f})...")
     anim_time = 0.0
     for i in range(N_WARMUP):
-        sim_time = float(time_mapping.anim_to_sim(anim_time))
+        sim_time = t_min + anim_time * t_range
         engine._current_sim_time = sim_time
         engine._anim_time = anim_time
         engine._update_frame()
@@ -168,7 +167,7 @@ def main():
     profiler.enable()
 
     for i in range(N_FRAMES):
-        sim_time = float(time_mapping.anim_to_sim(anim_time))
+        sim_time = t_min + anim_time * t_range
         engine._current_sim_time = sim_time
         engine._anim_time = anim_time
 

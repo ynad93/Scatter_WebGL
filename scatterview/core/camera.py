@@ -79,7 +79,7 @@ class CameraController:
         self._target_pid: int | None = None
         self._target_smoothed_vel = np.zeros(3)
 
-        # Radius percentile for extent (within framed particles)
+        # Radius percentile for framing (within framed particles)
         self._radius_percentile = D.CAMERA_RADIUS_PERCENTILE
 
     # --- Properties ---
@@ -192,7 +192,7 @@ class CameraController:
         active_ids: np.ndarray,
         reference_pos: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Select which particles should drive the camera framing (center + extent).
+        """Select which particles should drive the camera framing.
 
         Args:
             positions: (N, 3) array of all active particle positions.
@@ -267,8 +267,8 @@ class CameraController:
 
     # --- Helpers ---
 
-    def _compute_com(self, positions: np.ndarray, active_ids: np.ndarray) -> np.ndarray:
-        """Compute center of mass, optionally mass-weighted."""
+    def _compute_center_of_mass(self, positions: np.ndarray, active_ids: np.ndarray) -> np.ndarray:
+        """Compute center of mass of framed particles, weighted by mass if available."""
         if self._masses is not None:
             weights = []
             for pid in active_ids:
@@ -283,8 +283,12 @@ class CameraController:
                 return (positions * weights[:, np.newaxis]).sum(axis=0) / total
         return positions.mean(axis=0)
 
-    def _compute_extent(self, positions: np.ndarray, center: np.ndarray) -> float:
-        """Compute effective extent using percentile radius."""
+    def _compute_framing_radius(self, positions: np.ndarray, center: np.ndarray) -> float:
+        """Compute the framing radius (95th percentile of distances from center).
+
+        This determines how far the camera should be to fit the cluster.
+        Using a percentile rather than the max avoids chasing distant outliers.
+        """
         distances = np.linalg.norm(positions - center, axis=1)
         if len(distances) == 0:
             return 1.0
@@ -325,14 +329,21 @@ class CameraController:
 
         return self._smoothed_distance
 
-    def _apply_camera(self, center: np.ndarray, extent: float) -> None:
-        """Set camera center and distance from extent."""
+    def _apply_camera(self, center: np.ndarray, framing_radius: float) -> None:
+        """Push smoothed center and distance to the VisPy camera.
+
+        When free zoom is on, the user has full manual control — both
+        center and distance are left untouched so scrolling and panning
+        don't fight with the auto-framing.
+        """
+        if self._free_zoom:
+            return
+
         self._camera.center = tuple(center)
-        if not self._free_zoom:
-            fov_rad = np.radians(self._camera.fov / 2)
-            target_distance = extent / np.sin(fov_rad) * 1.25  # 80% fill
-            distance = self._smooth_distance(target_distance)
-            self._camera.distance = distance
+        fov_rad = np.radians(self._camera.fov / 2)
+        target_distance = framing_radius / np.sin(fov_rad) * 1.25
+        distance = self._smooth_distance(target_distance)
+        self._camera.distance = distance
 
     # --- Helpers ---
 
@@ -356,10 +367,10 @@ class CameraController:
         framed_pos, framed_ids = self._select_framed_particles(
             positions, active_ids, reference_pos=reference_pos
         )
-        com = self._compute_com(framed_pos, framed_ids)
+        com = self._compute_center_of_mass(framed_pos, framed_ids)
         center = self._smooth_center(com)
-        extent = self._compute_extent(framed_pos, center)
-        self._apply_camera(center, extent)
+        framing_radius = self._compute_framing_radius(framed_pos, center)
+        self._apply_camera(center, framing_radius)
 
     def _update_event_track(
         self, sim_time: float, positions: np.ndarray, active_ids: np.ndarray
@@ -378,12 +389,12 @@ class CameraController:
                 framed_pos, framed_ids = self._select_framed_particles(
                     positions, active_ids, reference_pos=event_pos
                 )
-                com = self._compute_com(framed_pos, framed_ids)
+                com = self._compute_center_of_mass(framed_pos, framed_ids)
                 target = (1 - blend) * com + blend * event_pos
                 center = self._smooth_center(target)
                 # Zoom in for the event
-                extent = self._compute_extent(framed_pos, center)
-                event_zoom = extent * (1 - blend * 0.7)  # zoom in up to 70%
+                framing_radius = self._compute_framing_radius(framed_pos, center)
+                event_zoom = framing_radius * (1 - blend * 0.7)  # zoom in up to 70%
                 fov_rad = np.radians(self._camera.fov / 2)
                 distance = self._smooth_distance(event_zoom / np.sin(fov_rad))
                 self._camera.center = tuple(center)
@@ -407,10 +418,10 @@ class CameraController:
         framed_pos, _ = self._select_framed_particles(
             positions, active_ids, reference_pos=target_pos,
         )
-        extent = self._compute_extent(framed_pos, target_pos)
+        framing_radius = self._compute_framing_radius(framed_pos, target_pos)
         if not self._free_zoom:
             fov_rad = np.radians(self._camera.fov / 2)
-            target_distance = extent / np.sin(fov_rad) * 1.25
+            target_distance = framing_radius / np.sin(fov_rad) * 1.25
             distance = self._smooth_distance(target_distance)
             self._camera.distance = distance
 
@@ -437,8 +448,8 @@ class CameraController:
         framed_pos, _ = self._select_framed_particles(
             positions, active_ids, reference_pos=target_pos
         )
-        extent = self._compute_extent(framed_pos, center)
-        self._apply_camera(center, extent)
+        framing_radius = self._compute_framing_radius(framed_pos, center)
+        self._apply_camera(center, framing_radius)
 
     def _apply_rotation(self) -> None:
         """Apply slow auto-rotation around vertical axis."""

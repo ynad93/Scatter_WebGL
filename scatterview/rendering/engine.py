@@ -10,58 +10,133 @@ import numpy as np
 from .. import defaults as D
 from ..core.data_loader import SimulationData
 from ..core.interpolation import TrajectoryInterpolator
-from ..core.time_mapping import TimeMapping
 
 
 @nb.njit(cache=True)
 def _advance_trail_pointers(
-    packed_times: np.ndarray,   # (total_pts,) float64 — all precomputed times
-    lo: np.ndarray,             # (n,) int64 — start offset per particle
-    hi: np.ndarray,             # (n,) int64 — end offset per particle
-    si_prev: np.ndarray,        # (n,) int64 — previous si (-1 = needs full search)
-    ei_prev: np.ndarray,        # (n,) int64 — previous ei (-1 = needs full search)
-    t_start: float,
-    t_end: float,
-    forward: bool,
-    si_out: np.ndarray,         # (n,) int64 — output
-    ei_out: np.ndarray,         # (n,) int64 — output
-) -> None:
-    """Advance or binary-search trail window pointers for all particles."""
-    for k in range(len(lo)):
-        lo_k = lo[k]
-        n_k = hi[k] - lo_k
+    packed_times,        # (total_pts,) float64 — all precomputed trail times
+    segment_start,       # (n_particles,) int64 — start offset in packed_times
+    segment_end,         # (n_particles,) int64 — end offset in packed_times
+    prev_window_start,   # (n_particles,) int64 — previous tail pointer (-1 = unset)
+    prev_window_end,     # (n_particles,) int64 — previous head pointer (-1 = unset)
+    t_trail_start,       # float64 — oldest time in the visible trail window
+    t_current,           # float64 — current simulation time (newest point)
+    is_forward,          # bool — True if time is advancing (normal playback)
+    out_window_start,    # (n_particles,) int64 — output tail indices
+    out_window_end,      # (n_particles,) int64 — output head indices
+):
+    """Find the visible trail window [start, end) for each particle.
 
-        if forward and si_prev[k] >= 0:
-            # Fast path: advance from previous position
-            s = si_prev[k]
-            while s < n_k and packed_times[lo_k + s] <= t_start:
-                s += 1
-            e = ei_prev[k]
-            while e < n_k and packed_times[lo_k + e] < t_end:
-                e += 1
+    During forward playback, advances the previous frame's pointers by
+    1-2 positions (O(1) per particle).  On scrub, loop, or first frame,
+    falls back to binary search (O(log N) per particle).
+    """
+    for particle in range(len(segment_start)):
+        seg_lo = segment_start[particle]
+        n_points = segment_end[particle] - seg_lo
+
+        if is_forward and prev_window_start[particle] >= 0:
+            # Forward playback: advance pointers from last frame
+            tail = prev_window_start[particle]
+            while tail < n_points and packed_times[seg_lo + tail] <= t_trail_start:
+                tail += 1
+            head = prev_window_end[particle]
+            while head < n_points and packed_times[seg_lo + head] < t_current:
+                head += 1
         else:
-            # Slow path: binary search
-            # searchsorted(side='right') for si
-            s_lo, s_hi = nb.int64(0), n_k
-            while s_lo < s_hi:
-                mid = (s_lo + s_hi) >> 1
-                if packed_times[lo_k + mid] <= t_start:
-                    s_lo = mid + 1
+            # Binary search (searchsorted side='right' for tail)
+            lo, hi = nb.int64(0), n_points
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if packed_times[seg_lo + mid] <= t_trail_start:
+                    lo = mid + 1
                 else:
-                    s_hi = mid
-            s = s_lo
-            # searchsorted(side='left') for ei
-            e_lo, e_hi = nb.int64(0), n_k
-            while e_lo < e_hi:
-                mid = (e_lo + e_hi) >> 1
-                if packed_times[lo_k + mid] < t_end:
-                    e_lo = mid + 1
+                    hi = mid
+            tail = lo
+            # Binary search (searchsorted side='left' for head)
+            lo, hi = nb.int64(0), n_points
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if packed_times[seg_lo + mid] < t_current:
+                    lo = mid + 1
                 else:
-                    e_hi = mid
-            e = e_lo
+                    hi = mid
+            head = lo
 
-        si_out[k] = s
-        ei_out[k] = e
+        out_window_start[particle] = tail
+        out_window_end[particle] = head
+
+
+@nb.njit(cache=True)
+def _assemble_trails(
+    out_positions,            # (total_pts, 3) float32 — output positions
+    out_colors,               # (total_pts, 4) float32 — output RGBA colors
+    out_times,                # (total_pts,) float64 — output timestamps
+    write_offsets,            # (n_trails,) int64 — start index in output arrays
+    trail_point_counts,       # (n_trails,) int64 — total points per trail
+    trail_body_starts,        # (n_trails,) int64 — start index of body in precomp
+    trail_body_counts,        # (n_trails,) int64 — number of precomputed body points
+    trail_has_tail,           # (n_trails,) bool — whether tail lerp point exists
+    trail_tail_positions,     # (n_trails, 3) float32 — lerp'd tail positions
+    active_particle_indices,  # (n_trails,) int64 — index into live positions array
+    particle_color_indices,   # (n_trails,) int64 — index into color table
+    precomp_positions,        # (total_precomp, 3) float32 — packed precomputed positions
+    precomp_times,            # (total_precomp,) float64 — packed precomputed times
+    live_positions,           # (n_active, 3) float64 — current particle positions
+    color_table,              # (n_particles, 4) float32 — per-particle RGBA
+    t_trail_start,            # float64 — oldest time in the trail window
+    t_current,                # float64 — current simulation time
+):
+    """Write trail geometry into output buffers for GPU upload.
+
+    Each trail is laid out as: [NaN separator] [tail lerp] [body] [head]
+    - Tail: interpolated position at exactly t_trail_start (smooth fade-in)
+    - Body: precomputed positions between t_trail_start and t_current
+    - Head: live particle position at t_current (from spline evaluation)
+    - NaN separators tell VisPy's line renderer to break between trails
+    """
+    n_trails = len(write_offsets)
+    for trail in range(n_trails):
+        offset = write_offsets[trail]
+        n_points = trail_point_counts[trail]
+        n_body = trail_body_counts[trail]
+        write_pos = nb.int64(0)
+
+        # NaN separator before this trail (except the first)
+        if trail > 0:
+            sep = offset - 1
+            for dim in range(3):
+                out_positions[sep, dim] = np.nan
+            for dim in range(4):
+                out_colors[sep, dim] = np.nan
+            out_times[sep] = np.nan
+
+        # Tail: lerp'd position at the trail window boundary
+        if trail_has_tail[trail]:
+            for dim in range(3):
+                out_positions[offset, dim] = trail_tail_positions[trail, dim]
+            out_times[offset] = t_trail_start
+            write_pos = 1
+
+        # Body: copy precomputed trajectory points
+        body_start = trail_body_starts[trail]
+        for i in range(n_body):
+            for dim in range(3):
+                out_positions[offset + write_pos + i, dim] = precomp_positions[body_start + i, dim]
+            out_times[offset + write_pos + i] = precomp_times[body_start + i]
+        write_pos += n_body
+
+        # Head: current particle position from spline evaluation
+        particle_idx = active_particle_indices[trail]
+        for dim in range(3):
+            out_positions[offset + write_pos, dim] = np.float32(live_positions[particle_idx, dim])
+        out_times[offset + write_pos] = t_current
+
+        # Base RGB color for all points in this trail
+        color_idx = particle_color_indices[trail]
+        for i in range(n_points):
+            for dim in range(3):
+                out_colors[offset + i, dim] = color_table[color_idx, dim]
 
 
 class RenderEngine:
@@ -69,14 +144,16 @@ class RenderEngine:
 
     def __init__(
         self, data: SimulationData, interpolator: TrajectoryInterpolator,
-        time_mapping: TimeMapping, size: tuple[int, int] = (1280, 720),
+        size: tuple[int, int] = (1280, 720),
         title: str = "ScatterView",
     ):
         from vispy import app, scene
 
         self._data = data
         self._interp = interpolator
-        self._time_mapping = time_mapping
+        self._t_min = float(data.times[0])
+        self._t_max = float(data.times[-1])
+        self._time_range = self._t_max - self._t_min
 
         # Animation state
         self._playing = False
@@ -167,7 +244,9 @@ class RenderEngine:
         self._trail_ei = np.full(n, -1, dtype=np.int64)
         self._trail_prev_time = -np.inf
 
-        # Pre-computed alpha lookup table (eliminates per-particle linspace + pow)
+        # Trail alpha gradient: maps time fraction (0=oldest, 1=newest) to
+        # opacity via a t^1.5 power curve.  Trails fade from transparent at
+        # the tail to opaque at the head.
         self._alpha_lut = (np.linspace(0, 1, 1024) ** 1.5).astype(np.float32)
 
         self._build_visuals()
@@ -178,11 +257,151 @@ class RenderEngine:
 
         # Auto-enable free zoom on scroll wheel / trackpad zoom
         self._canvas.events.mouse_wheel.connect(self._on_mouse_wheel)
+        self._canvas.events.key_press.connect(self._on_key_press)
+        self._canvas.events.key_release.connect(self._on_key_release)
+
+        # Keyboard pan: track which keys are held for smooth continuous movement
+        self._pan_keys_held: set[str] = set()
+        self._ctrl_held = False
+
+    @staticmethod
+    def _has_ctrl(event) -> bool:
+        """Check if Ctrl is held during an event."""
+        modifiers = getattr(event, 'modifiers', None) or ()
+        return any(
+            (m.name if hasattr(m, 'name') else str(m)).lower() == 'control'
+            for m in modifiers
+        )
 
     def _on_mouse_wheel(self, event) -> None:
-        """Enable free zoom when the user scrolls."""
+        """Zoom toward the mouse cursor position.
+
+        Shifts the camera center toward the world-space point under the
+        cursor as it zooms in (like Google Maps).  The cursor offset
+        from screen center is converted to world units using the camera
+        distance and field of view, then the center is nudged by that
+        offset proportional to the zoom amount.
+
+        Holding Ctrl multiplies zoom speed by 5x.
+        """
         if self._camera_controller is not None and not self._camera_controller.free_zoom:
             self._camera_controller.free_zoom = True
+
+        camera = self._view.camera
+        if not hasattr(camera, 'distance') or camera.distance is None:
+            return
+
+        delta = getattr(event, 'delta', None)
+        if delta is None:
+            return
+        scroll = delta[1] if hasattr(delta, '__len__') else float(delta)
+        if scroll == 0:
+            return
+
+        speed = 5.0 if self._has_ctrl(event) else 1.0
+        zoom_factor = 1.1 ** (-scroll * speed)
+
+        # Shift center toward cursor: convert the cursor's pixel offset
+        # from screen center into world-space displacement at the focal
+        # plane (the plane through camera.center).
+        import math
+        mouse_pos = getattr(event, 'pos', None)
+        canvas_size = self._canvas.size
+        if mouse_pos is not None and len(mouse_pos) >= 2 and canvas_size[1] > 0:
+            # Cursor offset from screen center, in pixels
+            cursor_offset_x = mouse_pos[0] - canvas_size[0] / 2
+            cursor_offset_y = mouse_pos[1] - canvas_size[1] / 2
+
+            # Convert pixels to world units: at the focal plane, the
+            # visible half-height is distance * tan(fov/2).  Pixel scale
+            # is (visible height) / (screen height).
+            fov_rad = math.radians(camera.fov / 2)
+            world_per_pixel = 2.0 * camera.distance * math.tan(fov_rad) / canvas_size[1]
+
+            # World-space offset in camera-relative coordinates
+            dx_screen = cursor_offset_x * world_per_pixel
+            dy_screen = -cursor_offset_y * world_per_pixel  # screen Y is flipped
+
+            # Rotate screen offset into world coordinates using camera azimuth
+            az_rad = math.radians(camera.azimuth)
+            right = np.array([math.cos(az_rad), math.sin(az_rad), 0.0])
+            up = np.array([0.0, 0.0, 1.0])
+
+            center = np.array(camera.center, dtype=np.float64)
+            world_offset = right * dx_screen + up * dy_screen
+
+            # Shift center toward cursor proportional to zoom amount:
+            # zoom_factor < 1 (zooming in) → positive shift toward cursor
+            # zoom_factor > 1 (zooming out) → negative shift away
+            center += world_offset * (1.0 - zoom_factor)
+            camera.center = tuple(center)
+
+        camera.distance *= zoom_factor
+        camera.view_changed()
+        event.handled = True
+
+    _PAN_KEYS = {'W', 'Up', 'S', 'Down', 'A', 'Left', 'D', 'Right'}
+
+    def _on_key_press(self, event) -> None:
+        """Track held keys for smooth continuous panning."""
+        key = getattr(event, 'key', None)
+        if key is None:
+            return
+        key_name = key.name if hasattr(key, 'name') else str(key)
+        if key_name in self._PAN_KEYS:
+            self._pan_keys_held.add(key_name)
+            # Enable free zoom so auto-framing doesn't fight the pan
+            if self._camera_controller is not None and not self._camera_controller.free_zoom:
+                self._camera_controller.free_zoom = True
+        if key_name == 'Control':
+            self._ctrl_held = True
+
+    def _on_key_release(self, event) -> None:
+        """Stop panning when key is released."""
+        key = getattr(event, 'key', None)
+        if key is None:
+            return
+        key_name = key.name if hasattr(key, 'name') else str(key)
+        self._pan_keys_held.discard(key_name)
+        if key_name == 'Control':
+            self._ctrl_held = False
+
+    def _apply_keyboard_pan(self) -> None:
+        """Apply smooth continuous panning from held keys.
+
+        Called each frame from _on_timer.  Pan speed is proportional to
+        camera distance so it feels consistent at any zoom level.
+        Holding Ctrl multiplies speed by 5x.
+        """
+        if not self._pan_keys_held:
+            return
+
+        import math
+        camera = self._view.camera
+        distance = camera.distance or 1.0
+
+        # Pan speed per frame (fraction of camera distance)
+        base_speed = 0.02
+        speed = base_speed * (5.0 if self._ctrl_held else 1.0)
+        step = distance * speed
+
+        # Camera-relative directions based on azimuth
+        az_rad = math.radians(camera.azimuth)
+        right = np.array([math.cos(az_rad), math.sin(az_rad), 0.0])
+        forward = np.array([-math.sin(az_rad), math.cos(az_rad), 0.0])
+
+        center = np.array(camera.center, dtype=np.float64)
+        for key_name in self._pan_keys_held:
+            if key_name in ('W', 'Up'):
+                center += forward * step
+            elif key_name in ('S', 'Down'):
+                center -= forward * step
+            elif key_name in ('A', 'Left'):
+                center -= right * step
+            elif key_name in ('D', 'Right'):
+                center += right * step
+
+        camera.center = tuple(center)
 
     # ------------------------------------------------------------------
     # Sizing
@@ -301,110 +520,126 @@ class RenderEngine:
             self._particle_visual.set_data(pos=positions, **attrs)
 
     # ------------------------------------------------------------------
-    # Trail rendering — precomputed trails with sliding-window extraction
+    # Trail rendering
+    #
+    # Trails are rendered as polylines showing each particle's recent
+    # trajectory.  The positions are precomputed at startup (from the
+    # simulation's adaptive timesteps + angle-based refinement) and
+    # stored in packed arrays.  Each frame, we extract the visible
+    # time window [t_trail_start, t_current] via a sliding-window
+    # lookup, interpolate smooth boundary points at the window edges,
+    # and upload the result to VisPy's Line visual.
     # ------------------------------------------------------------------
 
     def _update_trails(self, time: float, positions: np.ndarray,
                        active_ids: np.ndarray) -> None:
         from vispy import scene
 
+        # Trail window: [t_trail_start, time] covers trail_length_frac
+        # of the total simulation duration
         time_range = self._data.times[-1] - self._data.times[0]
         trail_length = time_range * self._trail_length_frac
-        t_start = max(time - trail_length, self._data.times[0])
-        if t_start >= time:
+        t_trail_start = max(time - trail_length, self._data.times[0])
+        if t_trail_start >= time:
             if self._trail_line is not None:
                 self._trail_line.visible = False
             return
 
         precomp = self._precomp
-        lut = self._alpha_lut
-        lut_max = len(lut) - 1
+        alpha_table = self._alpha_lut
+        max_alpha_index = len(alpha_table) - 1
         n_active = len(active_ids)
-        inv_window = 1.0 / (time - t_start)
+        inv_trail_window = 1.0 / (time - t_trail_start)
 
-        # --- Vectorized window lookup for all particles at once ---
-        # Map active IDs to precomp indices via the lookup table
-        buf_idx = self._pid_lookup[active_ids.astype(np.intp)]
-        valid = buf_idx >= 0
-        lo_all = precomp.offsets[buf_idx[valid]]
-        hi_all = precomp.offsets[buf_idx[valid] + 1]
-        has_data = lo_all < hi_all
+        # --- Map active particle IDs to precomputed trail segments ---
+        particle_indices = self._pid_lookup[active_ids.astype(np.intp)]
+        has_precomp = particle_indices >= 0
+        segment_starts_all = precomp.offsets[particle_indices[has_precomp]]
+        segment_ends_all = precomp.offsets[particle_indices[has_precomp] + 1]
+        has_trail_data = segment_starts_all < segment_ends_all
 
-        # Build arrays only for particles that have precomputed data
-        valid_idx = np.where(valid)[0][has_data]
-        n_valid = len(valid_idx)
+        # Filter to particles that have precomputed trail points
+        valid_particle_mask = np.where(has_precomp)[0][has_trail_data]
+        n_valid = len(valid_particle_mask)
         if n_valid == 0:
             if self._trail_line is not None:
                 self._trail_line.visible = False
             return
 
-        lo = precomp.offsets[buf_idx[valid_idx]]
-        hi = precomp.offsets[buf_idx[valid_idx] + 1]
-        n_precomp = hi - lo  # (n_valid,) — points per particle
+        segment_starts = precomp.offsets[particle_indices[valid_particle_mask]]
+        segment_ends = precomp.offsets[particle_indices[valid_particle_mask] + 1]
+        precomp_counts = segment_ends - segment_starts
 
-        # Two-pointer sliding window via numba: during forward playback,
-        # advance si/ei from the previous frame (O(1) per particle).
-        # Falls back to binary search on first frame, backward scrub, or loop.
-        particle_idx = buf_idx[valid_idx]  # index into _trail_si/_trail_ei
-        forward = time >= self._trail_prev_time
+        # --- Sliding window: find visible trail range per particle ---
+        # During forward playback, the numba function advances pointers
+        # by 1-2 positions (O(1)).  On scrub/loop it falls back to
+        # binary search (O(log N)).
+        trail_particle_idx = particle_indices[valid_particle_mask]
+        is_forward = time >= self._trail_prev_time
         self._trail_prev_time = time
 
-        si_arr = np.empty(n_valid, dtype=np.int64)
-        ei_arr = np.empty(n_valid, dtype=np.int64)
+        window_starts = np.empty(n_valid, dtype=np.int64)
+        window_ends = np.empty(n_valid, dtype=np.int64)
 
         _advance_trail_pointers(
-            precomp.times, lo, hi,
-            self._trail_si[particle_idx],
-            self._trail_ei[particle_idx],
-            t_start, time, forward,
-            si_arr, ei_arr,
+            precomp.times, segment_starts, segment_ends,
+            self._trail_si[trail_particle_idx],
+            self._trail_ei[trail_particle_idx],
+            t_trail_start, time, is_forward,
+            window_starts, window_ends,
         )
 
-        self._trail_si[particle_idx] = si_arr
-        self._trail_ei[particle_idx] = ei_arr
+        self._trail_si[trail_particle_idx] = window_starts
+        self._trail_ei[trail_particle_idx] = window_ends
 
-        body_counts = np.maximum(ei_arr - si_arr, 0)
-        body_starts = lo + si_arr  # absolute index into packed arrays
+        body_counts = np.maximum(window_ends - window_starts, 0)
+        body_starts = segment_starts + window_starts
 
-        # --- Vectorized tail lerp ---
-        # Tail exists when si > 0 (there's a precomputed point before t_start)
-        can_tail = (si_arr > 0) & (si_arr <= n_precomp)
-        # Clamp to valid range — particles with si=0 get dummy indices
-        # (their results are masked out by can_tail / has_tail).
-        i_before = np.maximum(lo + si_arr - 1, lo)
-        i_after = np.minimum(lo + si_arr, hi - 1)
-        t_before = precomp.times[i_before]
-        t_after = precomp.times[i_after]
-        dt_tail = t_after - t_before
-        has_tail = can_tail & (dt_tail > 0)
-        alpha_tail = np.where(has_tail, (t_start - t_before) / np.maximum(dt_tail, 1e-30), 0.0)
-        # Compute all lerp'd tail positions (unused ones will be skipped)
-        tail_pos_all = (
-            precomp.positions[i_before] * (1 - alpha_tail[:, np.newaxis])
-            + precomp.positions[i_after] * alpha_tail[:, np.newaxis]
+        # --- Tail interpolation ---
+        # The trail's oldest visible point should be at exactly
+        # t_trail_start, not at the nearest precomputed timestamp.
+        # We linearly interpolate between the precomputed points
+        # straddling t_trail_start so the tail fades in smoothly.
+        can_interpolate_tail = (window_starts > 0) & (window_starts <= precomp_counts)
+        idx_before_tail = np.maximum(segment_starts + window_starts - 1, segment_starts)
+        idx_after_tail = np.minimum(segment_starts + window_starts, segment_ends - 1)
+        t_before_tail = precomp.times[idx_before_tail]
+        t_after_tail = precomp.times[idx_after_tail]
+        tail_time_gap = t_after_tail - t_before_tail
+        has_tail = can_interpolate_tail & (tail_time_gap > 0)
+
+        # Lerp factor: 0 = at before point, 1 = at after point
+        tail_lerp_factor = np.where(
+            has_tail,
+            (t_trail_start - t_before_tail) / np.maximum(tail_time_gap, 1e-30),
+            0.0,
+        )
+        tail_positions = (
+            precomp.positions[idx_before_tail] * (1 - tail_lerp_factor[:, np.newaxis])
+            + precomp.positions[idx_after_tail] * tail_lerp_factor[:, np.newaxis]
         )
 
-        # --- Compute per-particle point counts and filter ---
-        counts = body_counts + 1 + has_tail.astype(np.int64)  # +1 for head
-        active_mask = counts >= 2
-        if not active_mask.any():
+        # --- Filter to particles with enough points to draw ---
+        # Need at least 2 points (tail/body/head) to render a line segment
+        trail_point_counts = body_counts + 1 + has_tail.astype(np.int64)
+        drawable = trail_point_counts >= 2
+        if not drawable.any():
             if self._trail_line is not None:
                 self._trail_line.visible = False
             return
 
-        # Filter to only particles with >= 2 trail points
-        a_idx = np.where(active_mask)[0]
-        n_trails = len(a_idx)
-        a_counts = counts[a_idx]
-        a_body_starts = body_starts[a_idx]
-        a_body_counts = body_counts[a_idx]
-        a_has_tail = has_tail[a_idx]
-        a_tail_pos = tail_pos_all[a_idx]
-        a_valid_idx = valid_idx[a_idx]  # index into active_ids / positions
+        drawable_idx = np.where(drawable)[0]
+        n_trails = len(drawable_idx)
+        draw_counts = trail_point_counts[drawable_idx]
+        draw_body_starts = body_starts[drawable_idx]
+        draw_body_counts = body_counts[drawable_idx]
+        draw_has_tail = has_tail[drawable_idx]
+        draw_tail_positions = tail_positions[drawable_idx]
+        draw_particle_idx = valid_particle_mask[drawable_idx]
 
-        total_pts = int(a_counts.sum()) + n_trails - 1  # +NaN separators
+        total_pts = int(draw_counts.sum()) + n_trails - 1  # NaN separators
 
-        # --- Reuse pre-allocated arrays (grow if needed) ---
+        # --- Reuse pre-allocated GPU arrays (grow if needed) ---
         if total_pts > self._trail_capacity:
             self._trail_capacity = int(total_pts * 1.5)
             self._combined_pos = np.empty((self._trail_capacity, 3), dtype=np.float32)
@@ -413,73 +648,40 @@ class RenderEngine:
         combined_pos = self._combined_pos[:total_pts]
         combined_colors = self._combined_colors[:total_pts]
 
-        # Compute write offsets for each particle's block
-        # write_offsets[k] = start index in combined arrays for trail k.
-        # Layout: [trail_0] [NaN] [trail_1] [NaN] ... [trail_N-1]
+        # Output offset per trail: accounts for NaN separators between trails
         write_offsets = np.empty(n_trails, dtype=np.int64)
         write_offsets[0] = 0
         if n_trails > 1:
-            cum = np.cumsum(a_counts)
-            for k in range(1, n_trails):
-                write_offsets[k] = cum[k - 1] + k  # k NaN separators before trail k
+            cumulative_counts = np.cumsum(draw_counts)
+            write_offsets[1:] = cumulative_counts[:-1] + np.arange(1, n_trails)
 
-        # Pre-fill NaN separators
-        for k in range(1, n_trails):
-            sep_idx = write_offsets[k] - 1
-            combined_pos[sep_idx] = np.nan
-            combined_colors[sep_idx] = np.nan
+        # Per-particle color lookup
+        particle_color_indices = self._pid_lookup[
+            active_ids[draw_particle_idx].astype(np.intp)
+        ]
 
-        # Look up color indices for all active trail particles
-        color_idx = self._pid_lookup[active_ids[a_valid_idx].astype(np.intp)]
-
-        # Write each particle's trail data
-        for k in range(n_trails):
-            off = write_offsets[k]
-            count = int(a_counts[k])
-            bc = int(a_body_counts[k])
-            w = 0
-
-            # Tail
-            if a_has_tail[k]:
-                combined_pos[off] = a_tail_pos[k]
-                w = 1
-
-            # Body (bulk copy from precomputed)
-            if bc > 0:
-                bs = int(a_body_starts[k])
-                combined_pos[off + w:off + w + bc] = precomp.positions[bs:bs + bc]
-                w += bc
-
-            # Head
-            combined_pos[off + w] = positions[a_valid_idx[k]]
-
-            # Colors: base RGB + time-based alpha
-            combined_colors[off:off + count, :3] = self._colors[color_idx[k], :3]
-
-        # --- Vectorized time-based alpha for ALL trail points at once ---
+        # Assemble all trail geometry in compiled code (numba)
         combined_times = self._combined_times[:total_pts]
-        combined_times[:] = np.nan  # NaN separators get NaN time (ignored)
+        _assemble_trails(
+            combined_pos, combined_colors, combined_times,
+            write_offsets, draw_counts, draw_body_starts, draw_body_counts,
+            draw_has_tail, draw_tail_positions, draw_particle_idx,
+            particle_color_indices,
+            precomp.positions, precomp.times, positions, self._colors,
+            t_trail_start, time,
+        )
 
-        for k in range(n_trails):
-            off = write_offsets[k]
-            count = int(a_counts[k])
-            bc = int(a_body_counts[k])
-            w = 0
-            if a_has_tail[k]:
-                combined_times[off] = t_start
-                w = 1
-            if bc > 0:
-                bs = int(a_body_starts[k])
-                combined_times[off + w:off + w + bc] = precomp.times[bs:bs + bc]
-                w += bc
-            combined_times[off + w] = time
-
-        # Single vectorized alpha computation across all points
-        valid_mask = ~np.isnan(combined_times)
-        t_frac = np.zeros(total_pts)
-        t_frac[valid_mask] = (combined_times[valid_mask] - t_start) * inv_window
-        lut_idx = (t_frac * lut_max).astype(np.intp)
-        combined_colors[:, 3] = lut[lut_idx] * self._trail_alpha
+        # --- Alpha gradient: older points fade out, newest are opaque ---
+        # Each point's alpha is determined by its time position within
+        # the trail window, mapped through a power-law curve (t^1.5)
+        # stored in the alpha lookup table.
+        valid_time_mask = ~np.isnan(combined_times)
+        time_fraction = np.zeros(total_pts)
+        time_fraction[valid_time_mask] = (
+            (combined_times[valid_time_mask] - t_trail_start) * inv_trail_window
+        )
+        alpha_index = (time_fraction * max_alpha_index).astype(np.intp)
+        combined_colors[:, 3] = alpha_table[alpha_index] * self._trail_alpha
 
         if self._trail_line is not None:
             self._trail_line.set_data(
@@ -522,10 +724,48 @@ class RenderEngine:
                 self._anim_time = 0.0
                 self._trail_si[:] = -1
                 self._trail_ei[:] = -1
-            self._current_sim_time = float(
-                self._time_mapping.anim_to_sim(self._anim_time),
-            )
+            self._current_sim_time = self._t_min + self._anim_time * self._time_range
+        self._apply_keyboard_pan()
         self._update_frame()
+
+    def _update_light_direction(self) -> None:
+        """Transform the world-space light direction into eye space.
+
+        VisPy's Markers shader expects the light direction in eye space
+        (camera-relative coordinates).  By transforming a fixed world-space
+        light direction through the camera's view rotation each frame,
+        particles get consistent directional lighting: the bright side
+        faces the light and the dark side faces away, regardless of
+        camera angle.  This gives strong depth cues when orbiting.
+        """
+        import math
+        camera = self._view.camera
+        world_light_dir = np.array(D.LIGHT_POSITION, dtype=np.float64)
+        world_light_dir /= np.linalg.norm(world_light_dir)
+
+        # Rotate world light direction by the inverse of the camera's
+        # azimuth and elevation to get eye-space direction
+        az = math.radians(-camera.azimuth)
+        el = math.radians(-camera.elevation)
+
+        # Azimuth rotation (around Z axis)
+        cos_az, sin_az = math.cos(az), math.sin(az)
+        x = world_light_dir[0] * cos_az - world_light_dir[1] * sin_az
+        y = world_light_dir[0] * sin_az + world_light_dir[1] * cos_az
+        z = world_light_dir[2]
+
+        # Elevation rotation (around X axis)
+        cos_el, sin_el = math.cos(el), math.sin(el)
+        eye_y = y * cos_el - z * sin_el
+        eye_z = y * sin_el + z * cos_el
+
+        eye_light = np.array([x, eye_y, eye_z])
+        eye_light /= np.linalg.norm(eye_light)
+
+        if self._particle_visual is not None:
+            self._particle_visual.light_position = tuple(eye_light)
+        if self._subview_markers is not None:
+            self._subview_markers.light_position = tuple(eye_light)
 
     def _update_frame(self) -> None:
         positions, active_ids, _ = self._interp.evaluate_batch(self._current_sim_time)
@@ -533,6 +773,7 @@ class RenderEngine:
             self._canvas.update()
             return
 
+        self._update_light_direction()
         attrs = self._get_particle_attrs(active_ids)
 
         if self._particle_visual is not None:
@@ -574,8 +815,8 @@ class RenderEngine:
 
     @sim_time.setter
     def sim_time(self, value: float) -> None:
-        self._current_sim_time = np.clip(value, self._data.times[0], self._data.times[-1])
-        self._anim_time = float(self._time_mapping.sim_to_anim(self._current_sim_time))
+        self._current_sim_time = np.clip(value, self._t_min, self._t_max)
+        self._anim_time = (self._current_sim_time - self._t_min) / self._time_range
         self._update_frame()
 
     @property
@@ -747,14 +988,14 @@ class RenderEngine:
         import imageio.v3 as iio
 
         n_frames = int(duration * fps)
-        frame_sim_times = self._time_mapping.get_frame_times(n_frames)
+        frame_sim_times = np.linspace(self._t_min, self._t_max, n_frames)
         filepath = Path(filepath)
         render_size = size or self._canvas.size
 
         with iio.imopen(str(filepath), "w") as writer:
             for i, t in enumerate(frame_sim_times):
                 self._current_sim_time = t
-                self._anim_time = float(self._time_mapping.sim_to_anim(t))
+                self._anim_time = (t - self._t_min) / self._time_range
                 self._update_frame()
 
                 img = self._canvas.render(size=render_size)

@@ -176,74 +176,84 @@ class TrajectoryInterpolator:
         return result
 
     def _build_batch_eval(self) -> None:
-        """Pre-extract spline coefficients for vectorized evaluate_batch.
+        """Pre-extract spline coefficients for vectorized position evaluation.
 
-        For single-segment particles sharing the same breakpoints (the
-        common case), stores coefficients in a layout optimised for
-        vectorized Horner evaluation with a single ``searchsorted`` call.
+        Scipy's CubicSpline stores polynomial coefficients internally as
+        arrays of shape (4, M, 3) where:
+          - 4 = cubic polynomial coefficients [c₃, c₂, c₁, c₀] (highest degree first)
+          - M = number of intervals between breakpoints
+          - 3 = spatial dimensions (x, y, z)
+
+        For each interval k, the position at time t is evaluated via
+        Horner's method: pos = ((c₃·dt + c₂)·dt + c₁)·dt + c₀
+        where dt = t - breakpoint[k].
+
+        Particles are split into two groups:
+          - Single-segment particles (existed for the full simulation):
+            can share breakpoints and be evaluated together with one
+            searchsorted call + vectorized Horner evaluation.
+          - Multi-segment particles (appeared/disappeared mid-simulation):
+            evaluated individually per segment.
         """
         all_ids = self._data.particle_ids
 
-        # Collect per-particle data
-        batch_idx = []
-        batch_pids = []
-        batch_x_list = []    # breakpoint arrays
-        batch_c_list = []    # coefficient arrays (4, M, 3)
-        batch_t_min = []
-        batch_t_max = []
+        # --- Single-segment particles (vectorizable) ---
+        single_seg_indices = []       # index in all_ids
+        single_seg_pids = []          # particle ID
+        single_seg_breakpoints = []   # spline knot times
+        single_seg_coefficients = []  # polynomial coefficients (4, M, 3)
+        single_seg_t_min = []         # earliest valid time
+        single_seg_t_max = []         # latest valid time
 
-        # Slow-path particles (multi-segment or constant)
-        slow_idx = []
-        slow_pids = []
+        # --- Multi-segment particles (evaluated individually) ---
+        multi_seg_indices = []
+        multi_seg_pids = []
 
         for i, pid in enumerate(all_ids):
             pid_key = int(pid)
             segments = self._particle_splines.get(pid_key, [])
             if len(segments) == 1 and segments[0].spline:
                 spline = segments[0].spline
-                batch_idx.append(i)
-                batch_pids.append(pid_key)
-                batch_x_list.append(spline.x)
-                batch_c_list.append(spline.c)
-                batch_t_min.append(spline.x[0])
-                batch_t_max.append(spline.x[-1])
+                single_seg_indices.append(i)
+                single_seg_pids.append(pid_key)
+                single_seg_breakpoints.append(spline.x)
+                single_seg_coefficients.append(spline.c)
+                single_seg_t_min.append(spline.x[0])
+                single_seg_t_max.append(spline.x[-1])
             else:
-                slow_idx.append(i)
-                slow_pids.append(pid_key)
+                multi_seg_indices.append(i)
+                multi_seg_pids.append(pid_key)
 
-        self._batch_idx = np.array(batch_idx, dtype=np.intp)
-        self._batch_pids = np.array(batch_pids, dtype=int)
-        self._batch_t_min = np.array(batch_t_min)
-        self._batch_t_max = np.array(batch_t_max)
-        self._slow_idx = np.array(slow_idx, dtype=np.intp)
-        self._slow_pids = np.array(slow_pids, dtype=int)
+        self._batch_idx = np.array(single_seg_indices, dtype=np.intp)
+        self._batch_pids = np.array(single_seg_pids, dtype=int)
+        self._batch_t_min = np.array(single_seg_t_min)
+        self._batch_t_max = np.array(single_seg_t_max)
+        self._slow_idx = np.array(multi_seg_indices, dtype=np.intp)
+        self._slow_pids = np.array(multi_seg_pids, dtype=int)
 
-        n_batch = len(batch_x_list)
-        if n_batch == 0:
+        n_single = len(single_seg_breakpoints)
+        if n_single == 0:
             self._shared_x = None
             self._batch_c_list = []
             return
 
-        # Check if all fast-path particles share the same breakpoints.
+        # Check if all single-segment particles share the same breakpoints.
         # This is the common case when all particles exist for the full
-        # simulation and were sampled at the same times.
-        ref_x = batch_x_list[0]
-        shared = all(
-            len(x) == len(ref_x) and np.array_equal(x, ref_x)
-            for x in batch_x_list[1:]
+        # simulation and were sampled at the same times.  If so, a single
+        # searchsorted call finds the interval for ALL particles at once.
+        reference_breakpoints = single_seg_breakpoints[0]
+        all_share_breakpoints = all(
+            len(x) == len(reference_breakpoints) and np.array_equal(x, reference_breakpoints)
+            for x in single_seg_breakpoints[1:]
         )
 
-        if shared:
-            self._shared_x = ref_x
-            # Store coefficient list for per-particle gather at eval time.
-            # Each element is (4, M, 3).  At eval time we extract [:, k, :]
-            # for the single interval k found by searchsorted.
-            self._batch_c_list = batch_c_list
+        if all_share_breakpoints:
+            self._shared_x = reference_breakpoints
+            self._batch_c_list = single_seg_coefficients
         else:
-            # Fallback: store per-particle breakpoints + coefficients
             self._shared_x = None
-            self._batch_c_list = batch_c_list
-            self._batch_x_list = batch_x_list
+            self._batch_c_list = single_seg_coefficients
+            self._batch_x_list = single_seg_breakpoints
 
     def evaluate_batch(self, time: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Evaluate all particle positions at a given time.
@@ -269,32 +279,43 @@ class TrajectoryInterpolator:
                 n_active = len(active_indices)
 
                 if self._shared_x is not None:
-                    # All particles share breakpoints: ONE searchsorted
-                    x = self._shared_x
-                    k = max(0, min(int(np.searchsorted(x, time, side='right') - 1),
-                                    len(x) - 2))
-                    dt = time - x[k]
+                    # Shared breakpoints: one searchsorted finds the
+                    # polynomial interval for ALL particles at once
+                    breakpoints = self._shared_x
+                    interval = max(0, min(
+                        int(np.searchsorted(breakpoints, time, side='right') - 1),
+                        len(breakpoints) - 2,
+                    ))
+                    time_offset = time - breakpoints[interval]
 
-                    # Gather coefficients at interval k for active particles
-                    c_at_k = np.empty((n_active, 4, 3))
+                    # Gather polynomial coefficients at this interval
+                    # for each active particle: shape (n_active, 4, 3)
+                    interval_coeffs = np.empty((n_active, 4, 3))
                     for i, j in enumerate(active_indices):
-                        c_at_k[i] = self._batch_c_list[j][:, k, :]
+                        interval_coeffs[i] = self._batch_c_list[j][:, interval, :]
 
-                    # Vectorized Horner evaluation
-                    fast_pos = (((c_at_k[:, 0] * dt + c_at_k[:, 1]) * dt
-                                 + c_at_k[:, 2]) * dt + c_at_k[:, 3])
+                    # Horner evaluation: pos = ((c₃·dt + c₂)·dt + c₁)·dt + c₀
+                    fast_pos = (((interval_coeffs[:, 0] * time_offset
+                                  + interval_coeffs[:, 1]) * time_offset
+                                 + interval_coeffs[:, 2]) * time_offset
+                                + interval_coeffs[:, 3])
                 else:
-                    # Non-shared breakpoints: per-particle searchsorted,
-                    # then vectorized Horner
+                    # Non-shared breakpoints: per-particle interval lookup
                     fast_pos = np.empty((n_active, 3))
                     for i, j in enumerate(active_indices):
-                        x = self._batch_x_list[j]
-                        c = self._batch_c_list[j]
-                        k = max(0, min(int(np.searchsorted(x, time, side='right') - 1),
-                                        len(x) - 2))
-                        dt = time - x[k]
-                        fast_pos[i] = ((c[0, k] * dt + c[1, k]) * dt
-                                       + c[2, k]) * dt + c[3, k]
+                        breakpoints = self._batch_x_list[j]
+                        coeffs = self._batch_c_list[j]
+                        interval = max(0, min(
+                            int(np.searchsorted(breakpoints, time, side='right') - 1),
+                            len(breakpoints) - 2,
+                        ))
+                        time_offset = time - breakpoints[interval]
+                        fast_pos[i] = (
+                            ((coeffs[0, interval] * time_offset
+                              + coeffs[1, interval]) * time_offset
+                             + coeffs[2, interval]) * time_offset
+                            + coeffs[3, interval]
+                        )
 
                 fast_pids = self._batch_pids[active]
                 mask[self._batch_idx[active]] = True
@@ -528,52 +549,61 @@ class TrajectoryInterpolator:
         if len(positions) < 3:
             return positions, times
 
-        diffs = np.diff(positions, axis=0)
-        lens = np.linalg.norm(diffs, axis=1)
+        # Compute the chord (straight-line) vectors between consecutive points
+        chord_vectors = np.diff(positions, axis=0)
+        chord_lengths = np.linalg.norm(chord_vectors, axis=1)
 
-        d1 = diffs[:-1]
-        d2 = diffs[1:]
-        dots = np.einsum("ij,ij->i", d1, d2)
-        norms = lens[:-1] * lens[1:]
-        norms = np.maximum(norms, 1e-30)
-        cos_angle = np.clip(dots / norms, -1.0, 1.0)
-        angles_deg = np.degrees(np.arccos(cos_angle))
+        # Measure the deflection angle at each interior vertex:
+        # the angle between consecutive chord vectors tells us how
+        # sharply the trajectory bends at that point.
+        chord_before = chord_vectors[:-1]
+        chord_after = chord_vectors[1:]
+        dot_products = np.einsum("ij,ij->i", chord_before, chord_after)
+        norm_products = chord_lengths[:-1] * chord_lengths[1:]
+        # Guard against zero-length chords (stationary particles)
+        norm_products = np.maximum(norm_products, 1e-30)
+        cos_deflection = np.clip(dot_products / norm_products, -1.0, 1.0)
+        deflection_angles_deg = np.degrees(np.arccos(cos_deflection))
 
-        # For each segment, take the max angle from its two adjacent
-        # vertices.  Segment i sits between vertex i and vertex i+1;
-        # angles are defined at interior vertices 1..N-2.
-        n_segs = len(lens)
-        seg_angle = np.zeros(n_segs)
-        seg_angle[:-1] = np.maximum(seg_angle[:-1], angles_deg)
-        seg_angle[1:] = np.maximum(seg_angle[1:], angles_deg)
+        # Assign each segment the max deflection angle from its two
+        # endpoints.  Segment i connects vertex i to vertex i+1;
+        # deflection angles are measured at interior vertices 1..N-2.
+        n_segments = len(chord_lengths)
+        segment_bend_angle = np.zeros(n_segments)
+        segment_bend_angle[:-1] = np.maximum(segment_bend_angle[:-1], deflection_angles_deg)
+        segment_bend_angle[1:] = np.maximum(segment_bend_angle[1:], deflection_angles_deg)
 
-        # Only refine segments exceeding the angle threshold
-        n_insert = np.maximum(np.ceil(seg_angle).astype(int) - 1, 0)
-        n_insert[seg_angle < D.REFINE_ANGLE_DEG] = 0
+        # Insert ceil(angle)-1 new points into each segment that exceeds
+        # the threshold.  This gives ~1 point per degree of bend, making
+        # sharp slingshots visually smooth as polylines.
+        points_to_insert = np.maximum(np.ceil(segment_bend_angle).astype(int) - 1, 0)
+        points_to_insert[segment_bend_angle < D.REFINE_ANGLE_DEG] = 0
 
-        if n_insert.sum() == 0:
+        if points_to_insert.sum() == 0:
             return positions, times
 
-        all_insert_times = []
-        for i in range(n_segs):
-            k = n_insert[i]
-            if k > 0:
+        new_times = []
+        for i in range(n_segments):
+            n_new = points_to_insert[i]
+            if n_new > 0:
                 t_a, t_b = times[i], times[i + 1]
-                fracs = np.linspace(0, 1, k + 2)[1:-1]
-                all_insert_times.append(t_a + fracs * (t_b - t_a))
+                fractions = np.linspace(0, 1, n_new + 2)[1:-1]
+                new_times.append(t_a + fractions * (t_b - t_a))
 
-        if not all_insert_times:
+        if not new_times:
             return positions, times
 
-        insert_times = np.concatenate(all_insert_times)
-        insert_pos = self._eval_times(segments, insert_times)
-        if insert_pos is None:
+        # Evaluate the spline at the new insertion times
+        insertion_times = np.concatenate(new_times)
+        insertion_positions = self._eval_times(segments, insertion_times)
+        if insertion_positions is None:
             return positions, times
 
-        all_times = np.concatenate([times, insert_times])
-        all_pos = np.concatenate([positions, insert_pos], axis=0)
-        order = np.argsort(all_times)
-        return all_pos[order], all_times[order]
+        # Merge original and inserted points, sorted by time
+        merged_times = np.concatenate([times, insertion_times])
+        merged_positions = np.concatenate([positions, insertion_positions], axis=0)
+        sort_order = np.argsort(merged_times)
+        return merged_positions[sort_order], merged_times[sort_order]
 
     def _evaluate_particle(
         self, segments: list[_SegmentSpline], time: float

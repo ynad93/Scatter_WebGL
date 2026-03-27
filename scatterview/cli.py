@@ -40,13 +40,6 @@ def main(argv: list[str] | None = None) -> None:
         help="Camera mode (default: manual)",
     )
     parser.add_argument(
-        "--gamma",
-        type=float,
-        default=D.GAMMA,
-        help=f"Time mapping gamma: 0=uniform sim-time advance (default: {D.GAMMA}), "
-             "1=equal screen-time per data timestep.",
-    )
-    parser.add_argument(
         "--trail-length",
         type=float,
         default=None,
@@ -107,11 +100,6 @@ def main(argv: list[str] | None = None) -> None:
     print("Building spline interpolation...")
     interpolator = TrajectoryInterpolator(data)
 
-    # Build time mapping
-    from .core.time_mapping import TimeMapping
-
-    time_mapping = TimeMapping(data.times, gamma=args.gamma)
-
     # Event detection
     if args.detect_events:
         from .core.event_detection import EventDetector
@@ -133,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
         from .core.camera import CameraController, CameraMode
 
         engine = RenderEngine(
-            data, interpolator, time_mapping,
+            data, interpolator,
             size=(args.width, args.height),
         )
         if args.trail_length is not None:
