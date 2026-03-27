@@ -3,6 +3,8 @@
 Monkey-patches timing wrappers around key methods, steps through
 N frames headlessly, and reports per-component breakdown + cProfile stats.
 
+Simulates normal GUI playback: 120 Hz timer, default anim_speed, gamma=0.
+
 Usage:
     python profile_engine.py [datafile] [--frames N] [--warmup N]
 """
@@ -54,6 +56,7 @@ class TimingCollector:
         self._trail_stats.append((total_pts, max_per_particle, n_dirty))
 
 
+
 def _ms(ns_array: np.ndarray) -> tuple[float, float, float, float]:
     """Return (mean, median, p95, max) in milliseconds."""
     ms = ns_array / 1e6
@@ -88,7 +91,7 @@ def main():
     parser.add_argument("datafile", nargs="?", default="cluster_sim_data.csv",
                         help="Path to simulation data file")
     parser.add_argument("--frames", type=int, default=200, help="Number of measured frames")
-    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup frames")
+    parser.add_argument("--warmup", type=int, default=50, help="Number of warmup frames")
     args = parser.parse_args()
 
     N_FRAMES = args.frames
@@ -109,6 +112,7 @@ def main():
 
     from scatterview.rendering.engine import RenderEngine
     from scatterview.core.camera import CameraController, CameraMode
+    from scatterview import defaults as D
 
     engine = RenderEngine(data, interpolator, time_mapping, size=(1280, 720))
     cam = CameraController(engine.view, masses=data.masses)
@@ -116,15 +120,22 @@ def main():
     engine.set_camera_controller(cam)
 
     n_particles = len(data.particle_ids)
-    frame_times = time_mapping.get_frame_times(N_WARMUP + N_FRAMES)
+
+    # Match GUI playback: 120 Hz timer, default anim_speed
+    TIMER_HZ = 120.0
+    anim_step = D.ANIM_SPEED / TIMER_HZ  # anim_time advance per frame
+
+    engine._playing = True
 
     # ---- Phase 2: Warmup ----
-    print(f"Warmup: {N_WARMUP} frames...")
+    print(f"Warmup: {N_WARMUP} frames (anim_step={anim_step:.6f})...")
+    anim_time = 0.0
     for i in range(N_WARMUP):
-        t = float(frame_times[i])
-        engine._current_sim_time = t
-        engine._anim_time = float(time_mapping.sim_to_anim(t))
+        sim_time = float(time_mapping.anim_to_sim(anim_time))
+        engine._current_sim_time = sim_time
+        engine._anim_time = anim_time
         engine._update_frame()
+        anim_time += anim_step
 
     # Force a render to ensure GL context is warm
     engine._canvas.render(size=(1280, 720))
@@ -140,7 +151,6 @@ def main():
         originals["particle_set_data"] = _wrap(engine._particle_visual, "set_data", "particle_set_data", collector)
 
     originals["_update_trails"] = _wrap(engine, "_update_trails", "update_trails", collector)
-    originals["_trail_append"] = _wrap(engine, "_trail_append", "trail_append", collector)
 
     if engine._trail_line is not None:
         originals["trail_line_set_data"] = _wrap(engine._trail_line, "set_data", "trail_line_set_data", collector)
@@ -149,16 +159,18 @@ def main():
         originals["camera_update"] = _wrap(engine._camera_controller, "update", "camera_update", collector)
 
     originals["canvas_update"] = _wrap(engine._canvas, "update", "canvas_update", collector)
+    originals["canvas_render"] = _wrap(engine._canvas, "render", "canvas_render", collector)
 
     # ---- Phase 4: Timed run ----
+    anim_coverage_start = anim_time
     print(f"Profiling: {N_FRAMES} frames...")
     profiler = cProfile.Profile()
     profiler.enable()
 
-    for i in range(N_WARMUP, N_WARMUP + N_FRAMES):
-        t = float(frame_times[i])
-        engine._current_sim_time = t
-        engine._anim_time = float(time_mapping.sim_to_anim(t))
+    for i in range(N_FRAMES):
+        sim_time = float(time_mapping.anim_to_sim(anim_time))
+        engine._current_sim_time = sim_time
+        engine._anim_time = anim_time
 
         collector.begin_frame()
         frame_t0 = time.perf_counter_ns()
@@ -168,28 +180,31 @@ def main():
 
         frame_t1 = time.perf_counter_ns()
 
-        # Trail cache stats
-        total_pts = 0
-        max_pp = 0
-        for pos_list in engine._trail_pos.values():
-            n = len(pos_list)
-            total_pts += n
-            if n > max_pp:
-                max_pp = n
-        n_dirty = len(engine._trail_dirty)
-        collector.add_trail_stats(total_pts, max_pp, n_dirty)
+        # Trail stats from precomputed data
+        precomp = engine._precomp
+        collector.add_trail_stats(
+            len(precomp.times), 0, n_particles,
+        )
 
         collector.end_frame(frame_t1 - frame_t0)
 
-        if (i - N_WARMUP + 1) % 50 == 0:
+        anim_time += anim_step
+        if anim_time > 1.0:
+            anim_time = 0.0
+
+        if (i + 1) % 50 == 0:
             elapsed_ms = (frame_t1 - frame_t0) / 1e6
-            print(f"  Frame {i - N_WARMUP + 1}/{N_FRAMES}  ({elapsed_ms:.1f} ms)")
+            print(f"  Frame {i + 1}/{N_FRAMES}  ({elapsed_ms:.1f} ms)")
 
     profiler.disable()
+    anim_coverage_end = anim_time
 
     # ---- Phase 5: Report ----
     print()
     print(f"ScatterView Profiler -- {N_FRAMES} frames, {n_particles} particles")
+    print(f"  Timer: {TIMER_HZ:.0f} Hz, anim_speed: {D.ANIM_SPEED:.4f}")
+    print(f"  Animation coverage: {anim_coverage_start:.4f} -> {anim_coverage_end:.4f}"
+          f" ({(anim_coverage_end - anim_coverage_start) * 100:.1f}% of total)")
     print("=" * 72)
     print()
 
@@ -202,19 +217,11 @@ def main():
         ("get_particle_attrs", "get_particle_attrs", ""),
         ("particle_set_data", "particle_set_data", ""),
         ("update_trails", "update_trails", ""),
-        ("trail_append", "  trail_append (sum)", ""),
-        ("gpu_array_build", "  gpu_array_build", "derived"),
         ("trail_line_set_data", "  trail_line_set_data", ""),
         ("camera_update", "camera_update", ""),
         ("canvas_update", "canvas_update", ""),
+        ("canvas_render", "canvas_render*", ""),
     ]
-
-    # Compute derived: gpu_array_build = update_trails - trail_append - trail_line_set_data
-    ut = np.array(collector._totals.get("update_trails", [0] * N_FRAMES))
-    ta = np.array(collector._totals.get("trail_append", [0] * N_FRAMES))
-    tl = np.array(collector._totals.get("trail_line_set_data", [0] * N_FRAMES))
-    gpu_build = np.maximum(ut - ta - tl, 0)
-    collector._totals["gpu_array_build"] = gpu_build.tolist()
 
     header = f"{'Component':<24} {'Mean':>8} {'Median':>8} {'P95':>8} {'Max':>8} {'%':>7}"
     print("FRAME TIMING (excluding warmup)")
@@ -238,7 +245,8 @@ def main():
 
     # Unaccounted
     accounted_labels = ["evaluate_batch", "get_particle_attrs", "particle_set_data",
-                        "update_trails", "camera_update", "canvas_update"]
+                        "update_trails", "trail_line_set_data",
+                        "camera_update", "canvas_update", "canvas_render"]
     accounted = sum(
         np.array(collector._totals.get(l, [0] * N_FRAMES)).mean()
         for l in accounted_labels
@@ -246,22 +254,22 @@ def main():
     unaccounted_ns = frame_ns.mean() - accounted
     unaccounted_pct = (unaccounted_ns / frame_ns.mean()) * 100 if frame_ns.mean() > 0 else 0
     print(f"{'Unaccounted':<24} {unaccounted_ns / 1e6:7.2f}ms {'':>8} {'':>8} {'':>8} {unaccounted_pct:6.1f}%")
+    print()
+    print("* canvas_render uses offscreen FBO + glReadPixels; real GUI screen")
+    print("  rendering is cheaper (no pixel readback).")
 
     # Trail cache stats
     print()
     print("TRAIL CACHE STATS")
     print("-" * 72)
-    if collector._trail_stats:
-        stats = np.array(collector._trail_stats)
-        total_pts = stats[:, 0]
-        max_pp = stats[:, 1]
-        n_dirty = stats[:, 2]
-        n_cached = len(engine._trail_pos)
-        mean_pp = total_pts.mean() / max(n_cached, 1)
-        print(f"  Particles with cache: {n_cached}")
-        print(f"  Total trail points (mean/max): {int(total_pts.mean())} / {int(total_pts.max())}")
-        print(f"  Per particle (mean/max): {int(mean_pp)} / {int(max_pp.max())}")
-        print(f"  Dirty rebuilds/frame (mean): {n_dirty.mean():.1f}")
+    precomp = engine._precomp
+    n_with_trails = sum(
+        1 for i in range(n_particles)
+        if precomp.offsets[i + 1] > precomp.offsets[i]
+    )
+    print(f"  Precomputed trails: {n_with_trails} particles, "
+          f"{len(precomp.times):,} total points "
+          f"({precomp.positions.nbytes / 1e6:.1f} MB)")
 
     # cProfile stats
     prof_file = "profile_200frames.prof"

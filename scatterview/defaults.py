@@ -13,19 +13,17 @@ POINT_ALPHA = 1.0
 TRAIL_ALPHA = 0.6
 TRAIL_LENGTH_FRAC = 0.005      # fraction of total simulation time (0.5%)
 TRAIL_WIDTH = 3.0              # pixels
-TRAIL_INITIAL_POINTS = 100     # starting uniform sample count before refinement
 
 # --- Sizing ---
 RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode
 RELATIVE_SIZE_MAX_PX = 20.0    # largest particle in relative mode
 DEFAULT_SIZE_PX = 10.0         # when no radii are provided
-DEPTH_SCALING = True           # closer particles appear larger (perspective-scaled sizes)
+DEPTH_SCALING = False          # closer particles appear larger (perspective-scaled sizes)
 
 # --- Camera ---
 CAMERA_FOV = 45
-CAMERA_EMA_ALPHA = 0.15        # center smoothing (exponential moving average)
-CAMERA_ZOOM_EMA_ALPHA = 0.03   # zoom smoothing (slower than center)
-CAMERA_COM_JUMP_THRESHOLD = 0.5
+CAMERA_EMA_ALPHA = 0.15        # center pan speed (fraction of distance per frame)
+CAMERA_ZOOM_EMA_ALPHA = 0.03   # zoom speed (fraction of distance per frame)
 CAMERA_OUTLIER_SIGMA = 2.0     # core-group rejection: N × median distance
 CAMERA_RADIUS_PERCENTILE = 95.0
 CAMERA_N_NEIGHBORS = 3
@@ -52,4 +50,4 @@ VIDEO_DURATION = 10.0
 VIDEO_FPS = 30
 
 # --- Adaptive trail refinement ---
-REFINE_ANGLE_THRESHOLD = 0.0524  # 3 degrees in radians
+REFINE_ANGLE_DEG = 3.0           # angle threshold in degrees

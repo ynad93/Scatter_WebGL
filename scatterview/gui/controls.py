@@ -147,7 +147,7 @@ class ControlPanel:
         # Time slider
         self._t_min = float(self._engine._data.times[0])
         self._t_max = float(self._engine._data.times[-1])
-        self._time_steps = 1000
+        self._time_steps = 10000
         self._time_slider = self._add_slider(
             section, "Time", self._t_min, self._t_max, self._t_min,
             self._on_time_slider_changed,
@@ -194,9 +194,9 @@ class ControlPanel:
         slider_val = int(frac * self._time_steps)
         slider_val = max(0, min(self._time_steps, slider_val))
 
-        self._slider_updating = True
+        self._time_slider.blockSignals(True)
         self._time_slider.setValue(slider_val)
-        self._slider_updating = False
+        self._time_slider.blockSignals(False)
         self._time_val_label.setText(f"{t:.3g}")
 
     def _on_play_toggle(self) -> None:
@@ -326,17 +326,18 @@ class ControlPanel:
         )
         section.addWidget(self._keep_all_cb)
 
-        # Lock zoom toggle
-        self._lock_zoom_cb = QtWidgets.QCheckBox("Lock Zoom")
-        self._lock_zoom_cb.setChecked(self._camera.lock_zoom)
-        self._lock_zoom_cb.setToolTip(
-            "Camera center tracks particles but zoom is manual.\n"
-            "Uncheck to let the camera auto-zoom to fit framed particles."
+        # Free zoom toggle
+        self._free_zoom_cb = QtWidgets.QCheckBox("Free Zoom")
+        self._free_zoom_cb.setChecked(self._camera.free_zoom)
+        self._free_zoom_cb.setToolTip(
+            "Manual zoom control (scroll wheel / trackpad).\n"
+            "Auto-enabled when you scroll. Uncheck to restore auto-zoom."
         )
-        self._lock_zoom_cb.toggled.connect(
-            lambda v: setattr(self._camera, "lock_zoom", v)
+        self._free_zoom_cb.toggled.connect(
+            lambda v: setattr(self._camera, "free_zoom", v)
         )
-        section.addWidget(self._lock_zoom_cb)
+        self._camera._free_zoom_callbacks.append(self._on_free_zoom_changed)
+        section.addWidget(self._free_zoom_cb)
 
         # Neighbor count (for NEAREST_NEIGHBORS scope)
         self._neighbor_slider = self._add_slider(
@@ -358,6 +359,20 @@ class ControlPanel:
             lambda v: setattr(self._camera, "rotation_speed", v),
         )
 
+        # Camera pan/zoom speed (hidden for modes that don't use smoothing)
+        self._speed_container = QtWidgets.QWidget()
+        speed_layout = QtWidgets.QVBoxLayout(self._speed_container)
+        speed_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_slider(
+            speed_layout, "Pan Speed", 0.01, 0.5, self._camera._ema_alpha,
+            lambda v: setattr(self._camera, "_ema_alpha", v),
+        )
+        self._add_slider(
+            speed_layout, "Zoom Speed", 0.005, 0.2, self._camera._zoom_ema_alpha,
+            lambda v: setattr(self._camera, "_zoom_ema_alpha", v),
+        )
+        section.addWidget(self._speed_container)
+
         # Target particle selector (searchable)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Target"))
@@ -367,6 +382,13 @@ class ControlPanel:
         )
         row.addWidget(self._target_combo)
         section.addLayout(row)
+
+    def _on_free_zoom_changed(self, value: bool) -> None:
+        """Sync checkbox when free zoom is toggled externally (e.g. scroll wheel)."""
+        if self._free_zoom_cb.isChecked() != value:
+            self._free_zoom_cb.blockSignals(True)
+            self._free_zoom_cb.setChecked(value)
+            self._free_zoom_cb.blockSignals(False)
 
     def _make_particle_combo(self) -> "QtWidgets.QComboBox":
         """Create a searchable combo box with all particle IDs."""
@@ -483,9 +505,15 @@ class ControlPanel:
 
         mode = self._mode_names.get(text, CameraMode.MANUAL)
         self._camera.mode = mode
-        # Sync the auto-rotate checkbox with mode selection
         if mode == CameraMode.AUTO_ROTATE:
             self._rotate_cb.setChecked(True)
+
+        # Show pan/zoom speed sliders only for modes that use smoothing
+        uses_smoothing = mode in (
+            CameraMode.AUTO_FRAME, CameraMode.AUTO_ROTATE,
+            CameraMode.EVENT_TRACK, CameraMode.TARGET_COMOVING,
+        )
+        self._speed_container.setVisible(uses_smoothing)
 
     def _on_framing_change(self, text: str) -> None:
         scope = self._framing_names.get(text)

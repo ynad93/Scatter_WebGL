@@ -7,11 +7,47 @@ more physically accurate trajectory rendering.
 
 from __future__ import annotations
 
+import multiprocessing
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.interpolate import CubicHermiteSpline, CubicSpline
 
 from .. import defaults as D
 from .data_loader import SimulationData
+
+
+# ---- Module-level worker for multiprocessing (fork inherits parent memory) ----
+
+_worker_interp = None  # TrajectoryInterpolator, set by pool initializer or before fork
+
+
+def _init_trail_worker(interp) -> None:
+    global _worker_interp
+    _worker_interp = interp
+
+
+def _eval_trail_worker(args: tuple) -> tuple[int, np.ndarray, np.ndarray] | None:
+    """Evaluate one particle's trail at simulation timesteps + 1-pass refinement."""
+    pid, t_end, trail_length = args
+    result = _worker_interp.evaluate_trail(pid, t_end, trail_length)
+    if result is None:
+        return None
+    pos, times = result
+    return (pid, pos, times)
+
+
+@dataclass
+class PrecomputedTrails:
+    """Packed pre-computed trail data for all particles.
+
+    Trails are stored in contiguous arrays with a per-particle offset table
+    so that each particle's trail segment can be extracted via slicing.
+    """
+    times: np.ndarray       # (total_pts,) float64 — packed trail times
+    positions: np.ndarray   # (total_pts, 3) float32 — packed trail positions
+    offsets: np.ndarray     # (n_particles + 1,) int64 — start index per particle
+    pid_to_idx: dict[int, int]  # particle ID → index into offsets
 
 
 class TrajectoryInterpolator:
@@ -46,14 +82,13 @@ class TrajectoryInterpolator:
             # Get the times for this particle's valid positions
             p_times = self._get_particle_times(pid_key)
 
-            if len(p_times) < 2:
-                # Not enough points for interpolation; store raw data
+            if len(p_times) == 0:
+                continue
+            if len(p_times) == 1:
                 self._particle_splines[pid_key] = [
                     _SegmentSpline(
-                        t_start=p_times[0] if len(p_times) > 0 else 0.0,
-                        t_end=p_times[0] if len(p_times) > 0 else 0.0,
-                        spline=None,
-                        constant_pos=pos[0] if len(pos) > 0 else np.zeros(3),
+                        t_start=p_times[0], t_end=p_times[0],
+                        spline=None, constant_pos=pos[0],
                     )
                 ]
                 continue
@@ -96,13 +131,13 @@ class TrajectoryInterpolator:
             else:
                 seg_vel = None
 
-            if len(seg_times) < 2:
+            if len(seg_times) == 0:
+                continue
+            if len(seg_times) == 1:
                 segments.append(
                     _SegmentSpline(
-                        t_start=seg_times[0] if len(seg_times) > 0 else t_start,
-                        t_end=seg_times[0] if len(seg_times) > 0 else t_end,
-                        spline=None,
-                        constant_pos=seg_pos[0] if len(seg_pos) > 0 else np.zeros(3),
+                        t_start=seg_times[0], t_end=seg_times[0],
+                        spline=None, constant_pos=seg_pos[0],
                     )
                 )
                 continue
@@ -143,17 +178,17 @@ class TrajectoryInterpolator:
     def _build_batch_eval(self) -> None:
         """Pre-extract spline coefficients for vectorized evaluate_batch.
 
-        For each particle with a single segment (the common case), caches
-        the breakpoints and coefficients directly (avoiding scipy property
-        access overhead per frame).
+        For single-segment particles sharing the same breakpoints (the
+        common case), stores coefficients in a layout optimised for
+        vectorized Horner evaluation with a single ``searchsorted`` call.
         """
         all_ids = self._data.particle_ids
 
-        # Fast-path data: pre-extracted from scipy spline objects
+        # Collect per-particle data
         batch_idx = []
         batch_pids = []
-        batch_x = []         # breakpoint arrays
-        batch_c = []         # coefficient arrays (4, M, 3)
+        batch_x_list = []    # breakpoint arrays
+        batch_c_list = []    # coefficient arrays (4, M, 3)
         batch_t_min = []
         batch_t_max = []
 
@@ -168,8 +203,8 @@ class TrajectoryInterpolator:
                 spline = segments[0].spline
                 batch_idx.append(i)
                 batch_pids.append(pid_key)
-                batch_x.append(spline.x)
-                batch_c.append(spline.c)
+                batch_x_list.append(spline.x)
+                batch_c_list.append(spline.c)
                 batch_t_min.append(spline.x[0])
                 batch_t_max.append(spline.x[-1])
             else:
@@ -178,137 +213,235 @@ class TrajectoryInterpolator:
 
         self._batch_idx = np.array(batch_idx, dtype=np.intp)
         self._batch_pids = np.array(batch_pids, dtype=int)
-        self._batch_x = batch_x
-        self._batch_c = batch_c
         self._batch_t_min = np.array(batch_t_min)
         self._batch_t_max = np.array(batch_t_max)
         self._slow_idx = np.array(slow_idx, dtype=np.intp)
         self._slow_pids = np.array(slow_pids, dtype=int)
 
+        n_batch = len(batch_x_list)
+        if n_batch == 0:
+            self._shared_x = None
+            self._batch_c_list = []
+            return
+
+        # Check if all fast-path particles share the same breakpoints.
+        # This is the common case when all particles exist for the full
+        # simulation and were sampled at the same times.
+        ref_x = batch_x_list[0]
+        shared = all(
+            len(x) == len(ref_x) and np.array_equal(x, ref_x)
+            for x in batch_x_list[1:]
+        )
+
+        if shared:
+            self._shared_x = ref_x
+            # Store coefficient list for per-particle gather at eval time.
+            # Each element is (4, M, 3).  At eval time we extract [:, k, :]
+            # for the single interval k found by searchsorted.
+            self._batch_c_list = batch_c_list
+        else:
+            # Fallback: store per-particle breakpoints + coefficients
+            self._shared_x = None
+            self._batch_c_list = batch_c_list
+            self._batch_x_list = batch_x_list
+
     def evaluate_batch(self, time: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Evaluate all particle positions at a given time.
 
-        Uses direct polynomial evaluation with pre-cached coefficients
-        for single-segment particles, falling back to per-particle
-        evaluation for multi-segment particles.
+        For single-segment particles sharing breakpoints: one searchsorted
+        call, then vectorized coefficient gather and Horner evaluation.
+        Falls back to per-particle evaluation for multi-segment particles.
 
         Returns (positions, ids, mask) for active particles.
         """
         all_ids = self._data.particle_ids
         n = len(all_ids)
         mask = np.zeros(n, dtype=bool)
-        positions = np.empty((n, 3))
-        active_ids = np.empty(n, dtype=int)
-        count = 0
 
-        # Fast path: direct Horner evaluation with cached coefficients
-        for j in range(len(self._batch_x)):
-            t_min = self._batch_t_min[j]
-            t_max = self._batch_t_max[j]
-            if time < t_min or time > t_max:
-                continue
-            x = self._batch_x[j]
-            c = self._batch_c[j]
-            k = min(int(np.searchsorted(x, time, side='right') - 1), len(x) - 2)
-            dt = time - x[k]
-            positions[count] = ((c[0, k] * dt + c[1, k]) * dt + c[2, k]) * dt + c[3, k]
-            active_ids[count] = self._batch_pids[j]
-            mask[self._batch_idx[j]] = True
-            count += 1
+        # --- Fast path ---
+        n_batch = len(self._batch_t_min)
+        if n_batch > 0:
+            # Vectorized time-range check
+            active = (time >= self._batch_t_min) & (time <= self._batch_t_max)
 
-        # Slow path: multi-segment particles
+            if active.any():
+                active_indices = np.where(active)[0]
+                n_active = len(active_indices)
+
+                if self._shared_x is not None:
+                    # All particles share breakpoints: ONE searchsorted
+                    x = self._shared_x
+                    k = max(0, min(int(np.searchsorted(x, time, side='right') - 1),
+                                    len(x) - 2))
+                    dt = time - x[k]
+
+                    # Gather coefficients at interval k for active particles
+                    c_at_k = np.empty((n_active, 4, 3))
+                    for i, j in enumerate(active_indices):
+                        c_at_k[i] = self._batch_c_list[j][:, k, :]
+
+                    # Vectorized Horner evaluation
+                    fast_pos = (((c_at_k[:, 0] * dt + c_at_k[:, 1]) * dt
+                                 + c_at_k[:, 2]) * dt + c_at_k[:, 3])
+                else:
+                    # Non-shared breakpoints: per-particle searchsorted,
+                    # then vectorized Horner
+                    fast_pos = np.empty((n_active, 3))
+                    for i, j in enumerate(active_indices):
+                        x = self._batch_x_list[j]
+                        c = self._batch_c_list[j]
+                        k = max(0, min(int(np.searchsorted(x, time, side='right') - 1),
+                                        len(x) - 2))
+                        dt = time - x[k]
+                        fast_pos[i] = ((c[0, k] * dt + c[1, k]) * dt
+                                       + c[2, k]) * dt + c[3, k]
+
+                fast_pids = self._batch_pids[active]
+                mask[self._batch_idx[active]] = True
+                n_fast = n_active
+            else:
+                fast_pos = np.empty((0, 3))
+                fast_pids = np.empty(0, dtype=int)
+                n_fast = 0
+        else:
+            fast_pos = np.empty((0, 3))
+            fast_pids = np.empty(0, dtype=int)
+            n_fast = 0
+
+        # --- Slow path: multi-segment particles ---
+        slow_positions = []
+        slow_ids = []
         for j in range(len(self._slow_pids)):
             pid_key = int(self._slow_pids[j])
             segments = self._particle_splines.get(pid_key, [])
             pos = self._evaluate_particle(segments, time)
             if pos is not None:
-                positions[count] = pos
-                active_ids[count] = pid_key
+                slow_positions.append(pos)
+                slow_ids.append(pid_key)
                 mask[self._slow_idx[j]] = True
-                count += 1
 
-        return positions[:count], active_ids[:count], mask
+        # Combine fast and slow results
+        n_slow = len(slow_positions)
+        count = n_fast + n_slow
+        positions = np.empty((count, 3))
+        active_ids = np.empty(count, dtype=int)
+
+        if n_fast > 0:
+            positions[:n_fast] = fast_pos
+            active_ids[:n_fast] = fast_pids
+        if n_slow > 0:
+            positions[n_fast:] = np.array(slow_positions)
+            active_ids[n_fast:] = np.array(slow_ids, dtype=int)
+
+        return positions, active_ids, mask
 
     def evaluate_trails_batch(
         self,
         pids: list[int],
         t_end: float,
         trail_length: float,
-        n_initial: int = D.TRAIL_INITIAL_POINTS,
     ) -> dict[int, tuple[np.ndarray, np.ndarray]]:
         """Evaluate trails for multiple particles at once.
 
-        Batch-evaluates the initial spline sample for all single-segment
-        particles, then refines per-particle.
+        Uses each particle's simulation timesteps as the seed grid,
+        then refines per-particle.
 
         Returns dict of pid -> (positions, times).
         """
-        t_start = max(t_end - trail_length, self._data.times[0])
-        if t_start >= t_end:
-            return {}
-
-        base_times = np.linspace(t_start, t_end, n_initial)
         results = {}
-
-        # Partition particles by evaluation strategy
-        batch_pids = []
-        batch_splines = []
-        slow_pids = []
-
         for pid in pids:
-            segments = self._particle_splines.get(pid, [])
-            if not segments:
-                continue
-            if (len(segments) == 1
-                    and segments[0].spline is not None
-                    and segments[0].t_start <= base_times[0]
-                    and segments[0].t_end >= base_times[-1]):
-                batch_pids.append(pid)
-                batch_splines.append(segments[0].spline)
-            else:
-                slow_pids.append(pid)
-
-        # Batch evaluation: one scipy call per particle (3D spline)
-        if batch_pids:
-            n_p = len(batch_pids)
-            n_t = len(base_times)
-            all_pos = np.empty((n_p, n_t, 3), dtype=np.float64)
-
-            for i, spline in enumerate(batch_splines):
-                all_pos[i] = spline(base_times)
-
-            # Refine per-particle (curvature differs)
-            for i, pid in enumerate(batch_pids):
-                segments = self._particle_splines[pid]
-                pos, t = self._refine_trail(segments, base_times.copy(), all_pos[i])
-                results[pid] = (pos, t)
-
-        for pid in slow_pids:
-            segments = self._particle_splines.get(pid, [])
-            positions = self._eval_times(segments, base_times)
-            if positions is None:
-                continue
-            pos, t = self._refine_trail(segments, base_times.copy(), positions)
-            results[pid] = (pos, t)
-
+            result = self.evaluate_trail(pid, t_end, trail_length)
+            if result is not None:
+                results[pid] = result
         return results
+
+    def precompute_all_trails(
+        self,
+        n_workers: int | None = None,
+    ) -> PrecomputedTrails:
+        """Pre-compute refined trails for every particle over the full simulation.
+
+        Seeds each particle from the simulation's adaptive timesteps
+        (which already concentrate at close encounters), then applies
+        single-pass 3-degree angle refinement.  The result is stored in
+        packed arrays so that render-time trail extraction is purely
+        searchsorted + slice — zero spline evaluation per frame.
+
+        Uses multiprocessing to evaluate particles in parallel (fork-based
+        — workers inherit the interpolator via copy-on-write, no pickling).
+
+        Args:
+            n_workers: Number of worker processes. Defaults to CPU count.
+
+        Returns:
+            PrecomputedTrails with packed arrays and an offset table.
+        """
+        pids = [int(pid) for pid in self._data.particle_ids]
+        t_start = self._data.times[0]
+        t_end = self._data.times[-1]
+        trail_length = t_end - t_start
+
+        if n_workers is None:
+            n_workers = min(multiprocessing.cpu_count(), 4)
+
+        global _worker_interp
+        _worker_interp = self  # set before fork so workers inherit it
+        args = [(pid, float(t_end), trail_length) for pid in pids]
+
+        if n_workers > 1 and len(pids) > 1:
+            chunksize = max(1, len(pids) // n_workers)
+            with multiprocessing.Pool(
+                n_workers, initializer=_init_trail_worker, initargs=(self,),
+            ) as pool:
+                raw_results = pool.map(_eval_trail_worker, args, chunksize=chunksize)
+        else:
+            raw_results = [_eval_trail_worker(a) for a in args]
+
+        # Pack results into contiguous arrays with offset table
+        pid_to_idx: dict[int, int] = {}
+        all_times: list[np.ndarray] = []
+        all_pos: list[np.ndarray] = []
+        offsets = [0]
+
+        for i, pid in enumerate(pids):
+            pid_to_idx[pid] = i
+            result = raw_results[i]
+            if result is not None:
+                _, pos, times = result
+                all_times.append(times)
+                all_pos.append(pos.astype(np.float32))
+                offsets.append(offsets[-1] + len(times))
+            else:
+                offsets.append(offsets[-1])
+
+        if all_times:
+            packed_times = np.concatenate(all_times)
+            packed_pos = np.concatenate(all_pos)
+        else:
+            packed_times = np.empty(0, dtype=np.float64)
+            packed_pos = np.empty((0, 3), dtype=np.float32)
+
+        return PrecomputedTrails(
+            times=packed_times,
+            positions=packed_pos,
+            offsets=np.array(offsets, dtype=np.int64),
+            pid_to_idx=pid_to_idx,
+        )
 
     def evaluate_trail(
         self, pid: int, t_end: float, trail_length: float,
-        n_initial: int = D.TRAIL_INITIAL_POINTS,
     ) -> tuple[np.ndarray, np.ndarray] | None:
         """Evaluate a particle's trajectory over a time range for trail rendering.
 
-        1. Start with n_initial uniformly-spaced points across the window.
-        2. Check consecutive chord angles via dot product.
-        3. Where angle > 3 degrees, insert midpoints (doubling local density).
-        4. Repeat until all angles are below threshold.
+        Uses the simulation's own adaptive timesteps as the seed grid
+        (the integrator already concentrates steps where dynamics are
+        fast, e.g. close encounters).  Then applies iterative angle-based
+        refinement to smooth any remaining sharp bends.
 
         Args:
             pid: Particle ID.
             t_end: End time (current time).
             trail_length: Duration of trail in time units.
-            n_initial: Starting number of uniformly-spaced points.
 
         Returns:
             (positions, times) tuple or None if particle doesn't exist.
@@ -321,7 +454,14 @@ class TrajectoryInterpolator:
         if t_start >= t_end:
             return None
 
-        times = np.linspace(t_start, t_end, n_initial)
+        # Use the simulation's adaptive timesteps as the seed grid.
+        p_times = self._get_particle_times(pid)
+        mask = (p_times >= t_start) & (p_times <= t_end)
+        times = p_times[mask]
+
+        if len(times) < 2:
+            return None
+
         positions = self._eval_times(segments, times)
         if positions is None:
             return None
@@ -359,15 +499,17 @@ class TrajectoryInterpolator:
             elif not seg.spline:
                 return np.tile(seg.constant_pos, (len(times), 1))
 
-        # Slow path: multiple segments or partial coverage
-        positions = []
-        for t in times:
+        # Slow path: multiple segments or partial coverage.
+        # Must return exactly len(times) rows so callers can pair
+        # positions with times.  Fill gaps with NaN.
+        positions = np.full((len(times), 3), np.nan)
+        any_valid = False
+        for i, t in enumerate(times):
             pos = self._evaluate_particle(segments, t)
             if pos is not None:
-                positions.append(pos)
-        if not positions:
-            return None
-        return np.array(positions)
+                positions[i] = pos
+                any_valid = True
+        return positions if any_valid else None
 
     def _refine_trail(
         self,
@@ -375,11 +517,13 @@ class TrajectoryInterpolator:
         times: np.ndarray,
         positions: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Densify trail segments proportional to their deflection angle.
+        """Single-pass angle-based densification of trail segments.
 
-        For each pair of consecutive chords, measure the angle via dot
-        product. Insert ceil(angle) evenly-spaced points into each
-        segment adjacent to the bend (1 point per degree). Single pass.
+        For each pair of consecutive chords exceeding the angle threshold
+        (~3 degrees), inserts ceil(angle)-1 evenly-spaced points into the
+        adjacent segments.  Seeded from the simulation's adaptive timesteps,
+        very few insertions are needed — the integrator already concentrates
+        steps at close encounters and fast orbital phases.
         """
         if len(positions) < 3:
             return positions, times
@@ -395,21 +539,21 @@ class TrajectoryInterpolator:
         cos_angle = np.clip(dots / norms, -1.0, 1.0)
         angles_deg = np.degrees(np.arccos(cos_angle))
 
-        # For each segment, take the max angle from its two adjacent vertices.
-        # Segment i sits between vertex i and vertex i+1;
+        # For each segment, take the max angle from its two adjacent
+        # vertices.  Segment i sits between vertex i and vertex i+1;
         # angles are defined at interior vertices 1..N-2.
         n_segs = len(lens)
         seg_angle = np.zeros(n_segs)
         seg_angle[:-1] = np.maximum(seg_angle[:-1], angles_deg)
         seg_angle[1:] = np.maximum(seg_angle[1:], angles_deg)
 
-        # Insert ceil(angle) - 1 points per segment (1 per degree)
+        # Only refine segments exceeding the angle threshold
         n_insert = np.maximum(np.ceil(seg_angle).astype(int) - 1, 0)
+        n_insert[seg_angle < D.REFINE_ANGLE_DEG] = 0
 
         if n_insert.sum() == 0:
             return positions, times
 
-        # Build all insertion times
         all_insert_times = []
         for i in range(n_segs):
             k = n_insert[i]

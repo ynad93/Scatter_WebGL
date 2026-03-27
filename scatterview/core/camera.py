@@ -57,20 +57,19 @@ class CameraController:
         # Framing scope
         self._framing_scope = FramingScope.CORE_GROUP
         self._keep_all_in_frame = False
-        self._lock_zoom = True
+        self._free_zoom = False
+        self._free_zoom_callbacks: list = []
         self._n_neighbors = D.CAMERA_N_NEIGHBORS
         self._outlier_sigma = D.CAMERA_OUTLIER_SIGMA
 
         # Smoothing parameters
         self._ema_alpha = D.CAMERA_EMA_ALPHA
         self._zoom_ema_alpha = D.CAMERA_ZOOM_EMA_ALPHA
-        self._com_jump_threshold = D.CAMERA_COM_JUMP_THRESHOLD
 
-        # State
-        self._smoothed_center = np.zeros(3)
-        self._smoothed_distance = 10.0
-        self._center_initialized = False
-        self._distance_initialized = False
+        # Smoothing state — starts from camera's current position
+        cam_center = self._camera.center
+        self._smoothed_center = np.array(cam_center, dtype=np.float64) if cam_center else np.zeros(3)
+        self._smoothed_distance = float(self._camera.distance or 10.0)
 
         # Auto-rotate
         self._rotation_speed = D.ROTATION_SPEED
@@ -92,10 +91,6 @@ class CameraController:
     @mode.setter
     def mode(self, value: CameraMode) -> None:
         self._mode = value
-        # Reset smoothing so center and zoom snap to the new target
-        self._center_initialized = False
-        self._distance_initialized = False
-        # Auto-Rotate mode implies rotation enabled
         if value == CameraMode.AUTO_ROTATE:
             self._auto_rotate_enabled = True
 
@@ -122,8 +117,6 @@ class CameraController:
     @target_particle.setter
     def target_particle(self, pid: int | None) -> None:
         self._target_pid = pid
-        self._center_initialized = False
-        self._distance_initialized = False
 
     @property
     def framing_scope(self) -> FramingScope:
@@ -132,8 +125,6 @@ class CameraController:
     @framing_scope.setter
     def framing_scope(self, value: FramingScope) -> None:
         self._framing_scope = value
-        self._center_initialized = False
-        self._distance_initialized = False
 
     @property
     def keep_all_in_frame(self) -> bool:
@@ -144,12 +135,16 @@ class CameraController:
         self._keep_all_in_frame = value
 
     @property
-    def lock_zoom(self) -> bool:
-        return self._lock_zoom
+    def free_zoom(self) -> bool:
+        return self._free_zoom
 
-    @lock_zoom.setter
-    def lock_zoom(self, value: bool) -> None:
-        self._lock_zoom = value
+    @free_zoom.setter
+    def free_zoom(self, value: bool) -> None:
+        if value == self._free_zoom:
+            return
+        self._free_zoom = value
+        for cb in self._free_zoom_callbacks:
+            cb(value)
 
     @property
     def n_neighbors(self) -> int:
@@ -296,42 +291,44 @@ class CameraController:
         return float(np.percentile(distances, self._radius_percentile)) or 1.0
 
     def _smooth_center(self, target_center: np.ndarray) -> np.ndarray:
-        """Apply exponential moving average to center, with jump detection."""
-        if not self._center_initialized:
-            self._smoothed_center = target_center.copy()
-            self._center_initialized = True
+        """Move camera center toward target at constant velocity.
+
+        Each frame, the center moves by `ema_alpha` fraction of the gap
+        to the target, clamped so it never exceeds `ema_alpha * distance`
+        (constant visual speed on screen).
+        """
+        delta = target_center - self._smoothed_center
+        dist = np.linalg.norm(delta)
+        if dist < 1e-30:
             return self._smoothed_center
 
-        # Jump detection for sudden mass loss / particle removal
-        jump = np.linalg.norm(target_center - self._smoothed_center)
-        if jump > self._smoothed_distance * self._com_jump_threshold:
-            # Snap immediately
-            self._smoothed_center = target_center.copy()
-        else:
-            # Smooth with EMA
-            alpha = self._ema_alpha
-            self._smoothed_center = alpha * target_center + (1 - alpha) * self._smoothed_center
+        # Blend toward target: covers ema_alpha of the remaining gap,
+        # but capped at a max visual speed (fraction of camera distance)
+        step = min(self._ema_alpha, 1.0) * dist
+        max_step = self._smoothed_distance * self._ema_alpha
+        step = min(step, max_step)
+        self._smoothed_center = self._smoothed_center + delta * (step / dist)
 
         return self._smoothed_center
 
     def _smooth_distance(self, target_distance: float) -> float:
-        """Smooth camera distance changes (slower than center smoothing).
+        """Move camera distance toward target at constant velocity.
 
-        Snaps immediately after a mode/scope change, then resumes EMA.
+        Each frame, the distance changes by `zoom_ema_alpha` fraction
+        of the gap, giving smooth zoom without snapping.
         """
-        if not self._distance_initialized:
-            self._smoothed_distance = target_distance
-            self._distance_initialized = True
-            return self._smoothed_distance
+        delta = target_distance - self._smoothed_distance
+        step = abs(delta) * min(self._zoom_ema_alpha, 1.0)
+        max_step = abs(self._smoothed_distance) * self._zoom_ema_alpha
+        step = min(step, max_step)
+        self._smoothed_distance += step if delta > 0 else -step
 
-        alpha = self._zoom_ema_alpha
-        self._smoothed_distance = alpha * target_distance + (1 - alpha) * self._smoothed_distance
         return self._smoothed_distance
 
     def _apply_camera(self, center: np.ndarray, extent: float) -> None:
         """Set camera center and distance from extent."""
         self._camera.center = tuple(center)
-        if not self._lock_zoom:
+        if not self._free_zoom:
             fov_rad = np.radians(self._camera.fov / 2)
             target_distance = extent / np.sin(fov_rad) * 1.25  # 80% fill
             distance = self._smooth_distance(target_distance)
@@ -397,18 +394,25 @@ class CameraController:
         self._update_auto_frame(positions, active_ids)
 
     def _update_target_rest(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
-        """Target rest frame: camera locked to target particle."""
+        """Target rest frame: camera locked exactly on target particle."""
         target_pos = self._find_target(positions, active_ids)
         if target_pos is None:
             self._update_auto_frame(positions, active_ids)
             return
 
-        center = self._smooth_center(target_pos)
+        # Lock directly — no smoothing, target stays at screen center
+        self._smoothed_center = target_pos.copy()
+        self._camera.center = tuple(target_pos)
+
         framed_pos, _ = self._select_framed_particles(
             positions, active_ids, reference_pos=target_pos,
         )
-        extent = self._compute_extent(framed_pos, center)
-        self._apply_camera(center, extent)
+        extent = self._compute_extent(framed_pos, target_pos)
+        if not self._free_zoom:
+            fov_rad = np.radians(self._camera.fov / 2)
+            target_distance = extent / np.sin(fov_rad) * 1.25
+            distance = self._smooth_distance(target_distance)
+            self._camera.distance = distance
 
     def _update_target_comoving(
         self, positions: np.ndarray, active_ids: np.ndarray,
@@ -419,12 +423,11 @@ class CameraController:
             self._update_auto_frame(positions, active_ids)
             return
 
-        if self._center_initialized:
-            vel_estimate = target_pos - self._smoothed_center
-            vel_alpha = 0.02  # very slow smoothing for velocity
-            self._target_smoothed_vel = (
-                vel_alpha * vel_estimate + (1 - vel_alpha) * self._target_smoothed_vel
-            )
+        vel_estimate = target_pos - self._smoothed_center
+        vel_alpha = 0.02  # very slow smoothing for velocity
+        self._target_smoothed_vel = (
+            vel_alpha * vel_estimate + (1 - vel_alpha) * self._target_smoothed_vel
+        )
 
         # Predict center from smoothed velocity
         predicted_center = target_pos - self._target_smoothed_vel * 0.5

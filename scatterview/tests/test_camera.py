@@ -167,7 +167,7 @@ class TestFramingScope:
         """Auto-frame mode should use the framing scope for extent calculation."""
         view = _FakeView()
         ctrl = CameraController(view)
-        ctrl.lock_zoom = False
+        ctrl.free_zoom = False
         ctrl.mode = CameraMode.AUTO_FRAME
         ctrl.framing_scope = FramingScope.CORE_GROUP
 
@@ -180,17 +180,16 @@ class TestFramingScope:
         ])
         ids = np.array([0, 1, 2, 3])
 
-        # Run with CORE_GROUP (should ignore outlier → smaller distance)
+        # Run with CORE_GROUP — update many frames so smoothing converges
         ctrl.framing_scope = FramingScope.CORE_GROUP
-        ctrl._center_initialized = False
-        ctrl.update(0.0, positions, ids)
+        for _ in range(200):
+            ctrl.update(0.0, positions, ids)
         core_distance = view.camera.distance
 
         # Run with ALL (should include outlier → much larger distance)
         ctrl.framing_scope = FramingScope.ALL
-        ctrl._center_initialized = False
-        ctrl._smoothed_distance = 10.0
-        ctrl.update(0.0, positions, ids)
+        for _ in range(200):
+            ctrl.update(0.0, positions, ids)
         all_distance = view.camera.distance
 
         assert core_distance < all_distance

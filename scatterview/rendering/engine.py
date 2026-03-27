@@ -2,15 +2,66 @@
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
+import numba as nb
 import numpy as np
 
 from .. import defaults as D
 from ..core.data_loader import SimulationData
 from ..core.interpolation import TrajectoryInterpolator
 from ..core.time_mapping import TimeMapping
+
+
+@nb.njit(cache=True)
+def _advance_trail_pointers(
+    packed_times: np.ndarray,   # (total_pts,) float64 — all precomputed times
+    lo: np.ndarray,             # (n,) int64 — start offset per particle
+    hi: np.ndarray,             # (n,) int64 — end offset per particle
+    si_prev: np.ndarray,        # (n,) int64 — previous si (-1 = needs full search)
+    ei_prev: np.ndarray,        # (n,) int64 — previous ei (-1 = needs full search)
+    t_start: float,
+    t_end: float,
+    forward: bool,
+    si_out: np.ndarray,         # (n,) int64 — output
+    ei_out: np.ndarray,         # (n,) int64 — output
+) -> None:
+    """Advance or binary-search trail window pointers for all particles."""
+    for k in range(len(lo)):
+        lo_k = lo[k]
+        n_k = hi[k] - lo_k
+
+        if forward and si_prev[k] >= 0:
+            # Fast path: advance from previous position
+            s = si_prev[k]
+            while s < n_k and packed_times[lo_k + s] <= t_start:
+                s += 1
+            e = ei_prev[k]
+            while e < n_k and packed_times[lo_k + e] < t_end:
+                e += 1
+        else:
+            # Slow path: binary search
+            # searchsorted(side='right') for si
+            s_lo, s_hi = nb.int64(0), n_k
+            while s_lo < s_hi:
+                mid = (s_lo + s_hi) >> 1
+                if packed_times[lo_k + mid] <= t_start:
+                    s_lo = mid + 1
+                else:
+                    s_hi = mid
+            s = s_lo
+            # searchsorted(side='left') for ei
+            e_lo, e_hi = nb.int64(0), n_k
+            while e_lo < e_hi:
+                mid = (e_lo + e_hi) >> 1
+                if packed_times[lo_k + mid] < t_end:
+                    e_lo = mid + 1
+                else:
+                    e_hi = mid
+            e = e_lo
+
+        si_out[k] = s
+        ei_out[k] = e
 
 
 class RenderEngine:
@@ -90,11 +141,31 @@ class RenderEngine:
         self._trail_line = None       # single Line visual for all trails
         self._subview_trail_line = None
 
-        # Trail cache: parallel lists per particle
-        self._trail_times: dict[int, list[float]] = {}
-        self._trail_pos: dict[int, list[np.ndarray]] = {}  # list of (3,) arrays
-        self._trail_pos_array: dict[int, np.ndarray] = {}  # cached (N,3) for GPU
-        self._trail_dirty: set[int] = set()
+        # Vectorized pid→index lookup (used for colors and trail window)
+        max_pid = int(max(data.particle_ids)) + 1
+        self._pid_lookup = np.full(max_pid, -1, dtype=np.int32)
+        for i, pid in enumerate(data.particle_ids):
+            self._pid_lookup[int(pid)] = i
+
+        # Pre-computed trails: evaluated once at startup for the entire
+        # simulation, then sliced per-frame via a sliding window.
+        self._n_particles = n
+        self._precomp = interpolator.precompute_all_trails()
+
+        # Pre-allocated trail GPU arrays — reused each frame to avoid
+        # per-frame allocation and GC pressure at 60+ FPS.
+        self._trail_capacity = 0
+        self._combined_pos = np.empty((0, 3), dtype=np.float32)
+        self._combined_colors = np.empty((0, 4), dtype=np.float32)
+        self._combined_times = np.empty(0, dtype=np.float64)
+
+        # Two-pointer sliding window indices (si, ei) per particle.
+        # During forward playback these advance by 0-2 positions per frame
+        # (O(1)) instead of binary search (O(log N)).  Reset to -1 to
+        # signal that searchsorted is needed (first frame, scrub, loop).
+        self._trail_si = np.full(n, -1, dtype=np.int64)
+        self._trail_ei = np.full(n, -1, dtype=np.int64)
+        self._trail_prev_time = -np.inf
 
         # Pre-computed alpha lookup table (eliminates per-particle linspace + pow)
         self._alpha_lut = (np.linspace(0, 1, 1024) ** 1.5).astype(np.float32)
@@ -102,8 +173,16 @@ class RenderEngine:
         self._build_visuals()
 
         # Timer and camera
-        self._timer = app.Timer(interval=1.0 / 120.0, connect=self._on_timer, start=False)
+        self._timer = app.Timer(interval=1.0 / 60.0, connect=self._on_timer, start=False)
         self._camera_controller = None
+
+        # Auto-enable free zoom on scroll wheel / trackpad zoom
+        self._canvas.events.mouse_wheel.connect(self._on_mouse_wheel)
+
+    def _on_mouse_wheel(self, event) -> None:
+        """Enable free zoom when the user scrolls."""
+        if self._camera_controller is not None and not self._camera_controller.free_zoom:
+            self._camera_controller.free_zoom = True
 
     # ------------------------------------------------------------------
     # Sizing
@@ -159,9 +238,7 @@ class RenderEngine:
 
     def _get_particle_attrs(self, active_ids: np.ndarray) -> dict:
         """Compute face_color, edge_color, edge_width, size in one pass."""
-        idx = np.array(
-            [self._id_to_idx.get(int(pid), 0) for pid in active_ids], dtype=np.intp,
-        )
+        idx = self._pid_lookup[active_ids.astype(np.intp)]
         n = len(active_ids)
         face_color = self._colors[idx].copy()
         edge_color = np.zeros((n, 4), dtype=np.float32)
@@ -224,71 +301,8 @@ class RenderEngine:
             self._particle_visual.set_data(pos=positions, **attrs)
 
     # ------------------------------------------------------------------
-    # Trail rendering (no cache — evaluate fresh each frame)
+    # Trail rendering — precomputed trails with sliding-window extraction
     # ------------------------------------------------------------------
-
-    def _trail_append(self, pid_key: int, head: np.ndarray,
-                      time: float, trail_length: float):
-        """Append head position and trim expired tail points.
-
-        Args:
-            pid_key: Particle ID.
-            head: (3,) position array (already evaluated by caller).
-            time: Current simulation time.
-            trail_length: Trail window in time units.
-        """
-        t_start = max(time - trail_length, self._data.times[0])
-        if t_start >= time:
-            return
-
-        times = self._trail_times.get(pid_key)
-
-        # Cache miss: seed from full evaluation
-        if times is None:
-            result = self._interp.evaluate_trail(pid_key, time, trail_length)
-            if result is None or len(result[0]) < 2:
-                return
-            pos_arr, t_arr = result
-            self._trail_times[pid_key] = t_arr.tolist()
-            self._trail_pos[pid_key] = [pos_arr[i] for i in range(len(pos_arr))]
-            self._trail_dirty.add(pid_key)
-            return
-
-        pos = self._trail_pos[pid_key]
-
-        # Trim expired tail points
-        trim_idx = 0
-        while trim_idx < len(times) and times[trim_idx] < t_start:
-            trim_idx += 1
-        if trim_idx > 0:
-            del times[:trim_idx]
-            del pos[:trim_idx]
-
-        if not times or time <= times[-1]:
-            if trim_idx > 0:
-                self._trail_dirty.add(pid_key)
-            return
-
-        # Subdivide if the new segment bends sharply
-        last_t = times[-1]
-        if len(pos) >= 2:
-            d1 = pos[-1] - pos[-2]
-            d2 = head - pos[-1]
-            dot = (d1 * d2).sum()
-            cos_a = dot / np.sqrt((d1 * d1).sum() * (d2 * d2).sum())
-            n_fill = int(math.ceil(math.degrees(math.acos(max(-1.0, min(1.0, cos_a))))))
-            if n_fill > 1:
-                fill_times = np.linspace(last_t, time, n_fill + 1)[1:]
-                fill_pos = self._interp.evaluate_spline(pid_key, fill_times)
-                if fill_pos is not None:
-                    times.extend(fill_times.tolist())
-                    pos.extend(fill_pos)
-                    self._trail_dirty.add(pid_key)
-                    return
-
-        times.append(time)
-        pos.append(head)
-        self._trail_dirty.add(pid_key)
 
     def _update_trails(self, time: float, positions: np.ndarray,
                        active_ids: np.ndarray) -> None:
@@ -296,63 +310,182 @@ class RenderEngine:
 
         time_range = self._data.times[-1] - self._data.times[0]
         trail_length = time_range * self._trail_length_frac
-
-        # First frame: batch evaluate to seed all caches at once
-        if not self._trail_times:
-            active_pids = [int(pid) for pid in active_ids]
-            batch = self._interp.evaluate_trails_batch(active_pids, time, trail_length)
-            for pid_key, (pos_arr, t_arr) in batch.items():
-                if len(pos_arr) >= 2:
-                    self._trail_times[pid_key] = t_arr.tolist()
-                    self._trail_pos[pid_key] = [pos_arr[i] for i in range(len(pos_arr))]
-
-        # Update each particle's trail — positions already evaluated by caller
-        for i, pid in enumerate(active_ids):
-            self._trail_append(int(pid), positions[i], time, trail_length)
-
-        # Build combined GPU array
-        active_pids = [int(pid) for pid in active_ids]
-        total_pts = 0
-        trail_lengths = {}
-        for pid_key in active_pids:
-            t = self._trail_times.get(pid_key)
-            if t and len(t) >= 2:
-                trail_lengths[pid_key] = len(t)
-                total_pts += len(t)
-        n_trails = len(trail_lengths)
-        if n_trails == 0:
+        t_start = max(time - trail_length, self._data.times[0])
+        if t_start >= time:
             if self._trail_line is not None:
                 self._trail_line.visible = False
             return
-        total_pts += n_trails - 1  # NaN separators
 
-        combined_pos = np.empty((total_pts, 3))
-        combined_colors = np.empty((total_pts, 4))
-        offset = 0
-
+        precomp = self._precomp
         lut = self._alpha_lut
         lut_max = len(lut) - 1
+        n_active = len(active_ids)
+        inv_window = 1.0 / (time - t_start)
 
-        for pid_key, n in trail_lengths.items():
-            if offset > 0:
-                combined_pos[offset] = np.nan
-                combined_colors[offset] = np.nan
-                offset += 1
+        # --- Vectorized window lookup for all particles at once ---
+        # Map active IDs to precomp indices via the lookup table
+        buf_idx = self._pid_lookup[active_ids.astype(np.intp)]
+        valid = buf_idx >= 0
+        lo_all = precomp.offsets[buf_idx[valid]]
+        hi_all = precomp.offsets[buf_idx[valid] + 1]
+        has_data = lo_all < hi_all
 
-            # Rebuild cached array only when dirty
-            if pid_key in self._trail_dirty or pid_key not in self._trail_pos_array:
-                self._trail_pos_array[pid_key] = np.array(self._trail_pos[pid_key])
-                self._trail_dirty.discard(pid_key)
-            combined_pos[offset:offset + n] = self._trail_pos_array[pid_key]
+        # Build arrays only for particles that have precomputed data
+        valid_idx = np.where(valid)[0][has_data]
+        n_valid = len(valid_idx)
+        if n_valid == 0:
+            if self._trail_line is not None:
+                self._trail_line.visible = False
+            return
 
-            base_color = self._colors[self._id_to_idx.get(pid_key, 0)]
-            combined_colors[offset:offset + n, :3] = base_color[:3]
-            indices = (np.arange(n) * (lut_max / max(n - 1, 1))).astype(np.intp)
-            combined_colors[offset:offset + n, 3] = lut[indices] * self._trail_alpha
-            offset += n
+        lo = precomp.offsets[buf_idx[valid_idx]]
+        hi = precomp.offsets[buf_idx[valid_idx] + 1]
+        n_precomp = hi - lo  # (n_valid,) — points per particle
+
+        # Two-pointer sliding window via numba: during forward playback,
+        # advance si/ei from the previous frame (O(1) per particle).
+        # Falls back to binary search on first frame, backward scrub, or loop.
+        particle_idx = buf_idx[valid_idx]  # index into _trail_si/_trail_ei
+        forward = time >= self._trail_prev_time
+        self._trail_prev_time = time
+
+        si_arr = np.empty(n_valid, dtype=np.int64)
+        ei_arr = np.empty(n_valid, dtype=np.int64)
+
+        _advance_trail_pointers(
+            precomp.times, lo, hi,
+            self._trail_si[particle_idx],
+            self._trail_ei[particle_idx],
+            t_start, time, forward,
+            si_arr, ei_arr,
+        )
+
+        self._trail_si[particle_idx] = si_arr
+        self._trail_ei[particle_idx] = ei_arr
+
+        body_counts = np.maximum(ei_arr - si_arr, 0)
+        body_starts = lo + si_arr  # absolute index into packed arrays
+
+        # --- Vectorized tail lerp ---
+        # Tail exists when si > 0 (there's a precomputed point before t_start)
+        can_tail = (si_arr > 0) & (si_arr <= n_precomp)
+        # Clamp to valid range — particles with si=0 get dummy indices
+        # (their results are masked out by can_tail / has_tail).
+        i_before = np.maximum(lo + si_arr - 1, lo)
+        i_after = np.minimum(lo + si_arr, hi - 1)
+        t_before = precomp.times[i_before]
+        t_after = precomp.times[i_after]
+        dt_tail = t_after - t_before
+        has_tail = can_tail & (dt_tail > 0)
+        alpha_tail = np.where(has_tail, (t_start - t_before) / np.maximum(dt_tail, 1e-30), 0.0)
+        # Compute all lerp'd tail positions (unused ones will be skipped)
+        tail_pos_all = (
+            precomp.positions[i_before] * (1 - alpha_tail[:, np.newaxis])
+            + precomp.positions[i_after] * alpha_tail[:, np.newaxis]
+        )
+
+        # --- Compute per-particle point counts and filter ---
+        counts = body_counts + 1 + has_tail.astype(np.int64)  # +1 for head
+        active_mask = counts >= 2
+        if not active_mask.any():
+            if self._trail_line is not None:
+                self._trail_line.visible = False
+            return
+
+        # Filter to only particles with >= 2 trail points
+        a_idx = np.where(active_mask)[0]
+        n_trails = len(a_idx)
+        a_counts = counts[a_idx]
+        a_body_starts = body_starts[a_idx]
+        a_body_counts = body_counts[a_idx]
+        a_has_tail = has_tail[a_idx]
+        a_tail_pos = tail_pos_all[a_idx]
+        a_valid_idx = valid_idx[a_idx]  # index into active_ids / positions
+
+        total_pts = int(a_counts.sum()) + n_trails - 1  # +NaN separators
+
+        # --- Reuse pre-allocated arrays (grow if needed) ---
+        if total_pts > self._trail_capacity:
+            self._trail_capacity = int(total_pts * 1.5)
+            self._combined_pos = np.empty((self._trail_capacity, 3), dtype=np.float32)
+            self._combined_colors = np.empty((self._trail_capacity, 4), dtype=np.float32)
+            self._combined_times = np.empty(self._trail_capacity, dtype=np.float64)
+        combined_pos = self._combined_pos[:total_pts]
+        combined_colors = self._combined_colors[:total_pts]
+
+        # Compute write offsets for each particle's block
+        # write_offsets[k] = start index in combined arrays for trail k.
+        # Layout: [trail_0] [NaN] [trail_1] [NaN] ... [trail_N-1]
+        write_offsets = np.empty(n_trails, dtype=np.int64)
+        write_offsets[0] = 0
+        if n_trails > 1:
+            cum = np.cumsum(a_counts)
+            for k in range(1, n_trails):
+                write_offsets[k] = cum[k - 1] + k  # k NaN separators before trail k
+
+        # Pre-fill NaN separators
+        for k in range(1, n_trails):
+            sep_idx = write_offsets[k] - 1
+            combined_pos[sep_idx] = np.nan
+            combined_colors[sep_idx] = np.nan
+
+        # Look up color indices for all active trail particles
+        color_idx = self._pid_lookup[active_ids[a_valid_idx].astype(np.intp)]
+
+        # Write each particle's trail data
+        for k in range(n_trails):
+            off = write_offsets[k]
+            count = int(a_counts[k])
+            bc = int(a_body_counts[k])
+            w = 0
+
+            # Tail
+            if a_has_tail[k]:
+                combined_pos[off] = a_tail_pos[k]
+                w = 1
+
+            # Body (bulk copy from precomputed)
+            if bc > 0:
+                bs = int(a_body_starts[k])
+                combined_pos[off + w:off + w + bc] = precomp.positions[bs:bs + bc]
+                w += bc
+
+            # Head
+            combined_pos[off + w] = positions[a_valid_idx[k]]
+
+            # Colors: base RGB + time-based alpha
+            combined_colors[off:off + count, :3] = self._colors[color_idx[k], :3]
+
+        # --- Vectorized time-based alpha for ALL trail points at once ---
+        combined_times = self._combined_times[:total_pts]
+        combined_times[:] = np.nan  # NaN separators get NaN time (ignored)
+
+        for k in range(n_trails):
+            off = write_offsets[k]
+            count = int(a_counts[k])
+            bc = int(a_body_counts[k])
+            w = 0
+            if a_has_tail[k]:
+                combined_times[off] = t_start
+                w = 1
+            if bc > 0:
+                bs = int(a_body_starts[k])
+                combined_times[off + w:off + w + bc] = precomp.times[bs:bs + bc]
+                w += bc
+            combined_times[off + w] = time
+
+        # Single vectorized alpha computation across all points
+        valid_mask = ~np.isnan(combined_times)
+        t_frac = np.zeros(total_pts)
+        t_frac[valid_mask] = (combined_times[valid_mask] - t_start) * inv_window
+        lut_idx = (t_frac * lut_max).astype(np.intp)
+        combined_colors[:, 3] = lut[lut_idx] * self._trail_alpha
 
         if self._trail_line is not None:
-            self._trail_line.set_data(pos=combined_pos, color=combined_colors)
+            self._trail_line.set_data(
+                pos=combined_pos, color=combined_colors,
+                width=self._trail_width,
+            )
             self._trail_line.visible = True
         else:
             self._trail_line = scene.Line(
@@ -362,8 +495,12 @@ class RenderEngine:
             )
 
         if self._subview_enabled and self._subview is not None:
+            sub_width = max(1.5, self._trail_width * 0.7)
             if self._subview_trail_line is not None:
-                self._subview_trail_line.set_data(pos=combined_pos, color=combined_colors)
+                self._subview_trail_line.set_data(
+                    pos=combined_pos, color=combined_colors,
+                    width=sub_width,
+                )
                 self._subview_trail_line.visible = True
             else:
                 self._subview_trail_line = scene.Line(
@@ -383,10 +520,8 @@ class RenderEngine:
             self._anim_time += self._anim_speed * dt
             if self._anim_time > 1.0:
                 self._anim_time = 0.0
-                self._trail_times.clear()
-                self._trail_pos.clear()
-                self._trail_pos_array.clear()
-                self._trail_dirty.clear()
+                self._trail_si[:] = -1
+                self._trail_ei[:] = -1
             self._current_sim_time = float(
                 self._time_mapping.anim_to_sim(self._anim_time),
             )
@@ -439,14 +574,8 @@ class RenderEngine:
 
     @sim_time.setter
     def sim_time(self, value: float) -> None:
-        old = self._current_sim_time
         self._current_sim_time = np.clip(value, self._data.times[0], self._data.times[-1])
         self._anim_time = float(self._time_mapping.sim_to_anim(self._current_sim_time))
-        if self._current_sim_time < old:
-            self._trail_times.clear()
-            self._trail_pos.clear()
-            self._trail_pos_array.clear()
-            self._trail_dirty.clear()
         self._update_frame()
 
     @property
@@ -505,10 +634,9 @@ class RenderEngine:
 
     def set_trail_length(self, frac: float) -> None:
         self._trail_length_frac = np.clip(frac, 0.0, 1.0)
-        self._trail_times.clear()
-        self._trail_pos.clear()
-        self._trail_pos_array.clear()
-        self._trail_dirty.clear()
+        # Reset two-pointer cache — trail window bounds changed
+        self._trail_si[:] = -1
+        self._trail_ei[:] = -1
 
     def set_trail_alpha(self, alpha: float) -> None:
         self._trail_alpha = np.clip(alpha, 0.0, 1.0)
