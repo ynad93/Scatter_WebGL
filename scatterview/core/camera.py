@@ -65,6 +65,7 @@ class CameraController:
         # Smoothing parameters
         self._ema_alpha = D.CAMERA_EMA_ALPHA
         self._zoom_ema_alpha = D.CAMERA_ZOOM_EMA_ALPHA
+        self._deadzone_fraction = 0.4
 
         # Smoothing state — starts from camera's current position
         cam_center = self._camera.center
@@ -78,6 +79,7 @@ class CameraController:
         # Target tracking
         self._target_pid: int | None = None
         self._target_smoothed_vel = np.zeros(3)
+        self._target_needs_acquisition = False
 
         # Radius percentile for framing (within framed particles)
         self._radius_percentile = D.CAMERA_RADIUS_PERCENTILE
@@ -117,6 +119,9 @@ class CameraController:
     @target_particle.setter
     def target_particle(self, pid: int | None) -> None:
         self._target_pid = pid
+        # Flag for the next update to jump to the target group
+        # instead of slowly chasing from the current camera position
+        self._target_needs_acquisition = pid is not None
 
     @property
     def framing_scope(self) -> FramingScope:
@@ -171,6 +176,26 @@ class CameraController:
 
         if len(positions) == 0:
             return
+
+        # When a target is first selected, jump the camera to the target
+        # group so the deadzone can maintain tracking from a good position
+        # (instead of slowly chasing from wherever the camera was).
+        if self._target_needs_acquisition:
+            self._target_needs_acquisition = False
+            target_pos = self._find_target(positions, active_ids)
+            if target_pos is not None:
+                framed_pos, framed_ids = self._select_framed_particles(
+                    positions, active_ids, reference_pos=target_pos,
+                )
+                group_center = self._compute_center_of_mass(framed_pos, framed_ids)
+                framing_radius = self._compute_framing_radius(framed_pos, group_center)
+                fov_rad = np.radians(self._camera.fov / 2)
+                ideal_distance = framing_radius / np.sin(fov_rad) * 1.25
+
+                self._smoothed_center = group_center.copy()
+                self._smoothed_distance = ideal_distance
+                self._camera.center = tuple(group_center)
+                self._camera.distance = ideal_distance
 
         if self._mode in (CameraMode.AUTO_FRAME, CameraMode.AUTO_ROTATE):
             self._update_auto_frame(positions, active_ids)
@@ -329,21 +354,67 @@ class CameraController:
 
         return self._smoothed_distance
 
+    def _apply_deadzone(self, target_position: np.ndarray) -> np.ndarray:
+        """Apply deadzone panning: hold camera until target drifts past threshold.
+
+        The camera stays still while the target is within `deadzone_fraction`
+        of the visible radius from screen center.  Once it drifts outside,
+        the camera moves exactly enough to place the target on the deadzone
+        edge.  No additional velocity cap — the deadzone itself IS the
+        smoothing.  This ensures the camera always keeps up, even during
+        fast slingshots.
+        """
+        visible_radius = self._smoothed_distance * np.tan(
+            np.radians(self._camera.fov / 2)
+        )
+        deadzone_radius = visible_radius * self._deadzone_fraction
+
+        offset = target_position - self._smoothed_center
+        offset_distance = np.linalg.norm(offset)
+
+        if offset_distance > deadzone_radius:
+            # Move camera exactly enough to put target on the deadzone edge
+            overshoot = offset_distance - deadzone_radius
+            chase_direction = offset / offset_distance
+            self._smoothed_center = self._smoothed_center + chase_direction * overshoot
+
+        return self._smoothed_center
+
     def _apply_camera(self, center: np.ndarray, framing_radius: float) -> None:
         """Push smoothed center and distance to the VisPy camera.
 
-        When free zoom is on, the user has full manual control — both
-        center and distance are left untouched so scrolling and panning
-        don't fight with the auto-framing.
+        Center is always updated (target tracking should work even if
+        the user has scrolled to zoom manually).  Distance is only
+        updated when free zoom is off — free zoom gives the user manual
+        control of the zoom level while the camera still tracks.
+
+        Zoom uses the deadzone philosophy: the camera distance holds
+        steady until the ideal framing distance differs from the current
+        by more than the deadzone fraction, then chases to the edge.
         """
+        self._camera.center = tuple(center)
+
+        # Free zoom: user controls distance manually via scroll wheel.
+        # Center tracking still works so target modes remain functional.
         if self._free_zoom:
             return
 
-        self._camera.center = tuple(center)
         fov_rad = np.radians(self._camera.fov / 2)
-        target_distance = framing_radius / np.sin(fov_rad) * 1.25
-        distance = self._smooth_distance(target_distance)
-        self._camera.distance = distance
+        ideal_distance = framing_radius / np.sin(fov_rad) * 1.25
+
+        # Zoom deadzone: hold if the ideal distance is within ±50% of
+        # the current smoothed distance.  Chase to the edge if outside.
+        # No velocity cap — the deadzone is the only smoothing.
+        current = self._smoothed_distance
+        delta = ideal_distance - current
+        threshold = abs(current) * self._deadzone_fraction
+
+        if abs(delta) > threshold:
+            edge_distance = current + (delta - np.sign(delta) * threshold)
+            self._smoothed_distance = edge_distance
+            self._camera.distance = edge_distance
+        else:
+            self._camera.distance = current
 
     # --- Helpers ---
 
@@ -361,14 +432,25 @@ class CameraController:
     # --- Mode implementations ---
 
     def _update_auto_frame(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
-        """Auto-frame: frame particles based on current framing scope."""
+        """Auto-frame: frame particles based on current framing scope.
+
+        When using NEAREST_NEIGHBORS scope, applies a deadzone: the
+        camera holds still while the group's center of mass stays within
+        30% of the visible radius, and smoothly chases only when the
+        group drifts outside.
+        """
         reference_pos = self._find_target(positions, active_ids)
 
         framed_pos, framed_ids = self._select_framed_particles(
             positions, active_ids, reference_pos=reference_pos
         )
-        com = self._compute_center_of_mass(framed_pos, framed_ids)
-        center = self._smooth_center(com)
+        target_com = self._compute_center_of_mass(framed_pos, framed_ids)
+
+        if self._framing_scope == FramingScope.NEAREST_NEIGHBORS:
+            center = self._apply_deadzone(target_com)
+        else:
+            center = self._smooth_center(target_com)
+
         framing_radius = self._compute_framing_radius(framed_pos, center)
         self._apply_camera(center, framing_radius)
 
@@ -405,46 +487,41 @@ class CameraController:
         self._update_auto_frame(positions, active_ids)
 
     def _update_target_rest(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
-        """Target rest frame: camera locked exactly on target particle."""
+        """Target rest frame: camera locked exactly on target particle.
+
+        Center is locked directly to the target (no smoothing, no deadzone).
+        Zoom uses _apply_camera which respects the zoom deadzone.
+        """
         target_pos = self._find_target(positions, active_ids)
         if target_pos is None:
             self._update_auto_frame(positions, active_ids)
             return
 
-        # Lock directly — no smoothing, target stays at screen center
+        # Lock center directly — no smoothing, target stays at screen center
         self._smoothed_center = target_pos.copy()
-        self._camera.center = tuple(target_pos)
 
         framed_pos, _ = self._select_framed_particles(
             positions, active_ids, reference_pos=target_pos,
         )
         framing_radius = self._compute_framing_radius(framed_pos, target_pos)
-        if not self._free_zoom:
-            fov_rad = np.radians(self._camera.fov / 2)
-            target_distance = framing_radius / np.sin(fov_rad) * 1.25
-            distance = self._smooth_distance(target_distance)
-            self._camera.distance = distance
+        self._apply_camera(target_pos, framing_radius)
 
     def _update_target_comoving(
         self, positions: np.ndarray, active_ids: np.ndarray,
     ) -> None:
-        """Target comoving frame: smooth velocity tracking."""
+        """Target comoving frame with deadzone.
+
+        The camera holds still while the target particle stays within
+        the deadzone.  Once it drifts past the edge, the camera smoothly
+        chases just enough to pull the target back to the boundary.
+        """
         target_pos = self._find_target(positions, active_ids)
         if target_pos is None:
             self._update_auto_frame(positions, active_ids)
             return
 
-        vel_estimate = target_pos - self._smoothed_center
-        vel_alpha = 0.02  # very slow smoothing for velocity
-        self._target_smoothed_vel = (
-            vel_alpha * vel_estimate + (1 - vel_alpha) * self._target_smoothed_vel
-        )
+        center = self._apply_deadzone(target_pos)
 
-        # Predict center from smoothed velocity
-        predicted_center = target_pos - self._target_smoothed_vel * 0.5
-        center = self._smooth_center(predicted_center)
-
-        # Frame the target's neighborhood
         framed_pos, _ = self._select_framed_particles(
             positions, active_ids, reference_pos=target_pos
         )

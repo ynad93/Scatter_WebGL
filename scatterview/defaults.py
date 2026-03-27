@@ -39,10 +39,13 @@ BH_STARTYPE = 14               # BSE stellar type code identifying black holes
 BH_FACE_COLOR = (0.02, 0.02, 0.05, 0.15)  # near-black with low opacity
 BH_EDGE_WIDTH = 2.0            # edge ring width in pixels
 
-# --- Lighting (VisPy scene lighting for spherical markers) ---
-LIGHT_AMBIENT = 0.2
+# --- Lighting (world-space directional light for spherical markers) ---
+# The light direction is transformed into eye space each frame so that
+# shading changes as you orbit.  Offset from the default camera view
+# direction so particles show visible shadow contrast on startup.
+LIGHT_AMBIENT = 0.15
 LIGHT_COLOR = "white"
-LIGHT_POSITION = (1, -1, 1)
+LIGHT_POSITION = (-0.5, -0.3, 1.0)  # upper-left, offset from default camera
 
 # --- Window ---
 WINDOW_WIDTH = 1280

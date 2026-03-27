@@ -167,6 +167,10 @@ class RenderEngine:
         self._trail_length_frac = D.TRAIL_LENGTH_FRAC
         self._trail_width = D.TRAIL_WIDTH
 
+        # Manual control speeds (WASD pan and scroll zoom)
+        self._pan_speed = 0.02       # fraction of camera distance per frame
+        self._zoom_speed = 1.0       # scroll zoom multiplier (1.0 = default)
+
         # Per-particle settings
         n = len(data.particle_ids)
         self._colors = self._default_colors(n)
@@ -298,7 +302,7 @@ class RenderEngine:
         if scroll == 0:
             return
 
-        speed = 5.0 if self._has_ctrl(event) else 1.0
+        speed = self._zoom_speed * (5.0 if self._has_ctrl(event) else 1.0)
         zoom_factor = 1.1 ** (-scroll * speed)
 
         # Shift center toward cursor: convert the cursor's pixel offset
@@ -381,8 +385,7 @@ class RenderEngine:
         distance = camera.distance or 1.0
 
         # Pan speed per frame (fraction of camera distance)
-        base_speed = 0.02
-        speed = base_speed * (5.0 if self._ctrl_held else 1.0)
+        speed = self._pan_speed * (5.0 if self._ctrl_held else 1.0)
         step = distance * speed
 
         # Camera-relative directions based on azimuth

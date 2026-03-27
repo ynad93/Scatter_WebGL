@@ -332,12 +332,17 @@ class ControlPanel:
         self._camera._free_zoom_callbacks.append(self._on_free_zoom_changed)
         section.addWidget(self._free_zoom_cb)
 
-        # Neighbor count (for NEAREST_NEIGHBORS scope)
+        # Neighbor count (only visible for NEAREST_NEIGHBORS scope)
+        self._neighbor_container = QtWidgets.QWidget()
+        neighbor_layout = QtWidgets.QVBoxLayout(self._neighbor_container)
+        neighbor_layout.setContentsMargins(0, 0, 0, 0)
         self._neighbor_slider = self._add_slider(
-            section, "Neighbors", 1, 10, self._camera.n_neighbors,
+            neighbor_layout, "Neighbors", 1, 10, self._camera.n_neighbors,
             lambda v: setattr(self._camera, "n_neighbors", int(v)),
             steps=9,
         )
+        self._neighbor_container.setVisible(False)
+        section.addWidget(self._neighbor_container)
 
         # Auto-rotate toggle
         self._rotate_cb = QtWidgets.QCheckBox("Auto-Rotate")
@@ -352,19 +357,21 @@ class ControlPanel:
             lambda v: setattr(self._camera, "rotation_speed", v),
         )
 
-        # Camera pan/zoom speed (hidden for modes that don't use smoothing)
-        self._speed_container = QtWidgets.QWidget()
-        speed_layout = QtWidgets.QVBoxLayout(self._speed_container)
-        speed_layout.setContentsMargins(0, 0, 0, 0)
-        self._add_slider(
-            speed_layout, "Pan Speed", 0.01, 0.5, self._camera._ema_alpha,
-            lambda v: setattr(self._camera, "_ema_alpha", v),
+        # Manual control speeds (WASD pan and scroll zoom) — log-spaced
+        self._add_log_slider(
+            section, "Pan Speed", 0.005, 0.1, self._engine._pan_speed,
+            lambda v: setattr(self._engine, "_pan_speed", v),
         )
-        self._add_slider(
-            speed_layout, "Zoom Speed", 0.005, 0.2, self._camera._zoom_ema_alpha,
-            lambda v: setattr(self._camera, "_zoom_ema_alpha", v),
+        self._add_log_slider(
+            section, "Zoom Speed", 0.2, 5.0, self._engine._zoom_speed,
+            lambda v: setattr(self._engine, "_zoom_speed", v),
         )
-        section.addWidget(self._speed_container)
+
+        # Deadzone: fraction of visible radius where camera holds still
+        self._deadzone_slider = self._add_slider(
+            section, "Deadzone", 0.1, 0.8, self._camera._deadzone_fraction,
+            lambda v: setattr(self._camera, "_deadzone_fraction", v),
+        )
 
         # Target particle selector (searchable)
         row = QtWidgets.QHBoxLayout()
@@ -377,7 +384,7 @@ class ControlPanel:
         section.addLayout(row)
 
     def _on_free_zoom_changed(self, value: bool) -> None:
-        """Sync checkbox when free zoom is toggled externally (e.g. scroll wheel)."""
+        """Sync checkbox and hide speed sliders when free zoom changes."""
         if self._free_zoom_cb.isChecked() != value:
             self._free_zoom_cb.blockSignals(True)
             self._free_zoom_cb.setChecked(value)
@@ -501,17 +508,14 @@ class ControlPanel:
         if mode == CameraMode.AUTO_ROTATE:
             self._rotate_cb.setChecked(True)
 
-        # Show pan/zoom speed sliders only for modes that use smoothing
-        uses_smoothing = mode in (
-            CameraMode.AUTO_FRAME, CameraMode.AUTO_ROTATE,
-            CameraMode.EVENT_TRACK, CameraMode.TARGET_COMOVING,
-        )
-        self._speed_container.setVisible(uses_smoothing)
 
     def _on_framing_change(self, text: str) -> None:
+        from ..core.camera import FramingScope
+
         scope = self._framing_names.get(text)
         if scope is not None:
             self._camera.framing_scope = scope
+            self._neighbor_container.setVisible(scope == FramingScope.NEAREST_NEIGHBORS)
 
     def _resolve_pid(self, text: str) -> int | None:
         """Resolve a label string from a combo box to an integer particle ID."""
@@ -527,7 +531,18 @@ class ControlPanel:
             return None
 
     def _on_target_change(self, text: str) -> None:
-        self._camera.target_particle = self._resolve_pid(text)
+        from ..core.camera import CameraMode
+
+        pid = self._resolve_pid(text)
+        self._camera.target_particle = pid
+
+        # Auto-switch to Target Comoving when a target is selected
+        if pid is not None:
+            self._camera.mode = CameraMode.TARGET_COMOVING
+            self._mode_combo.blockSignals(True)
+            self._mode_combo.setCurrentText("Target (Comoving)")
+            self._mode_combo.blockSignals(False)
+            self._on_camera_mode_change("Target (Comoving)")
 
     def _build_subview_controls(self) -> None:
         from PyQt6 import QtWidgets
@@ -585,6 +600,12 @@ class ControlPanel:
             steps=9,
         )
 
+        # Sub-view deadzone
+        self._add_slider(
+            section, "Deadzone", 0.1, 0.8, 0.4,
+            self._set_subview_deadzone,
+        )
+
         # Sub-view auto-rotate
         self._subview_rotate_cb = QtWidgets.QCheckBox("Auto-Rotate")
         self._subview_rotate_cb.toggled.connect(self._on_subview_rotate_toggle)
@@ -626,6 +647,11 @@ class ControlPanel:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.target_particle = self._resolve_pid(text)
+
+    def _set_subview_deadzone(self, value: float) -> None:
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is not None:
+            ctrl._deadzone_fraction = value
 
     def _set_subview_neighbors(self, n: int) -> None:
         ctrl = self._engine._subview_camera_controller
