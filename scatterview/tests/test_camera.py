@@ -76,6 +76,7 @@ class TestFramingScope:
         view = _FakeView()
         ctrl = CameraController(view)
         ctrl.framing_scope = FramingScope.CORE_GROUP
+        ctrl._core_group_percentile = 75.0  # keep inner 75% = 3 of 4
 
         # 4 particles: 3 clustered near origin, 1 far away
         positions = np.array([
@@ -168,13 +169,13 @@ class TestFramingScope:
         framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
         assert len(framed_ids) == 2
 
-    def test_auto_frame_uses_framing_scope(self):
-        """Auto-frame mode should use the framing scope for extent calculation."""
+    def test_tracking_uses_framing_scope(self):
+        """Tracking mode should use the framing scope for zoom distance."""
         view = _FakeView()
         ctrl = CameraController(view)
         ctrl.free_zoom = False
         ctrl.mode = CameraMode.TARGET_COMOVING
-        ctrl.framing_scope = FramingScope.CORE_GROUP
+        ctrl._core_group_percentile = 75.0  # keep inner 3 of 4
 
         # 3 clustered + 1 outlier
         positions = np.array([
@@ -185,13 +186,13 @@ class TestFramingScope:
         ])
         ids = np.array([0, 1, 2, 3])
 
-        # Run with CORE_GROUP — update many frames so smoothing converges
+        # Run with CORE_GROUP (75%) — excludes outlier → smaller distance
         ctrl.framing_scope = FramingScope.CORE_GROUP
         for _ in range(200):
             ctrl.update(0.0, positions, ids)
         core_distance = view.camera.distance
 
-        # Run with ALL (should include outlier → much larger distance)
+        # Run with ALL — includes outlier → much larger distance
         ctrl.framing_scope = FramingScope.ALL
         for _ in range(200):
             ctrl.update(0.0, positions, ids)

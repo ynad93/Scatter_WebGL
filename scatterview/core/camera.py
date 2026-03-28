@@ -56,7 +56,7 @@ class CameraController:
         # Framing: which particles drive the camera
         self._framing_scope = FramingScope.CORE_GROUP
         self._keep_all_in_frame = False
-        self._core_group_percentile = 80.0  # keep inner X% of particles
+        self._core_group_percentile = 100.0  # keep inner X% of particles
         self._n_neighbors = D.CAMERA_N_NEIGHBORS
 
         # Target tracking
