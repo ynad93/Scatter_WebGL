@@ -80,7 +80,7 @@ class CameraController:
         # Framing: which particles drive the camera
         self._framing_scope = FramingScope.CORE_GROUP
         self._keep_all_in_frame = False
-        self._core_group_percentile = 100.0  # keep inner X% of particles
+        self._core_group_percentile = 100.0  # 100% = no filtering; GUI slider adjusts
         self._n_neighbors = D.CAMERA_N_NEIGHBORS
 
         # Target tracking
@@ -218,6 +218,8 @@ class CameraController:
                 group_center = framed_pos.mean(axis=0)
                 framing_radius = self._compute_framing_radius(framed_pos, group_center)
                 fov_rad = np.radians(self._camera.fov / 2)
+                # Distance that fits framing_radius inside the FOV cone,
+                # with 25% padding so particles aren't clipped at screen edges
                 ideal_distance = framing_radius / np.sin(fov_rad) * 1.25
 
                 self._smoothed_center = group_center.copy()
@@ -487,5 +489,4 @@ class CameraController:
     def _apply_rotation(self) -> None:
         """Apply slow auto-rotation around vertical axis."""
         self._azimuth_offset += self._rotation_speed
-        if hasattr(self._camera, "azimuth"):
-            self._camera.azimuth = self._azimuth_offset
+        self._camera.azimuth = self._azimuth_offset

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -165,7 +164,6 @@ class ControlPanel:
         self._sync_timer = QtCore.QTimer()
         self._sync_timer.setInterval(50)  # 20 Hz update
         self._sync_timer.timeout.connect(self._sync_time_slider)
-        self._slider_updating = False  # guard against feedback loops
 
         # Play/Pause button
         row = QtWidgets.QHBoxLayout()
@@ -182,9 +180,8 @@ class ControlPanel:
 
 
     def _on_time_slider_changed(self, value: float) -> None:
-        """User dragged the time slider — update engine (but skip if syncing)."""
-        if not self._slider_updating:
-            self._engine.sim_time = value
+        """User dragged the time slider — update engine."""
+        self._engine.sim_time = value
 
     def _sync_time_slider(self) -> None:
         """Push current engine time back to the slider during playback."""
@@ -292,6 +289,7 @@ class ControlPanel:
             section, "Trail Alpha", 0.0, 1.0, self._engine._trail_alpha,
             self._engine.set_trail_alpha,
         )
+
 
     def _build_camera_controls(self) -> None:
         from PyQt6 import QtWidgets

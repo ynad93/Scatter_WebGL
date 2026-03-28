@@ -37,7 +37,7 @@ BH_EDGE_WIDTH = 2.0            # edge ring width in pixels
 # direction so particles show visible shadow contrast on startup.
 LIGHT_AMBIENT = 0.15
 LIGHT_COLOR = "white"
-LIGHT_POSITION = (-0.5, -0.3, 1.0)  # upper-left, offset from default camera
+LIGHT_POSITION = (-0.5, -0.3, 1.0)  # world-space direction, upper-left offset from camera
 
 # --- Window ---
 WINDOW_WIDTH = 1280

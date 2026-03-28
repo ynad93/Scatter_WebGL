@@ -142,7 +142,8 @@ class TrajectoryInterpolator:
                 )
                 continue
 
-            # Build single 3D spline (evaluates x, y, z together)
+            # Build 3D spline: Hermite when velocities are available
+            # (physically accurate for orbital dynamics), CubicSpline otherwise
             if seg_vel is not None:
                 spline = CubicHermiteSpline(seg_times, seg_pos, seg_vel)
             else:
@@ -534,6 +535,8 @@ class TrajectoryInterpolator:
         norm_products = chord_lengths[:-1] * chord_lengths[1:]
         # Guard against zero-length chords (stationary particles)
         norm_products = np.maximum(norm_products, 1e-30)
+        # Clip to [-1, 1] for arccos domain safety (floating-point rounding
+        # can produce values slightly outside this range)
         cos_deflection = np.clip(dot_products / norm_products, -1.0, 1.0)
         deflection_angles_deg = np.degrees(np.arccos(cos_deflection))
 
@@ -549,6 +552,7 @@ class TrajectoryInterpolator:
         # the threshold.  This gives ~1 point per degree of bend, making
         # sharp slingshots visually smooth as polylines.
         points_to_insert = np.maximum(np.ceil(segment_bend_angle).astype(int) - 1, 0)
+        # Zero out segments below the angle threshold — no refinement needed
         points_to_insert[segment_bend_angle < D.REFINE_ANGLE_DEG] = 0
 
         if points_to_insert.sum() == 0:
@@ -559,6 +563,7 @@ class TrajectoryInterpolator:
             n_new = points_to_insert[i]
             if n_new > 0:
                 t_a, t_b = times[i], times[i + 1]
+                # Interior points only (exclude endpoints which already exist)
                 fractions = np.linspace(0, 1, n_new + 2)[1:-1]
                 new_times.append(t_a + fractions * (t_b - t_a))
 
@@ -588,7 +593,10 @@ class TrajectoryInterpolator:
         if not segments:
             return None
 
-        # Clamp near segment boundaries (within 1% of total span)
+        # Clamp near segment boundaries: floating-point rounding can push
+        # evaluate_batch's time slightly past segment edges.  1% of total
+        # span is generous enough for rounding but tight enough to not
+        # extrapolate meaningfully.  1e-10 absolute floor for very short spans.
         total_span = segments[-1].t_end - segments[0].t_start
         clamp_tol = max(total_span * 0.01, 1e-10)
 

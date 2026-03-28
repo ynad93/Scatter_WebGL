@@ -190,42 +190,36 @@ def load_csv(
         pdf = df.loc[mask].sort_values(time_col)
 
         p_times = pdf[time_col].values.astype(float)
-        # Coerce to numeric — handles empty strings and whitespace from CSVs
-        p_pos = (
+        # Positions use pd.to_numeric because empty/whitespace cells are
+        # the normal way to represent "particle doesn't exist at this
+        # timestep" in ragged CSV grids.  These become NaN → filtered below.
+        p_pos = np.column_stack([
             pd.to_numeric(pdf[pos_cols[0]], errors="coerce").values,
             pd.to_numeric(pdf[pos_cols[1]], errors="coerce").values,
             pd.to_numeric(pdf[pos_cols[2]], errors="coerce").values,
-        )
+        ])
 
-        # Detect valid (non-null) rows
-        valid_mask = np.isfinite(p_pos[0]) & np.isfinite(p_pos[1]) & np.isfinite(p_pos[2])
+        # Filter to rows where the particle exists (non-NaN positions)
+        valid_mask = np.isfinite(p_pos).all(axis=1)
+        positions[pid_key] = p_pos[valid_mask]
 
-        # Build position array for valid rows only
-        pos_array = np.column_stack([p_pos[0][valid_mask], p_pos[1][valid_mask], p_pos[2][valid_mask]])
-        valid_times = p_times[valid_mask]
-
-        positions[pid_key] = pos_array
-
+        # Velocities, masses, radii, startypes only exist at valid rows.
+        # Bad values here are genuinely malformed data and should crash.
         if has_velocity and velocities is not None:
-            v_data = (
-                pdf[vel_cols[0]].values[valid_mask],
-                pdf[vel_cols[1]].values[valid_mask],
-                pdf[vel_cols[2]].values[valid_mask],
-            )
-            velocities[pid_key] = np.column_stack(v_data)
+            velocities[pid_key] = np.column_stack([
+                pdf[vel_cols[0]].values[valid_mask].astype(float),
+                pdf[vel_cols[1]].values[valid_mask].astype(float),
+                pdf[vel_cols[2]].values[valid_mask].astype(float),
+            ])
 
         if has_mass and masses is not None:
-            masses[pid_key] = pdf[mass_col].values[valid_mask]
+            masses[pid_key] = pdf[mass_col].values[valid_mask].astype(float)
 
         if has_radius and radii is not None:
-            r_vals = pd.to_numeric(pdf[radius_col], errors="coerce").values[valid_mask]
-            finite = r_vals[np.isfinite(r_vals)]
-            radii[pid_key] = float(finite[0]) if len(finite) > 0 else 1.0
+            radii[pid_key] = float(pdf[radius_col].values[valid_mask][0])
 
         if has_startype and startypes is not None:
-            k_vals = pd.to_numeric(pdf[startype_col], errors="coerce").values[valid_mask]
-            finite_k = k_vals[np.isfinite(k_vals)]
-            startypes[pid_key] = int(finite_k[0]) if len(finite_k) > 0 else -1
+            startypes[pid_key] = int(pdf[startype_col].values[valid_mask][0])
 
         # Compute valid intervals (continuous segments without nulls)
         valid_intervals[pid_key] = _compute_valid_intervals(p_times, valid_mask)

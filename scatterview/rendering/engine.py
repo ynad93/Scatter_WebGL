@@ -227,12 +227,6 @@ class RenderEngine:
         self._trail_line = None
         self._subview_trail_line = None
 
-        # Vectorized pid→index lookup (used for colors and trail window)
-        max_pid = int(max(data.particle_ids)) + 1
-        self._pid_lookup = np.full(max_pid, -1, dtype=np.int32)
-        for i, pid in enumerate(data.particle_ids):
-            self._pid_lookup[int(pid)] = i
-
         # Pre-computed trails: evaluated once at startup for the entire
         # simulation, then sliced per-frame via a sliding window.
         self._n_particles = n
@@ -283,12 +277,8 @@ class RenderEngine:
 
     @staticmethod
     def _has_ctrl(event) -> bool:
-        """Check if Ctrl is held during an event."""
-        modifiers = getattr(event, 'modifiers', None) or ()
-        return any(
-            (m.name if hasattr(m, 'name') else str(m)).lower() == 'control'
-            for m in modifiers
-        )
+        """Check if Ctrl is held during a VisPy input event."""
+        return any(m.name.lower() == 'control' for m in event.modifiers)
 
     def _on_mouse_wheel(self, event) -> None:
         """Zoom toward the mouse cursor position.
@@ -305,25 +295,21 @@ class RenderEngine:
             self._camera_controller.free_zoom = True
 
         camera = self._view.camera
-        if not hasattr(camera, 'distance') or camera.distance is None:
-            return
 
-        delta = getattr(event, 'delta', None)
-        if delta is None:
-            return
-        scroll = delta[1] if hasattr(delta, '__len__') else float(delta)
+        scroll = event.delta[1]
         if scroll == 0:
             return
 
         speed = self._zoom_speed * (5.0 if self._has_ctrl(event) else 1.0)
+        # 1.1^(-scroll*speed): scroll up → zoom_factor < 1 → closer
         zoom_factor = 1.1 ** (-scroll * speed)
 
         # Shift center toward cursor: convert the cursor's pixel offset
         # from screen center into world-space displacement at the focal
         # plane (the plane through camera.center).
-        mouse_pos = getattr(event, 'pos', None)
+        mouse_pos = event.pos
         canvas_size = self._canvas.size
-        if mouse_pos is not None and len(mouse_pos) >= 2 and canvas_size[1] > 0:
+        if mouse_pos is not None:
             # Cursor offset from screen center, in pixels
             cursor_offset_x = mouse_pos[0] - canvas_size[0] / 2
             cursor_offset_y = mouse_pos[1] - canvas_size[1] / 2
@@ -359,10 +345,7 @@ class RenderEngine:
 
     def _on_key_press(self, event) -> None:
         """Track held keys for smooth continuous panning."""
-        key = getattr(event, 'key', None)
-        if key is None:
-            return
-        key_name = key.name if hasattr(key, 'name') else str(key)
+        key_name = event.key.name
         if key_name in self._PAN_KEYS:
             self._pan_keys_held.add(key_name)
             # Enable free zoom so auto-framing doesn't fight the pan
@@ -373,10 +356,7 @@ class RenderEngine:
 
     def _on_key_release(self, event) -> None:
         """Stop panning when key is released."""
-        key = getattr(event, 'key', None)
-        if key is None:
-            return
-        key_name = key.name if hasattr(key, 'name') else str(key)
+        key_name = event.key.name
         self._pan_keys_held.discard(key_name)
         if key_name == 'Control':
             self._ctrl_held = False
@@ -392,11 +372,9 @@ class RenderEngine:
             return
 
         camera = self._view.camera
-        distance = camera.distance or 1.0
-
-        # Pan speed per frame (fraction of camera distance)
+        # Pan speed scales with camera distance so it feels consistent at any zoom
         speed = self._pan_speed * (5.0 if self._ctrl_held else 1.0)
-        step = distance * speed
+        step = camera.distance * speed
 
         right, forward = self._camera_axes(camera)
 
@@ -418,6 +396,11 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _compute_relative_base_sizes(self) -> np.ndarray:
+        """Map particle radii to screen-pixel sizes.
+
+        Cube root compresses the dynamic range (proportional to volume^(1/3)),
+        then linearly maps [0, max] → [MIN_PX, MAX_PX].
+        """
         n = len(self._data.particle_ids)
         if self._raw_radii is not None:
             compressed = np.cbrt(self._raw_radii)
@@ -429,6 +412,11 @@ class RenderEngine:
         return np.full(n, D.DEFAULT_SIZE_PX, dtype=np.float32)
 
     def _compute_absolute_base_sizes(self) -> np.ndarray:
+        """Map particle radii to world-unit diameters.
+
+        If radii are provided, diameter = 2 * radius.
+        Otherwise, default to 1% of the simulation spatial extent.
+        """
         n = len(self._data.particle_ids)
         if self._raw_radii is not None:
             return 2.0 * self._raw_radii
@@ -619,6 +607,8 @@ class RenderEngine:
         tail_time_gap = t_after_tail - t_before_tail
         has_tail = can_interpolate_tail & (tail_time_gap > 0)
 
+        # Lerp factor: 0.0 = at before point, 1.0 = at after point.
+        # 1e-30 prevents division by zero when times are identical.
         tail_lerp_factor = np.where(
             has_tail,
             (t_trail_start - t_before_tail) / np.maximum(tail_time_gap, 1e-30),
@@ -666,11 +656,13 @@ class RenderEngine:
         combined_pos = self._combined_pos[:total_pts]
         combined_colors = self._combined_colors[:total_pts]
 
-        # Output offset per trail: accounts for NaN separators between trails
+        # Output offset per trail: each trail starts after the previous
+        # trail's points + 1 NaN separator (used by VisPy to break the line strip)
         write_offsets = np.empty(n_trails, dtype=np.int64)
         write_offsets[0] = 0
         if n_trails > 1:
             cumulative_counts = np.cumsum(draw_counts)
+            # +arange(1,n) adds one NaN separator per preceding trail
             write_offsets[1:] = cumulative_counts[:-1] + np.arange(1, n_trails)
 
         # Assemble all trail geometry in compiled code (numba)
@@ -719,8 +711,7 @@ class RenderEngine:
             else:
                 self._subview_trail_line = scene.Line(
                     pos=combined_pos, color=combined_colors,
-                    parent=self._subview.scene,
-                    width=max(1.5, self._trail_width * 0.7),
+                    parent=self._subview.scene, width=sub_width,
                     antialias=True, connect="strip",
                 )
 
@@ -788,6 +779,12 @@ class RenderEngine:
         active_pos = positions[mask]
         attrs = self._get_particle_attrs(mask)
 
+        # Camera update before GPU upload so tracking drives this frame's view
+        if self._camera_controller is not None:
+            self._camera_controller.update(self._current_sim_time, positions, mask)
+        if self._subview_camera_controller is not None and self._subview_enabled:
+            self._subview_camera_controller.update(self._current_sim_time, positions, mask)
+
         if self._particle_visual is not None:
             self._particle_visual.set_data(pos=active_pos, **attrs)
 
@@ -801,11 +798,6 @@ class RenderEngine:
             )
             if self._subview_canvas is not None:
                 self._subview_canvas.update()
-
-        if self._camera_controller is not None:
-            self._camera_controller.update(self._current_sim_time, positions, mask)
-        if self._subview_camera_controller is not None and self._subview_enabled:
-            self._subview_camera_controller.update(self._current_sim_time, positions, mask)
 
         self._canvas.update()
 
@@ -880,10 +872,9 @@ class RenderEngine:
         self._rebuild_particle_visual()
 
     def set_black_hole(self, pid: int, is_bh: bool = True) -> None:
-        if is_bh:
-            self._bh_set.add(pid)
-        else:
-            self._bh_set.discard(pid)
+        idx = self._id_to_idx.get(pid)
+        if idx is not None:
+            self._is_bh[idx] = is_bh
 
     def set_trail_length(self, frac: float) -> None:
         self._trail_length_frac = np.clip(frac, 0.0, 1.0)
