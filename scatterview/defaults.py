@@ -22,14 +22,8 @@ DEPTH_SCALING = False          # if True, closer particles appear larger (perspe
 
 # --- Camera ---
 CAMERA_FOV = 45                # field of view in degrees
-CAMERA_EMA_ALPHA = 0.15        # camera pan speed: max displacement per frame as a
-                               # fraction of the current camera distance
-CAMERA_ZOOM_EMA_ALPHA = 0.03   # camera zoom speed: max distance change per frame
-                               # as a fraction of the current camera distance
-CAMERA_OUTLIER_SIGMA = 2.0     # core-group framing: reject particles farther than
-                               # this many × the median distance from the centroid
-CAMERA_RADIUS_PERCENTILE = 95.0  # framing extent uses this percentile of particle
-                               # distances from center (ignores far outliers)
+CAMERA_EMA_ALPHA = 0.15        # event-track camera smoothing: max displacement per
+                               # frame as a fraction of the current camera distance
 CAMERA_N_NEIGHBORS = 3         # nearest-neighbors framing: track the target
                                # particle plus this many closest neighbors
 ROTATION_SPEED = 0.5           # auto-rotate: degrees of azimuth per frame
@@ -50,7 +44,6 @@ LIGHT_POSITION = (-0.5, -0.3, 1.0)  # upper-left, offset from default camera
 # --- Window ---
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
-SUBVIEW_SIZE_FRAC = 0.3        # picture-in-picture size as fraction of main window
 SUBVIEW_FOV = 60
 
 # --- Video export ---

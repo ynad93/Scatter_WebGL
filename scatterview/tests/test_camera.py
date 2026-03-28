@@ -91,8 +91,8 @@ class TestFramingScope:
         assert 3 not in framed_ids
         assert len(framed_pos) == 3
 
-    def test_core_group_keeps_all_when_close(self):
-        """When all particles are clustered, CORE_GROUP keeps all of them."""
+    def test_core_group_keeps_percentage(self):
+        """CORE_GROUP at 100% keeps all; at 50% keeps half."""
         view = _FakeView()
         ctrl = CameraController(view)
         ctrl.framing_scope = FramingScope.CORE_GROUP
@@ -105,8 +105,13 @@ class TestFramingScope:
         ])
         ids = np.array([0, 1, 2, 3])
 
+        ctrl._core_group_percentile = 100.0
         framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
         assert len(framed_ids) == 4
+
+        ctrl._core_group_percentile = 50.0
+        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
+        assert len(framed_ids) == 2
 
     def test_nearest_neighbors_selects_k_closest(self):
         """NEAREST_NEIGHBORS should frame target + K nearest."""
@@ -168,7 +173,7 @@ class TestFramingScope:
         view = _FakeView()
         ctrl = CameraController(view)
         ctrl.free_zoom = False
-        ctrl.mode = CameraMode.AUTO_FRAME
+        ctrl.mode = CameraMode.TARGET_COMOVING
         ctrl.framing_scope = FramingScope.CORE_GROUP
 
         # 3 clustered + 1 outlier
@@ -195,10 +200,11 @@ class TestFramingScope:
         assert core_distance < all_distance
 
     def test_nearest_neighbors_fallback_without_target(self):
-        """NEAREST_NEIGHBORS without a reference_pos falls back to CORE_GROUP."""
+        """NEAREST_NEIGHBORS without a target uses centroid as reference."""
         view = _FakeView()
         ctrl = CameraController(view)
         ctrl.framing_scope = FramingScope.NEAREST_NEIGHBORS
+        ctrl._n_neighbors = 3
 
         positions = np.array([
             [0.0, 0.0, 0.0],
@@ -208,9 +214,10 @@ class TestFramingScope:
         ])
         ids = np.array([0, 1, 2, 3])
 
-        # No reference_pos → should fall back to core group logic
+        # No target → uses centroid as reference, selects K+1 nearest
         framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        assert 3 not in framed_ids
+        # Should return K+1 = 4 particles (all of them, since K=3 + centroid itself)
+        assert len(framed_ids) <= ctrl._n_neighbors + 1
 
 
 class TestEventDetection:

@@ -1,6 +1,6 @@
 """Automated camera controller for N-body visualization.
 
-Provides composable camera modes: auto-frame, auto-center,
+Provides composable camera modes: tracking, auto-center,
 auto-rotate, event tracking, target tracking, and manual control.
 
 Framing scope controls which particles drive the camera zoom:
@@ -20,11 +20,9 @@ from .. import defaults as D
 
 class CameraMode(Enum):
     MANUAL = auto()
-    AUTO_FRAME = auto()
-    AUTO_ROTATE = auto()
     EVENT_TRACK = auto()
     TARGET_REST_FRAME = auto()
-    TARGET_COMOVING = auto()
+    TARGET_COMOVING = auto()  # unified tracking: deadzone on target or COM
 
 
 class FramingScope(Enum):
@@ -45,44 +43,42 @@ class CameraController:
     """
 
     def __init__(self, view, masses: dict[int, np.ndarray] | None = None, events=None):
-        self._view = view
         self._camera = view.camera
         self._masses = masses
         self._events = events or []
 
-        # Mode
-        self._mode = CameraMode.MANUAL
+        # Camera mode and rotation
+        self._mode = CameraMode.TARGET_COMOVING
         self._auto_rotate_enabled = False
-
-        # Framing scope
-        self._framing_scope = FramingScope.CORE_GROUP
-        self._keep_all_in_frame = False
-        self._free_zoom = False
-        self._free_zoom_callbacks: list = []
-        self._n_neighbors = D.CAMERA_N_NEIGHBORS
-        self._outlier_sigma = D.CAMERA_OUTLIER_SIGMA
-
-        # Smoothing parameters
-        self._ema_alpha = D.CAMERA_EMA_ALPHA
-        self._zoom_ema_alpha = D.CAMERA_ZOOM_EMA_ALPHA
-        self._deadzone_fraction = 0.4
-
-        # Smoothing state — starts from camera's current position
-        cam_center = self._camera.center
-        self._smoothed_center = np.array(cam_center, dtype=np.float64) if cam_center else np.zeros(3)
-        self._smoothed_distance = float(self._camera.distance or 10.0)
-
-        # Auto-rotate
         self._rotation_speed = D.ROTATION_SPEED
         self._azimuth_offset = 0.0
 
+        # Framing: which particles drive the camera
+        self._framing_scope = FramingScope.CORE_GROUP
+        self._keep_all_in_frame = False
+        self._core_group_percentile = 80.0  # keep inner X% of particles
+        self._n_neighbors = D.CAMERA_N_NEIGHBORS
+
         # Target tracking
         self._target_pid: int | None = None
-        self._target_smoothed_vel = np.zeros(3)
         self._target_needs_acquisition = False
 
-        # Radius percentile for framing (within framed particles)
-        self._radius_percentile = D.CAMERA_RADIUS_PERCENTILE
+        # Deadzone: camera holds still until the tracked point drifts
+        # outside this fraction of the visible radius
+        self._deadzone_fraction = 0.5
+
+        # Free zoom: when True, user controls distance via scroll wheel;
+        # center tracking still works for target modes
+        self._free_zoom = False
+        self._free_zoom_callbacks: list = []
+
+        # Event tracking smoothing (only used in EVENT_TRACK mode)
+        self._ema_alpha = D.CAMERA_EMA_ALPHA
+
+        # Camera state — initialized from VisPy camera's current position
+        cam_center = self._camera.center
+        self._smoothed_center = np.array(cam_center, dtype=np.float64) if cam_center else np.zeros(3)
+        self._smoothed_distance = float(self._camera.distance or 10.0)
 
     # --- Properties ---
 
@@ -93,8 +89,6 @@ class CameraController:
     @mode.setter
     def mode(self, value: CameraMode) -> None:
         self._mode = value
-        if value == CameraMode.AUTO_ROTATE:
-            self._auto_rotate_enabled = True
 
     @property
     def auto_rotate(self) -> bool:
@@ -197,14 +191,12 @@ class CameraController:
                 self._camera.center = tuple(group_center)
                 self._camera.distance = ideal_distance
 
-        if self._mode in (CameraMode.AUTO_FRAME, CameraMode.AUTO_ROTATE):
-            self._update_auto_frame(positions, active_ids)
+        if self._mode == CameraMode.TARGET_COMOVING:
+            self._update_target_comoving(positions, active_ids)
         elif self._mode == CameraMode.EVENT_TRACK:
             self._update_event_track(sim_time, positions, active_ids)
         elif self._mode == CameraMode.TARGET_REST_FRAME:
             self._update_target_rest(positions, active_ids)
-        elif self._mode == CameraMode.TARGET_COMOVING:
-            self._update_target_comoving(positions, active_ids)
 
         if self._auto_rotate_enabled:
             self._apply_rotation()
@@ -247,27 +239,20 @@ class CameraController:
     def _select_core_group(
         self, positions: np.ndarray, active_ids: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Reject outlier particles far from the cluster center.
+        """Keep the closest X% of particles by distance from centroid.
 
-        Uses the median distance from the unweighted centroid as the
-        scale. Particles beyond outlier_sigma × median_distance are
-        excluded from framing (they still render, just don't drive the zoom).
+        Particles are ranked by distance from the unweighted centroid.
+        The closest `core_group_percentile`% by count are kept for
+        framing.  Outliers still render but don't drive the camera.
         """
         centroid = positions.mean(axis=0)
         distances = np.linalg.norm(positions - centroid, axis=1)
-        median_dist = np.median(distances)
 
-        if median_dist < 1e-12:
-            return positions, active_ids
-
-        threshold = self._outlier_sigma * median_dist
-        mask = distances <= threshold
-        # Always keep at least 2 particles
-        if mask.sum() < 2:
-            # Keep the closest 2
-            closest = np.argsort(distances)[:2]
-            mask = np.zeros(len(positions), dtype=bool)
-            mask[closest] = True
+        # Keep the closest N particles where N = percentage of total count
+        n_keep = max(2, int(len(positions) * self._core_group_percentile / 100.0))
+        closest = np.argsort(distances)[:n_keep]
+        mask = np.zeros(len(positions), dtype=bool)
+        mask[closest] = True
 
         return positions[mask], active_ids[mask]
 
@@ -277,12 +262,14 @@ class CameraController:
         active_ids: np.ndarray,
         reference_pos: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Select the target particle + its K nearest neighbors.
+        """Select the K nearest neighbors around a reference point.
 
-        If no target is set or reference_pos is None, falls back to CORE_GROUP.
+        If a target particle is set, uses its position as the reference.
+        Otherwise uses the center of mass (mass-weighted if available,
+        unweighted centroid otherwise).
         """
         if reference_pos is None:
-            return self._select_core_group(positions, active_ids)
+            reference_pos = self._compute_center_of_mass(positions, active_ids)
 
         distances = np.linalg.norm(positions - reference_pos, axis=1)
         # K nearest (including the target itself, which has distance ~0)
@@ -317,7 +304,7 @@ class CameraController:
         distances = np.linalg.norm(positions - center, axis=1)
         if len(distances) == 0:
             return 1.0
-        return float(np.percentile(distances, self._radius_percentile)) or 1.0
+        return float(np.max(distances)) or 1.0
 
     def _smooth_center(self, target_center: np.ndarray) -> np.ndarray:
         """Move camera center toward target at constant velocity.
@@ -339,20 +326,6 @@ class CameraController:
         self._smoothed_center = self._smoothed_center + delta * (step / dist)
 
         return self._smoothed_center
-
-    def _smooth_distance(self, target_distance: float) -> float:
-        """Move camera distance toward target at constant velocity.
-
-        Each frame, the distance changes by `zoom_ema_alpha` fraction
-        of the gap, giving smooth zoom without snapping.
-        """
-        delta = target_distance - self._smoothed_distance
-        step = abs(delta) * min(self._zoom_ema_alpha, 1.0)
-        max_step = abs(self._smoothed_distance) * self._zoom_ema_alpha
-        step = min(step, max_step)
-        self._smoothed_distance += step if delta > 0 else -step
-
-        return self._smoothed_distance
 
     def _apply_deadzone(self, target_position: np.ndarray) -> np.ndarray:
         """Apply deadzone panning: hold camera until target drifts past threshold.
@@ -431,29 +404,6 @@ class CameraController:
 
     # --- Mode implementations ---
 
-    def _update_auto_frame(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
-        """Auto-frame: frame particles based on current framing scope.
-
-        When using NEAREST_NEIGHBORS scope, applies a deadzone: the
-        camera holds still while the group's center of mass stays within
-        30% of the visible radius, and smoothly chases only when the
-        group drifts outside.
-        """
-        reference_pos = self._find_target(positions, active_ids)
-
-        framed_pos, framed_ids = self._select_framed_particles(
-            positions, active_ids, reference_pos=reference_pos
-        )
-        target_com = self._compute_center_of_mass(framed_pos, framed_ids)
-
-        if self._framing_scope == FramingScope.NEAREST_NEIGHBORS:
-            center = self._apply_deadzone(target_com)
-        else:
-            center = self._smooth_center(target_com)
-
-        framing_radius = self._compute_framing_radius(framed_pos, center)
-        self._apply_camera(center, framing_radius)
-
     def _update_event_track(
         self, sim_time: float, positions: np.ndarray, active_ids: np.ndarray
     ) -> None:
@@ -483,8 +433,8 @@ class CameraController:
                 self._camera.distance = distance
                 return
 
-        # Fallback to auto-frame
-        self._update_auto_frame(positions, active_ids)
+        # Fallback to tracking mode
+        self._update_target_comoving(positions, active_ids)
 
     def _update_target_rest(self, positions: np.ndarray, active_ids: np.ndarray) -> None:
         """Target rest frame: camera locked exactly on target particle.
@@ -494,7 +444,7 @@ class CameraController:
         """
         target_pos = self._find_target(positions, active_ids)
         if target_pos is None:
-            self._update_auto_frame(positions, active_ids)
+            self._update_target_comoving(positions, active_ids)
             return
 
         # Lock center directly — no smoothing, target stays at screen center
@@ -509,22 +459,30 @@ class CameraController:
     def _update_target_comoving(
         self, positions: np.ndarray, active_ids: np.ndarray,
     ) -> None:
-        """Target comoving frame with deadzone.
+        """Unified deadzone tracking mode.
 
-        The camera holds still while the target particle stays within
-        the deadzone.  Once it drifts past the edge, the camera smoothly
-        chases just enough to pull the target back to the boundary.
+        If a target particle is set, the deadzone tracks that particle.
+        Otherwise, it tracks the center of mass of the framing scope
+        (Core Group, All, or Nearest Neighbors).
+
+        The camera holds still while the tracked point stays within the
+        deadzone.  Once it drifts past the edge, the camera moves exactly
+        enough to bring it back to the boundary.
         """
         target_pos = self._find_target(positions, active_ids)
-        if target_pos is None:
-            self._update_auto_frame(positions, active_ids)
-            return
 
-        center = self._apply_deadzone(target_pos)
-
-        framed_pos, _ = self._select_framed_particles(
-            positions, active_ids, reference_pos=target_pos
+        framed_pos, framed_ids = self._select_framed_particles(
+            positions, active_ids, reference_pos=target_pos,
         )
+
+        if target_pos is not None:
+            # Track the target particle with deadzone
+            tracking_point = target_pos
+        else:
+            # No target — track the group's center of mass
+            tracking_point = self._compute_center_of_mass(framed_pos, framed_ids)
+
+        center = self._apply_deadzone(tracking_point)
         framing_radius = self._compute_framing_radius(framed_pos, center)
         self._apply_camera(center, framing_radius)
 

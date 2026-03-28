@@ -35,9 +35,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--camera",
         type=str,
-        default="manual",
-        choices=["manual", "auto-frame", "auto-rotate", "event-track"],
-        help="Camera mode (default: manual)",
+        default="tracking",
+        choices=["manual", "tracking", "event-track"],
+        help="Camera mode (default: tracking)",
     )
     parser.add_argument(
         "--trail-length",
@@ -130,13 +130,10 @@ def main(argv: list[str] | None = None) -> None:
         cam = CameraController(engine.view, masses=data.masses)
         mode_map = {
             "manual": CameraMode.MANUAL,
-            "auto-frame": CameraMode.AUTO_FRAME,
-            "auto-rotate": CameraMode.AUTO_ROTATE,
+            "tracking": CameraMode.TARGET_COMOVING,
             "event-track": CameraMode.EVENT_TRACK,
         }
         cam.mode = mode_map.get(args.camera, CameraMode.MANUAL)
-        if args.camera == "auto-rotate":
-            cam.auto_rotate = True
         if args.target is not None:
             cam.target_particle = args.target
         engine.set_camera_controller(cam)

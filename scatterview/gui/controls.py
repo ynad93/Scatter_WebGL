@@ -154,6 +154,12 @@ class ControlPanel:
             steps=self._time_steps,
         )
         self._time_val_label = self._time_slider._val_label
+        # Fixed-width label so it doesn't resize as digits change
+        max_text = f"{self._t_max:.1f}"
+        self._time_val_label.setFixedWidth(
+            self._time_val_label.fontMetrics().horizontalAdvance(max_text) + 10
+        )
+        self._time_val_label.setText(f"{self._t_min:.1f}")
 
         # Sync timer: update slider from engine during playback
         self._sync_timer = QtCore.QTimer()
@@ -192,7 +198,7 @@ class ControlPanel:
         self._time_slider.blockSignals(True)
         self._time_slider.setValue(slider_val)
         self._time_slider.blockSignals(False)
-        self._time_val_label.setText(f"{t:.3g}")
+        self._time_val_label.setText(f"{t:.1f}")
 
     def _on_play_toggle(self) -> None:
         self._engine.toggle_play()
@@ -299,6 +305,7 @@ class ControlPanel:
         row.addWidget(QtWidgets.QLabel("Mode"))
         self._mode_combo = self._make_mode_combo()
         self._mode_names = self._camera_mode_names
+        self._mode_combo.setCurrentText("Tracking")
         self._mode_combo.currentTextChanged.connect(self._on_camera_mode_change)
         row.addWidget(self._mode_combo)
         section.addLayout(row)
@@ -332,14 +339,26 @@ class ControlPanel:
         self._camera._free_zoom_callbacks.append(self._on_free_zoom_changed)
         section.addWidget(self._free_zoom_cb)
 
+        # Core group percentile (only visible for CORE_GROUP scope)
+        self._core_group_container = QtWidgets.QWidget()
+        core_layout = QtWidgets.QVBoxLayout(self._core_group_container)
+        core_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_slider(
+            core_layout, "Core %", 1, 100,
+            self._camera._core_group_percentile,
+            lambda v: setattr(self._camera, "_core_group_percentile", v),
+            steps=99,
+        )
+        section.addWidget(self._core_group_container)
+
         # Neighbor count (only visible for NEAREST_NEIGHBORS scope)
         self._neighbor_container = QtWidgets.QWidget()
         neighbor_layout = QtWidgets.QVBoxLayout(self._neighbor_container)
         neighbor_layout.setContentsMargins(0, 0, 0, 0)
         self._neighbor_slider = self._add_slider(
-            neighbor_layout, "Neighbors", 1, 10, self._camera.n_neighbors,
+            neighbor_layout, "Neighbors", 1, 100, self._camera.n_neighbors,
             lambda v: setattr(self._camera, "n_neighbors", int(v)),
-            steps=9,
+            steps=99,
         )
         self._neighbor_container.setVisible(False)
         section.addWidget(self._neighbor_container)
@@ -420,41 +439,31 @@ class ControlPanel:
 
         self._camera_mode_names = {
             "Manual": CameraMode.MANUAL,
-            "Auto-Frame": CameraMode.AUTO_FRAME,
-            "Auto-Rotate": CameraMode.AUTO_ROTATE,
+            "Tracking": CameraMode.TARGET_COMOVING,
             "Event Track": CameraMode.EVENT_TRACK,
             "Target (Rest)": CameraMode.TARGET_REST_FRAME,
-            "Target (Comoving)": CameraMode.TARGET_COMOVING,
         }
         tips = {
             "Manual": (
                 "Free trackball camera.\n"
-                "Drag to rotate, scroll to zoom, middle-drag to pan."
+                "Drag to rotate, scroll to zoom, WASD to pan."
             ),
-            "Auto-Frame": (
-                "Automatically center and zoom to keep the framed\n"
-                "particles in view. Which particles are framed is\n"
-                "controlled by the Framing dropdown below."
-            ),
-            "Auto-Rotate": (
-                "Like Auto-Frame, but also slowly orbits the camera\n"
-                "around the vertical axis. Good for presentations\n"
-                "and video export."
+            "Tracking": (
+                "Deadzone tracking: camera holds still while the\n"
+                "tracked point is near screen center, chases when\n"
+                "it drifts past the deadzone edge.\n"
+                "If a Target is selected, tracks that particle.\n"
+                "Otherwise tracks the center of mass of the\n"
+                "framing group (Core Group / All / Nearest Neighbors).\n"
+                "Enable Auto-Rotate checkbox for slow orbit."
             ),
             "Event Track": (
                 "Smoothly zoom into detected events (close encounters,\n"
-                "mergers) as they approach in simulation time. Falls\n"
-                "back to Auto-Frame between events."
+                "mergers) as they approach in simulation time."
             ),
             "Target (Rest)": (
-                "Lock the camera center on the selected Target particle.\n"
-                "Everything else moves relative to the target. Useful\n"
-                "for studying one star's interactions."
-            ),
-            "Target (Comoving)": (
-                "Follow the Target particle with a smoothed velocity\n"
-                "estimate, reducing jitter from orbital oscillations.\n"
-                "The target stays roughly centered."
+                "Lock the camera center exactly on the Target particle.\n"
+                "Everything else moves relative to the target."
             ),
         }
         combo = QtWidgets.QComboBox()
@@ -505,8 +514,6 @@ class ControlPanel:
 
         mode = self._mode_names.get(text, CameraMode.MANUAL)
         self._camera.mode = mode
-        if mode == CameraMode.AUTO_ROTATE:
-            self._rotate_cb.setChecked(True)
 
 
     def _on_framing_change(self, text: str) -> None:
@@ -515,6 +522,7 @@ class ControlPanel:
         scope = self._framing_names.get(text)
         if scope is not None:
             self._camera.framing_scope = scope
+            self._core_group_container.setVisible(scope == FramingScope.CORE_GROUP)
             self._neighbor_container.setVisible(scope == FramingScope.NEAREST_NEIGHBORS)
 
     def _resolve_pid(self, text: str) -> int | None:
@@ -540,9 +548,9 @@ class ControlPanel:
         if pid is not None:
             self._camera.mode = CameraMode.TARGET_COMOVING
             self._mode_combo.blockSignals(True)
-            self._mode_combo.setCurrentText("Target (Comoving)")
+            self._mode_combo.setCurrentText("Tracking")
             self._mode_combo.blockSignals(False)
-            self._on_camera_mode_change("Target (Comoving)")
+            self._on_camera_mode_change("Tracking")
 
     def _build_subview_controls(self) -> None:
         from PyQt6 import QtWidgets
@@ -568,7 +576,7 @@ class ControlPanel:
         row.addWidget(QtWidgets.QLabel("Mode"))
         self._subview_mode_combo = self._make_mode_combo()
         self._subview_mode_names = self._camera_mode_names
-        self._subview_mode_combo.setCurrentText("Auto-Frame")
+        self._subview_mode_combo.setCurrentText("Tracking")
         self._subview_mode_combo.currentTextChanged.connect(self._on_subview_mode_change)
         row.addWidget(self._subview_mode_combo)
         section.addLayout(row)
@@ -624,16 +632,12 @@ class ControlPanel:
             self._engine.disable_subview()
 
     def _on_subview_mode_change(self, text: str) -> None:
-        from ..core.camera import CameraMode
-
         ctrl = self._engine._subview_camera_controller
         if ctrl is None:
             return
         mode = self._subview_mode_names.get(text)
         if mode is not None:
             ctrl.mode = mode
-            if mode == CameraMode.AUTO_ROTATE:
-                self._subview_rotate_cb.setChecked(True)
 
     def _on_subview_framing_change(self, text: str) -> None:
         ctrl = self._engine._subview_camera_controller

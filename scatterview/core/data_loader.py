@@ -290,19 +290,25 @@ def load_hdf5(
 ) -> SimulationData:
     """Load simulation data from an HDF5 file.
 
-    Supports two common layouts:
-    1. Single-file with datasets: /times, /positions (N, T, 3), /ids (N,), etc.
-    2. Snapshot groups: /snapshot_0000/positions (N, 3), /snapshot_0000/time, etc.
+    Supports three layouts:
+    1. Multi-index DataFrame (pandas HDF5 table): multi-index with
+       (time, ID), columns include x, y, z and optionally vx, vy, vz,
+       mass, k (startype), radius.
+    2. Single-file with datasets: /times, /positions (N, T, 3), /ids (N,).
+    3. Snapshot groups: /snapshot_0000/positions (N, 3), etc.
 
     Args:
         filepath: Path to the HDF5 file.
         field_map: Optional mapping from standard names to HDF5 dataset paths.
-            Standard names: 'ids', 'times', 'positions', 'velocities', 'masses'.
-            Example: {'positions': 'PartType1/Coordinates', 'ids': 'PartType1/ParticleIDs'}
-        snapshot_group_pattern: Format string for snapshot group names if using
-            snapshot layout. Use '{}' for the snapshot index.
+        snapshot_group_pattern: Format string for snapshot group names.
     """
     import h5py
+
+    # Try multi-index DataFrame first (pandas HDF5 table format)
+    try:
+        return _load_hdf5_multiindex(filepath)
+    except (KeyError, ValueError, TypeError, ImportError):
+        pass
 
     default_field_map = {
         "ids": "ids",
@@ -316,11 +322,142 @@ def load_hdf5(
     fmap = default_field_map
 
     with h5py.File(filepath, "r") as f:
-        # Detect layout: check if top-level has 'positions' dataset or snapshot groups
         if fmap["positions"] in f:
             return _load_hdf5_single(f, fmap)
         else:
             return _load_hdf5_snapshots(f, fmap, snapshot_group_pattern)
+
+
+def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
+    """Load from a pandas HDF5 table with multi-index (time, ID).
+
+    Expected format: DataFrame written with ``df.to_hdf(path, key=...)``
+    where the index has two levels:
+        - Level 0: simulation time (float), assumed already sorted
+        - Level 1: particle ID (int or string — strings become user labels)
+
+    All bodies are assumed to share the same block timesteps (no gaps).
+    Per-particle data is extracted via pandas multi-index slicing
+    (``df.xs(pid, level=1)``) which reads directly from HDF5 without
+    expanding the full N_particles × N_timesteps table into memory.
+
+    Columns (detected flexibly):
+        Required: x, y, z
+        Optional: vx, vy, vz, mass, radius, k (BSE stellar type)
+    """
+    df = pd.read_hdf(filepath)
+
+    if not isinstance(df.index, pd.MultiIndex) or df.index.nlevels < 2:
+        raise ValueError("HDF5 file does not contain a multi-index DataFrame")
+
+    # Flexible column detection (case-insensitive)
+    col_map = {c.lower(): c for c in df.columns}
+
+    def _find_col(candidates):
+        for c in candidates:
+            if c.lower() in col_map:
+                return col_map[c.lower()]
+        return None
+
+    x_col = _find_col(["x", "r0", "pos_x"])
+    y_col = _find_col(["y", "r1", "pos_y"])
+    z_col = _find_col(["z", "r2", "pos_z"])
+    if x_col is None or y_col is None or z_col is None:
+        raise ValueError(
+            f"HDF5 multi-index DataFrame must have x, y, z columns. "
+            f"Found: {list(df.columns)}"
+        )
+
+    vx_col = _find_col(["vx", "v0", "vel_x"])
+    vy_col = _find_col(["vy", "v1", "vel_y"])
+    vz_col = _find_col(["vz", "v2", "vel_z"])
+    has_vel = vx_col is not None and vy_col is not None and vz_col is not None
+
+    mass_col = _find_col(["mass", "m"])
+    radius_col = _find_col(["radius", "rad"])
+    startype_col = _find_col(["k", "startype", "kstar", "stellar_type"])
+
+    # Times from the first index level (assumed sorted)
+    times = np.array(df.index.get_level_values(0).unique(), dtype=float)
+
+    # Particle IDs from the second index level
+    raw_ids = df.index.get_level_values(1).unique()
+
+    # Convert IDs: use originals for targeting, map to integer keys internally
+    id_labels = None
+    try:
+        particle_ids = np.sort(np.array([int(pid) for pid in raw_ids]))
+        id_to_key = {pid: int(pid) for pid in raw_ids}
+    except (ValueError, TypeError):
+        # String IDs — assign integer keys, store original labels for GUI
+        sorted_labels = sorted(raw_ids, key=str)
+        id_labels = {i: str(label) for i, label in enumerate(sorted_labels)}
+        id_to_key = {label: i for i, label in enumerate(sorted_labels)}
+        particle_ids = np.arange(len(sorted_labels))
+
+    # Extract per-particle data using multi-index slicing.
+    # df.xs(pid, level=1) returns a DataFrame indexed by time for one particle,
+    # without copying the data for other particles.
+    positions = {}
+    velocities = {} if has_vel else None
+    masses = {} if mass_col else None
+    radii = {} if radius_col else None
+    startypes = {} if startype_col else None
+    valid_intervals = {}
+
+    for raw_pid in raw_ids:
+        pid_key = id_to_key[raw_pid]
+
+        # Slice this particle's data directly from the multi-index
+        particle_df = df.xs(raw_pid, level=1)
+
+        pos_x = particle_df[x_col].values.astype(float)
+        pos_y = particle_df[y_col].values.astype(float)
+        pos_z = particle_df[z_col].values.astype(float)
+
+        valid_mask = np.isfinite(pos_x) & np.isfinite(pos_y) & np.isfinite(pos_z)
+        positions[pid_key] = np.column_stack([
+            pos_x[valid_mask], pos_y[valid_mask], pos_z[valid_mask],
+        ])
+
+        if has_vel and velocities is not None:
+            velocities[pid_key] = np.column_stack([
+                particle_df[vx_col].values[valid_mask].astype(float),
+                particle_df[vy_col].values[valid_mask].astype(float),
+                particle_df[vz_col].values[valid_mask].astype(float),
+            ])
+
+        if mass_col and masses is not None:
+            mass_vals = particle_df[mass_col].values[valid_mask].astype(float)
+            finite = mass_vals[np.isfinite(mass_vals)]
+            if len(finite) > 0:
+                masses[pid_key] = finite
+
+        if radius_col and radii is not None:
+            rad_vals = particle_df[radius_col].values[valid_mask].astype(float)
+            finite = rad_vals[np.isfinite(rad_vals)]
+            if len(finite) > 0:
+                radii[pid_key] = float(np.median(finite))
+
+        if startype_col and startypes is not None:
+            k_vals = particle_df[startype_col].values[valid_mask]
+            finite_k = k_vals[np.isfinite(k_vals.astype(float))]
+            if len(finite_k) > 0:
+                startypes[pid_key] = int(finite_k[-1])
+
+        valid_intervals[pid_key] = _compute_valid_intervals(times, valid_mask)
+
+    return SimulationData(
+        particle_ids=particle_ids,
+        times=times,
+        positions=positions,
+        velocities=velocities,
+        masses=masses,
+        radii=radii,
+        startypes=startypes,
+        valid_intervals=valid_intervals,
+        id_labels=id_labels,
+    )
 
 
 def _load_hdf5_single(f, fmap: dict[str, str]) -> SimulationData:

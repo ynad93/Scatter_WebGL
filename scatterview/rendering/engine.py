@@ -936,7 +936,7 @@ class RenderEngine:
 
         from ..core.camera import CameraController, CameraMode
         self._subview_camera_controller = CameraController(self._subview, masses=self._data.masses)
-        self._subview_camera_controller.mode = CameraMode.AUTO_FRAME
+        self._subview_camera_controller.mode = CameraMode.TARGET_COMOVING
 
         positions, active_ids, _ = self._interp.evaluate_batch(self._current_sim_time)
         if len(positions) == 0:
