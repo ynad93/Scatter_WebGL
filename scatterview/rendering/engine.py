@@ -1006,10 +1006,7 @@ class RenderEngine:
         render_size = size or self._canvas.size
 
         container = av.open(str(filepath), mode="w")
-        stream = container.add_stream("libx264", rate=fps)
-        stream.width = render_size[0]
-        stream.height = render_size[1]
-        stream.pix_fmt = "yuv420p"
+        stream = None
 
         try:
             for i, t in enumerate(frame_sim_times):
@@ -1018,6 +1015,15 @@ class RenderEngine:
                 self._update_frame()
 
                 img = self._canvas.render(size=render_size)[:, :, :3]
+
+                # Create stream from actual rendered dimensions (first frame)
+                if stream is None:
+                    h, w = img.shape[:2]
+                    stream = container.add_stream("libx264", rate=fps)
+                    stream.width = w
+                    stream.height = h
+                    stream.pix_fmt = "yuv420p"
+
                 frame = av.VideoFrame.from_ndarray(img, format="rgb24")
                 for packet in stream.encode(frame):
                     container.mux(packet)
