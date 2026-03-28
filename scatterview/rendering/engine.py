@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numba as nb
@@ -78,11 +79,12 @@ def _assemble_trails(
     trail_body_counts,        # (n_trails,) int64 — number of precomputed body points
     trail_has_tail,           # (n_trails,) bool — whether tail lerp point exists
     trail_tail_positions,     # (n_trails, 3) float32 — lerp'd tail positions
-    active_particle_indices,  # (n_trails,) int64 — index into live positions array
+    particle_indices,         # (n_trails,) int64 — index into full positions array
+    trail_is_active,          # (n_trails,) bool — whether particle is currently active
     particle_color_indices,   # (n_trails,) int64 — index into color table
     precomp_positions,        # (total_precomp, 3) float32 — packed precomputed positions
     precomp_times,            # (total_precomp,) float64 — packed precomputed times
-    live_positions,           # (n_active, 3) float64 — current particle positions
+    live_positions,           # (n_particles, 3) float64 — full-size positions (NaN if inactive)
     color_table,              # (n_particles, 4) float32 — per-particle RGBA
     t_trail_start,            # float64 — oldest time in the trail window
     t_current,                # float64 — current simulation time
@@ -92,7 +94,7 @@ def _assemble_trails(
     Each trail is laid out as: [NaN separator] [tail lerp] [body] [head]
     - Tail: interpolated position at exactly t_trail_start (smooth fade-in)
     - Body: precomputed positions between t_trail_start and t_current
-    - Head: live particle position at t_current (from spline evaluation)
+    - Head: live particle position at t_current (only for active particles)
     - NaN separators tell VisPy's line renderer to break between trails
     """
     n_trails = len(write_offsets)
@@ -126,11 +128,12 @@ def _assemble_trails(
             out_times[offset + write_pos + i] = precomp_times[body_start + i]
         write_pos += n_body
 
-        # Head: current particle position from spline evaluation
-        particle_idx = active_particle_indices[trail]
-        for dim in range(3):
-            out_positions[offset + write_pos, dim] = np.float32(live_positions[particle_idx, dim])
-        out_times[offset + write_pos] = t_current
+        # Head: current particle position (only for active particles)
+        if trail_is_active[trail]:
+            p_idx = particle_indices[trail]
+            for dim in range(3):
+                out_positions[offset + write_pos, dim] = np.float32(live_positions[p_idx, dim])
+            out_times[offset + write_pos] = t_current
 
         # Base RGB color for all points in this trail
         color_idx = particle_color_indices[trail]
@@ -191,14 +194,16 @@ class RenderEngine:
         self._base_sizes_absolute = self._compute_absolute_base_sizes()
         self._sizes = self._base_sizes_relative.copy()
 
-        # Black hole rendering
-        self._bh_set: set[int] = set()
+        self._id_to_idx = {int(pid): i for i, pid in enumerate(data.particle_ids)}
+
+        # Black hole rendering — pre-computed boolean array for vectorized lookup
+        self._is_bh = np.zeros(n, dtype=bool)
         if data.startypes is not None:
             for pid_key, k in data.startypes.items():
                 if k == D.BH_STARTYPE:
-                    self._bh_set.add(pid_key)
-
-        self._id_to_idx = {int(pid): i for i, pid in enumerate(data.particle_ids)}
+                    idx = self._id_to_idx.get(pid_key)
+                    if idx is not None:
+                        self._is_bh[idx] = True
 
         # VisPy canvas and view
         self._canvas = scene.SceneCanvas(
@@ -219,7 +224,7 @@ class RenderEngine:
 
         # Visuals
         self._particle_visual = None
-        self._trail_line = None       # single Line visual for all trails
+        self._trail_line = None
         self._subview_trail_line = None
 
         # Vectorized pid→index lookup (used for colors and trail window)
@@ -269,6 +274,14 @@ class RenderEngine:
         self._ctrl_held = False
 
     @staticmethod
+    def _camera_axes(camera):
+        """Compute camera-relative right and forward vectors from azimuth."""
+        az_rad = math.radians(camera.azimuth)
+        right = np.array([math.cos(az_rad), math.sin(az_rad), 0.0])
+        forward = np.array([-math.sin(az_rad), math.cos(az_rad), 0.0])
+        return right, forward
+
+    @staticmethod
     def _has_ctrl(event) -> bool:
         """Check if Ctrl is held during an event."""
         modifiers = getattr(event, 'modifiers', None) or ()
@@ -308,7 +321,6 @@ class RenderEngine:
         # Shift center toward cursor: convert the cursor's pixel offset
         # from screen center into world-space displacement at the focal
         # plane (the plane through camera.center).
-        import math
         mouse_pos = getattr(event, 'pos', None)
         canvas_size = self._canvas.size
         if mouse_pos is not None and len(mouse_pos) >= 2 and canvas_size[1] > 0:
@@ -326,9 +338,8 @@ class RenderEngine:
             dx_screen = cursor_offset_x * world_per_pixel
             dy_screen = -cursor_offset_y * world_per_pixel  # screen Y is flipped
 
-            # Rotate screen offset into world coordinates using camera azimuth
-            az_rad = math.radians(camera.azimuth)
-            right = np.array([math.cos(az_rad), math.sin(az_rad), 0.0])
+            # Rotate screen offset into world coordinates
+            right, _ = self._camera_axes(camera)
             up = np.array([0.0, 0.0, 1.0])
 
             center = np.array(camera.center, dtype=np.float64)
@@ -380,7 +391,6 @@ class RenderEngine:
         if not self._pan_keys_held:
             return
 
-        import math
         camera = self._view.camera
         distance = camera.distance or 1.0
 
@@ -388,10 +398,7 @@ class RenderEngine:
         speed = self._pan_speed * (5.0 if self._ctrl_held else 1.0)
         step = distance * speed
 
-        # Camera-relative directions based on azimuth
-        az_rad = math.radians(camera.azimuth)
-        right = np.array([math.cos(az_rad), math.sin(az_rad), 0.0])
-        forward = np.array([-math.sin(az_rad), math.cos(az_rad), 0.0])
+        right, forward = self._camera_axes(camera)
 
         center = np.array(camera.center, dtype=np.float64)
         for key_name in self._pan_keys_held:
@@ -453,28 +460,34 @@ class RenderEngine:
         return base[idx]
 
     def _compute_initial_distance(self) -> float:
-        positions, _, _ = self._interp.evaluate_batch(self._data.times[0])
-        if len(positions) == 0:
+        positions, mask = self._interp.evaluate_batch(self._data.times[0])
+        if not mask.any():
             return 10.0
-        return max(np.max(np.linalg.norm(positions, axis=1)) * 5.0, 1.0)
+        return max(np.max(np.linalg.norm(positions[mask], axis=1)) * 5.0, 1.0)
 
-    def _get_particle_attrs(self, active_ids: np.ndarray) -> dict:
-        """Compute face_color, edge_color, edge_width, size in one pass."""
-        idx = self._pid_lookup[active_ids.astype(np.intp)]
-        n = len(active_ids)
-        face_color = self._colors[idx].copy()
-        edge_color = np.zeros((n, 4), dtype=np.float32)
-        edge_width = np.zeros(n, dtype=np.float32)
-        sizes = self._sizes[idx].copy()
+    def _get_particle_attrs(self, mask: np.ndarray) -> dict:
+        """Compute face_color, edge_color, edge_width, size for active particles.
 
-        if self._bh_set:
+        Args:
+            mask: (n_particles,) bool — True for active particles.
+        """
+        n = int(mask.sum())
+        sizes = self._sizes[mask]
+
+        bh_mask = self._is_bh[mask]
+        if bh_mask.any():
+            face_color = self._colors[mask].copy()
+            edge_color = np.zeros((n, 4), dtype=np.float32)
+            edge_width = np.zeros(n, dtype=np.float32)
             bh_face = np.array(D.BH_FACE_COLOR, dtype=np.float32)
-            for i, pid in enumerate(active_ids):
-                if int(pid) in self._bh_set:
-                    face_color[i] = bh_face
-                    edge_color[i] = self._colors[idx[i]]
-                    edge_color[i, 3] = 1.0
-                    edge_width[i] = D.BH_EDGE_WIDTH
+            face_color[bh_mask] = bh_face
+            edge_color[bh_mask] = self._colors[mask][bh_mask]
+            edge_color[bh_mask, 3] = 1.0
+            edge_width[bh_mask] = D.BH_EDGE_WIDTH
+        else:
+            face_color = self._colors[mask]
+            edge_color = np.zeros((n, 4), dtype=np.float32)
+            edge_width = np.zeros(n, dtype=np.float32)
 
         return {"face_color": face_color, "edge_color": edge_color,
                 "edge_width": edge_width, "size": sizes}
@@ -491,18 +504,17 @@ class RenderEngine:
     def _build_visuals(self) -> None:
         from vispy import scene
 
-        positions, active_ids, _ = self._interp.evaluate_batch(self._data.times[0])
-        if len(positions) == 0:
-            positions = np.zeros((1, 3), dtype=np.float32)
+        positions, mask = self._interp.evaluate_batch(self._data.times[0])
+        active_pos = positions[mask] if mask.any() else np.zeros((1, 3), dtype=np.float32)
 
-        attrs = self._get_particle_attrs(active_ids)
+        attrs = self._get_particle_attrs(mask)
         self._particle_visual = scene.Markers(
             spherical=True, scaling=self._resolve_scaling_mode(),
             light_color=D.LIGHT_COLOR, light_position=D.LIGHT_POSITION,
             light_ambient=D.LIGHT_AMBIENT, parent=self._view.scene,
         )
-        self._particle_visual.set_data(pos=positions, **attrs)
-        self._update_trails(self._data.times[0], positions, active_ids)
+        self._particle_visual.set_data(pos=active_pos, **attrs)
+        self._update_trails(self._data.times[0], positions, mask)
 
     def _rebuild_particle_visual(self) -> None:
         from vispy import scene
@@ -517,10 +529,17 @@ class RenderEngine:
         )
         self._particle_visual.alpha = self._point_alpha
 
-        positions, active_ids, _ = self._interp.evaluate_batch(self._current_sim_time)
-        if len(positions) > 0:
-            attrs = self._get_particle_attrs(active_ids)
-            self._particle_visual.set_data(pos=positions, **attrs)
+        positions, mask = self._interp.evaluate_batch(self._current_sim_time)
+        if mask.any():
+            attrs = self._get_particle_attrs(mask)
+            self._particle_visual.set_data(pos=positions[mask], **attrs)
+
+    def _hide_all_trails(self) -> None:
+        """Hide all trail visuals."""
+        if self._trail_line is not None:
+            self._trail_line.visible = False
+        if self._subview_trail_line is not None:
+            self._subview_trail_line.visible = False
 
     # ------------------------------------------------------------------
     # Trail rendering
@@ -535,49 +554,42 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _update_trails(self, time: float, positions: np.ndarray,
-                       active_ids: np.ndarray) -> None:
+                       mask: np.ndarray) -> None:
         from vispy import scene
 
         # Trail window: [t_trail_start, time] covers trail_length_frac
         # of the total simulation duration
-        time_range = self._data.times[-1] - self._data.times[0]
-        trail_length = time_range * self._trail_length_frac
-        t_trail_start = max(time - trail_length, self._data.times[0])
+        trail_length = self._time_range * self._trail_length_frac
+        t_trail_start = max(time - trail_length, self._t_min)
         if t_trail_start >= time:
-            if self._trail_line is not None:
-                self._trail_line.visible = False
+            self._hide_all_trails()
             return
 
         precomp = self._precomp
         alpha_table = self._alpha_lut
         max_alpha_index = len(alpha_table) - 1
-        n_active = len(active_ids)
+        n_particles = self._n_particles
         inv_trail_window = 1.0 / (time - t_trail_start)
 
-        # --- Map active particle IDs to precomputed trail segments ---
-        particle_indices = self._pid_lookup[active_ids.astype(np.intp)]
-        has_precomp = particle_indices >= 0
-        segment_starts_all = precomp.offsets[particle_indices[has_precomp]]
-        segment_ends_all = precomp.offsets[particle_indices[has_precomp] + 1]
-        has_trail_data = segment_starts_all < segment_ends_all
+        # --- Check ALL particles for visible trail data ---
+        # (not just active ones — disappeared particles keep their trails
+        # until the trail window slides past their last precomputed point)
+        all_indices = np.arange(n_particles)
+        segment_starts = precomp.offsets[:-1]
+        segment_ends = precomp.offsets[1:]
+        has_trail_data = segment_starts < segment_ends
 
-        # Filter to particles that have precomputed trail points
-        valid_particle_mask = np.where(has_precomp)[0][has_trail_data]
-        n_valid = len(valid_particle_mask)
+        valid_indices = all_indices[has_trail_data]
+        n_valid = len(valid_indices)
         if n_valid == 0:
-            if self._trail_line is not None:
-                self._trail_line.visible = False
+            self._hide_all_trails()
             return
 
-        segment_starts = precomp.offsets[particle_indices[valid_particle_mask]]
-        segment_ends = precomp.offsets[particle_indices[valid_particle_mask] + 1]
-        precomp_counts = segment_ends - segment_starts
+        seg_starts = segment_starts[valid_indices]
+        seg_ends = segment_ends[valid_indices]
+        precomp_counts = seg_ends - seg_starts
 
         # --- Sliding window: find visible trail range per particle ---
-        # During forward playback, the numba function advances pointers
-        # by 1-2 positions (O(1)).  On scrub/loop it falls back to
-        # binary search (O(log N)).
-        trail_particle_idx = particle_indices[valid_particle_mask]
         is_forward = time >= self._trail_prev_time
         self._trail_prev_time = time
 
@@ -585,33 +597,28 @@ class RenderEngine:
         window_ends = np.empty(n_valid, dtype=np.int64)
 
         _advance_trail_pointers(
-            precomp.times, segment_starts, segment_ends,
-            self._trail_si[trail_particle_idx],
-            self._trail_ei[trail_particle_idx],
+            precomp.times, seg_starts, seg_ends,
+            self._trail_si[valid_indices],
+            self._trail_ei[valid_indices],
             t_trail_start, time, is_forward,
             window_starts, window_ends,
         )
 
-        self._trail_si[trail_particle_idx] = window_starts
-        self._trail_ei[trail_particle_idx] = window_ends
+        self._trail_si[valid_indices] = window_starts
+        self._trail_ei[valid_indices] = window_ends
 
         body_counts = np.maximum(window_ends - window_starts, 0)
-        body_starts = segment_starts + window_starts
+        body_starts = seg_starts + window_starts
 
         # --- Tail interpolation ---
-        # The trail's oldest visible point should be at exactly
-        # t_trail_start, not at the nearest precomputed timestamp.
-        # We linearly interpolate between the precomputed points
-        # straddling t_trail_start so the tail fades in smoothly.
         can_interpolate_tail = (window_starts > 0) & (window_starts <= precomp_counts)
-        idx_before_tail = np.maximum(segment_starts + window_starts - 1, segment_starts)
-        idx_after_tail = np.minimum(segment_starts + window_starts, segment_ends - 1)
+        idx_before_tail = np.maximum(seg_starts + window_starts - 1, seg_starts)
+        idx_after_tail = np.minimum(seg_starts + window_starts, seg_ends - 1)
         t_before_tail = precomp.times[idx_before_tail]
         t_after_tail = precomp.times[idx_after_tail]
         tail_time_gap = t_after_tail - t_before_tail
         has_tail = can_interpolate_tail & (tail_time_gap > 0)
 
-        # Lerp factor: 0 = at before point, 1 = at after point
         tail_lerp_factor = np.where(
             has_tail,
             (t_trail_start - t_before_tail) / np.maximum(tail_time_gap, 1e-30),
@@ -622,13 +629,20 @@ class RenderEngine:
             + precomp.positions[idx_after_tail] * tail_lerp_factor[:, np.newaxis]
         )
 
-        # --- Filter to particles with enough points to draw ---
-        # Need at least 2 points (tail/body/head) to render a line segment
-        trail_point_counts = body_counts + 1 + has_tail.astype(np.int64)
+        # --- Determine which trails have an active head ---
+        # Active particles get a live head position from the spline;
+        # inactive particles' trails end at the last precomputed point.
+        is_active = mask[valid_indices]
+
+        # Trail point count: body + head (if active) + tail (if interpolated)
+        trail_point_counts = (
+            body_counts
+            + is_active.astype(np.int64)
+            + has_tail.astype(np.int64)
+        )
         drawable = trail_point_counts >= 2
         if not drawable.any():
-            if self._trail_line is not None:
-                self._trail_line.visible = False
+            self._hide_all_trails()
             return
 
         drawable_idx = np.where(drawable)[0]
@@ -638,7 +652,8 @@ class RenderEngine:
         draw_body_counts = body_counts[drawable_idx]
         draw_has_tail = has_tail[drawable_idx]
         draw_tail_positions = tail_positions[drawable_idx]
-        draw_particle_idx = valid_particle_mask[drawable_idx]
+        draw_particle_idx = valid_indices[drawable_idx]
+        draw_is_active = is_active[drawable_idx]
 
         total_pts = int(draw_counts.sum()) + n_trails - 1  # NaN separators
 
@@ -658,32 +673,26 @@ class RenderEngine:
             cumulative_counts = np.cumsum(draw_counts)
             write_offsets[1:] = cumulative_counts[:-1] + np.arange(1, n_trails)
 
-        # Per-particle color lookup
-        particle_color_indices = self._pid_lookup[
-            active_ids[draw_particle_idx].astype(np.intp)
-        ]
-
         # Assemble all trail geometry in compiled code (numba)
         combined_times = self._combined_times[:total_pts]
         _assemble_trails(
             combined_pos, combined_colors, combined_times,
             write_offsets, draw_counts, draw_body_starts, draw_body_counts,
             draw_has_tail, draw_tail_positions, draw_particle_idx,
-            particle_color_indices,
+            draw_is_active, draw_particle_idx,  # color_indices = particle indices
             precomp.positions, precomp.times, positions, self._colors,
             t_trail_start, time,
         )
 
         # --- Alpha gradient: older points fade out, newest are opaque ---
-        # Each point's alpha is determined by its time position within
-        # the trail window, mapped through a power-law curve (t^1.5)
-        # stored in the alpha lookup table.
         valid_time_mask = ~np.isnan(combined_times)
-        time_fraction = np.zeros(total_pts)
+        time_fraction = np.zeros(total_pts, dtype=np.float32)
         time_fraction[valid_time_mask] = (
             (combined_times[valid_time_mask] - t_trail_start) * inv_trail_window
         )
-        alpha_index = (time_fraction * max_alpha_index).astype(np.intp)
+        alpha_index = np.clip(
+            (time_fraction * max_alpha_index).astype(np.intp), 0, max_alpha_index,
+        )
         combined_colors[:, 3] = alpha_table[alpha_index] * self._trail_alpha
 
         if self._trail_line is not None:
@@ -741,7 +750,6 @@ class RenderEngine:
         faces the light and the dark side faces away, regardless of
         camera angle.  This gives strong depth cues when orbiting.
         """
-        import math
         camera = self._view.camera
         world_light_dir = np.array(D.LIGHT_POSITION, dtype=np.float64)
         world_light_dir /= np.linalg.norm(world_light_dir)
@@ -771,22 +779,23 @@ class RenderEngine:
             self._subview_markers.light_position = tuple(eye_light)
 
     def _update_frame(self) -> None:
-        positions, active_ids, _ = self._interp.evaluate_batch(self._current_sim_time)
-        if len(positions) == 0:
+        positions, mask = self._interp.evaluate_batch(self._current_sim_time)
+        if not mask.any():
             self._canvas.update()
             return
 
         self._update_light_direction()
-        attrs = self._get_particle_attrs(active_ids)
+        active_pos = positions[mask]
+        attrs = self._get_particle_attrs(mask)
 
         if self._particle_visual is not None:
-            self._particle_visual.set_data(pos=positions, **attrs)
+            self._particle_visual.set_data(pos=active_pos, **attrs)
 
-        self._update_trails(self._current_sim_time, positions, active_ids)
+        self._update_trails(self._current_sim_time, positions, mask)
 
         if self._subview_enabled and self._subview_markers is not None:
             self._subview_markers.set_data(
-                pos=positions, face_color=attrs["face_color"],
+                pos=active_pos, face_color=attrs["face_color"],
                 size=attrs["size"] * 0.7, edge_color=attrs["edge_color"],
                 edge_width=attrs["edge_width"],
             )
@@ -794,9 +803,9 @@ class RenderEngine:
                 self._subview_canvas.update()
 
         if self._camera_controller is not None:
-            self._camera_controller.update(self._current_sim_time, positions, active_ids)
+            self._camera_controller.update(self._current_sim_time, positions, mask)
         if self._subview_camera_controller is not None and self._subview_enabled:
-            self._subview_camera_controller.update(self._current_sim_time, positions, active_ids)
+            self._subview_camera_controller.update(self._current_sim_time, positions, mask)
 
         self._canvas.update()
 
@@ -886,11 +895,8 @@ class RenderEngine:
         self._trail_alpha = np.clip(alpha, 0.0, 1.0)
 
     def set_trail_width(self, width: float) -> None:
-        self._trail_width = max(1.0, width)
-        if self._trail_line is not None:
-            self._trail_line.set_data(width=self._trail_width)
-        if self._subview_trail_line is not None:
-            self._subview_trail_line.set_data(width=max(1.5, self._trail_width * 0.7))
+        self._trail_width = max(0.5, width)
+
 
     def set_point_alpha(self, alpha: float) -> None:
         self._point_alpha = np.clip(alpha, 0.0, 1.0)
@@ -935,22 +941,22 @@ class RenderEngine:
         )
 
         from ..core.camera import CameraController, CameraMode
-        self._subview_camera_controller = CameraController(self._subview, masses=self._data.masses)
+        self._subview_camera_controller = CameraController(
+            self._subview, masses=self._data.masses, particle_ids=self._data.particle_ids,
+        )
         self._subview_camera_controller.mode = CameraMode.TARGET_COMOVING
 
-        positions, active_ids, _ = self._interp.evaluate_batch(self._current_sim_time)
-        if len(positions) == 0:
-            positions = np.zeros((1, 3), dtype=np.float32)
-            active_ids = np.array([0])
+        positions, mask = self._interp.evaluate_batch(self._current_sim_time)
+        active_pos = positions[mask] if mask.any() else np.zeros((1, 3), dtype=np.float32)
 
-        attrs = self._get_particle_attrs(active_ids)
+        attrs = self._get_particle_attrs(mask)
         self._subview_markers = scene.Markers(
             spherical=True, light_color=D.LIGHT_COLOR,
             light_position=D.LIGHT_POSITION, light_ambient=D.LIGHT_AMBIENT,
             parent=self._subview.scene,
         )
         self._subview_markers.set_data(
-            pos=positions, face_color=attrs["face_color"],
+            pos=active_pos, face_color=attrs["face_color"],
             size=attrs["size"] * 0.7, edge_color=attrs["edge_color"],
             edge_width=attrs["edge_width"],
         )
@@ -987,24 +993,45 @@ class RenderEngine:
     def render_video(
         self, filepath: str | Path, duration: float = D.VIDEO_DURATION,
         fps: int = D.VIDEO_FPS, size: tuple[int, int] | None = None,
+        t_start: float | None = None, t_end: float | None = None,
+        progress_callback: callable | None = None,
     ) -> None:
-        import imageio.v3 as iio
+        import av
 
+        t0 = t_start if t_start is not None else self._t_min
+        t1 = t_end if t_end is not None else self._t_max
         n_frames = int(duration * fps)
-        frame_sim_times = np.linspace(self._t_min, self._t_max, n_frames)
+        frame_sim_times = np.linspace(t0, t1, n_frames)
         filepath = Path(filepath)
         render_size = size or self._canvas.size
 
-        with iio.imopen(str(filepath), "w") as writer:
+        container = av.open(str(filepath), mode="w")
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width = render_size[0]
+        stream.height = render_size[1]
+        stream.pix_fmt = "yuv420p"
+
+        try:
             for i, t in enumerate(frame_sim_times):
                 self._current_sim_time = t
                 self._anim_time = (t - self._t_min) / self._time_range
                 self._update_frame()
 
-                img = self._canvas.render(size=render_size)
-                writer.write(img, plugin="pyav", codec="libx264", fps=fps)
+                img = self._canvas.render(size=render_size)[:, :, :3]
+                frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+                for packet in stream.encode(frame):
+                    container.mux(packet)
 
-                if (i + 1) % (n_frames // 10 or 1) == 0:
+                if progress_callback is not None:
+                    progress_callback(i + 1, n_frames)
+                elif (i + 1) % (n_frames // 10 or 1) == 0:
                     print(f"Rendering: {(i + 1) / n_frames * 100:.0f}%")
 
-        print(f"Video saved to {filepath}")
+            # Flush encoder
+            for packet in stream.encode():
+                container.mux(packet)
+        finally:
+            container.close()
+
+        if progress_callback is None:
+            print(f"Video saved to {filepath}")

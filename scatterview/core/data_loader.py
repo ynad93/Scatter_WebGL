@@ -172,12 +172,10 @@ def load_csv(
         particle_ids_raw = np.array([int(p) for p in particle_ids_raw])
         particle_ids = np.sort(particle_ids_raw)
         id_label_map = {int(p): int(p) for p in particle_ids}
-        reverse_label_map = id_label_map.copy()
     else:
         # String IDs — assign stable integer keys in sorted order
         sorted_labels = sorted(particle_ids_raw, key=str)
         id_label_map = {label: i for i, label in enumerate(sorted_labels)}
-        reverse_label_map = {i: label for label, i in id_label_map.items()}
         particle_ids = np.arange(len(sorted_labels))
 
     positions: dict[int, np.ndarray] = {}

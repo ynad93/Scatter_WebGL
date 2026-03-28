@@ -283,7 +283,7 @@ class ControlPanel:
 
         # Trail width
         self._add_slider(
-            section, "Trail Width", 1.0, 10.0, self._engine._trail_width,
+            section, "Trail Width", 0.5, 15.0, self._engine._trail_width,
             self._engine.set_trail_width,
         )
 
@@ -677,7 +677,33 @@ class ControlPanel:
         self._screenshot_btn.clicked.connect(self._on_screenshot)
         section.addWidget(self._screenshot_btn)
 
-        # Video record
+        # --- Time range for video rendering ---
+        section.addWidget(QtWidgets.QLabel("Render Range"))
+        t_min = self._t_min
+        t_max = self._t_max
+        decimals = 1
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Start"))
+        self._render_t_start = QtWidgets.QDoubleSpinBox()
+        self._render_t_start.setDecimals(decimals)
+        self._render_t_start.setRange(t_min, t_max)
+        self._render_t_start.setValue(t_min)
+        self._render_t_start.setSingleStep((t_max - t_min) / 100)
+        row.addWidget(self._render_t_start)
+        section.addLayout(row)
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("End"))
+        self._render_t_end = QtWidgets.QDoubleSpinBox()
+        self._render_t_end.setDecimals(decimals)
+        self._render_t_end.setRange(t_min, t_max)
+        self._render_t_end.setValue(t_max)
+        self._render_t_end.setSingleStep((t_max - t_min) / 100)
+        row.addWidget(self._render_t_end)
+        section.addLayout(row)
+
+        # Video settings
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Duration (s)"))
         self._duration_spin = QtWidgets.QDoubleSpinBox()
@@ -721,16 +747,54 @@ class ControlPanel:
             self._engine.screenshot(filepath)
 
     def _on_record(self) -> None:
-        from PyQt6 import QtWidgets
+        from PyQt6 import QtWidgets, QtCore
 
         filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
             self._window, "Save Video", "video.mp4", "MP4 (*.mp4);;GIF (*.gif)"
         )
-        if filepath:
-            duration = self._duration_spin.value()
-            fps = self._fps_spin.value()
-            size = (self._res_w.value(), self._res_h.value())
-            self._engine.render_video(filepath, duration=duration, fps=fps, size=size)
+        if not filepath:
+            return
+
+        duration = self._duration_spin.value()
+        fps = self._fps_spin.value()
+        size = (self._res_w.value(), self._res_h.value())
+        n_frames = int(duration * fps)
+
+        progress = QtWidgets.QProgressDialog(
+            "Rendering video...", "Cancel", 0, n_frames, self._window,
+        )
+        progress.setWindowTitle("Rendering")
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        was_playing = self._engine._playing
+        self._engine._playing = False
+
+        cancelled = False
+
+        def on_progress(current, total):
+            nonlocal cancelled
+            progress.setValue(current)
+            QtWidgets.QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled = True
+                raise InterruptedError("Cancelled by user")
+
+        t_start = self._render_t_start.value()
+        t_end = self._render_t_end.value()
+
+        try:
+            self._engine.render_video(
+                filepath, duration=duration, fps=fps, size=size,
+                t_start=t_start, t_end=t_end,
+                progress_callback=on_progress,
+            )
+        except InterruptedError:
+            pass
+        finally:
+            progress.close()
+            self._engine._playing = was_playing
 
     def show(self) -> None:
         """Show the main window and start Qt event loop."""

@@ -1,0 +1,16 @@
+name: moviemaking
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - numpy
+  - scipy
+  - numba
+  - pandas
+  - pytables
+  - pyqt6
+  - pip
+  - pip:
+    - vispy
+    - av
+    - imageio

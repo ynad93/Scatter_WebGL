@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.trail_length is not None:
             engine.set_trail_length(args.trail_length)
 
-        cam = CameraController(engine.view, masses=data.masses)
+        cam = CameraController(engine.view, masses=data.masses, particle_ids=data.particle_ids)
         mode_map = {
             "manual": CameraMode.MANUAL,
             "tracking": CameraMode.TARGET_COMOVING,

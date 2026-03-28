@@ -53,11 +53,12 @@ class TestTrajectoryInterpolator:
     def test_evaluate_batch(self, sample_data, interp):
         """Batch evaluation should return arrays."""
         t0 = sample_data.times[0]
-        positions, ids, mask = interp.evaluate_batch(t0)
+        positions, mask = interp.evaluate_batch(t0)
         assert positions.ndim == 2
         assert positions.shape[1] == 3
-        assert len(ids) == len(positions)
+        assert positions.shape[0] == len(sample_data.particle_ids)
         assert mask.dtype == bool
+        assert mask.any()
 
     def test_evaluate_trail(self, sample_data, interp):
         """Trail evaluation should return a trajectory."""

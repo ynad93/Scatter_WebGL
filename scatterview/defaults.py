@@ -22,8 +22,6 @@ DEPTH_SCALING = False          # if True, closer particles appear larger (perspe
 
 # --- Camera ---
 CAMERA_FOV = 45                # field of view in degrees
-CAMERA_EMA_ALPHA = 0.15        # event-track camera smoothing: max displacement per
-                               # frame as a fraction of the current camera distance
 CAMERA_N_NEIGHBORS = 3         # nearest-neighbors framing: track the target
                                # particle plus this many closest neighbors
 ROTATION_SPEED = 0.5           # auto-rotate: degrees of azimuth per frame

@@ -112,8 +112,8 @@ def main():
     from scatterview import defaults as D
 
     engine = RenderEngine(data, interpolator, size=(1280, 720))
-    cam = CameraController(engine.view, masses=data.masses)
-    cam.mode = CameraMode.AUTO_FRAME
+    cam = CameraController(engine.view, masses=data.masses, particle_ids=data.particle_ids)
+    cam.mode = CameraMode.TARGET_COMOVING
     engine.set_camera_controller(cam)
 
     n_particles = len(data.particle_ids)

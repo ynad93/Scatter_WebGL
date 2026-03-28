@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-
 
 def render_video_headless(
     engine,

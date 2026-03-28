@@ -255,32 +255,32 @@ class TrajectoryInterpolator:
             self._batch_c_list = single_seg_coefficients
             self._batch_x_list = single_seg_breakpoints
 
-    def evaluate_batch(self, time: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def evaluate_batch(self, time: float) -> tuple[np.ndarray, np.ndarray]:
         """Evaluate all particle positions at a given time.
 
         For single-segment particles sharing breakpoints: one searchsorted
         call, then vectorized coefficient gather and Horner evaluation.
         Falls back to per-particle evaluation for multi-segment particles.
 
-        Returns (positions, ids, mask) for active particles.
+        Returns:
+            positions: (n_particles, 3) array — NaN for inactive particles.
+            mask: (n_particles,) bool — True where particle is active.
         """
-        all_ids = self._data.particle_ids
-        n = len(all_ids)
+        n = len(self._data.particle_ids)
+        positions = np.full((n, 3), np.nan)
         mask = np.zeros(n, dtype=bool)
 
-        # --- Fast path ---
+        # --- Fast path: single-segment particles ---
         n_batch = len(self._batch_t_min)
         if n_batch > 0:
-            # Vectorized time-range check
             active = (time >= self._batch_t_min) & (time <= self._batch_t_max)
 
             if active.any():
                 active_indices = np.where(active)[0]
                 n_active = len(active_indices)
+                dest_idx = self._batch_idx[active]
 
                 if self._shared_x is not None:
-                    # Shared breakpoints: one searchsorted finds the
-                    # polynomial interval for ALL particles at once
                     breakpoints = self._shared_x
                     interval = max(0, min(
                         int(np.searchsorted(breakpoints, time, side='right') - 1),
@@ -288,20 +288,17 @@ class TrajectoryInterpolator:
                     ))
                     time_offset = time - breakpoints[interval]
 
-                    # Gather polynomial coefficients at this interval
-                    # for each active particle: shape (n_active, 4, 3)
                     interval_coeffs = np.empty((n_active, 4, 3))
                     for i, j in enumerate(active_indices):
                         interval_coeffs[i] = self._batch_c_list[j][:, interval, :]
 
-                    # Horner evaluation: pos = ((c₃·dt + c₂)·dt + c₁)·dt + c₀
-                    fast_pos = (((interval_coeffs[:, 0] * time_offset
-                                  + interval_coeffs[:, 1]) * time_offset
-                                 + interval_coeffs[:, 2]) * time_offset
-                                + interval_coeffs[:, 3])
+                    positions[dest_idx] = (
+                        ((interval_coeffs[:, 0] * time_offset
+                          + interval_coeffs[:, 1]) * time_offset
+                         + interval_coeffs[:, 2]) * time_offset
+                        + interval_coeffs[:, 3]
+                    )
                 else:
-                    # Non-shared breakpoints: per-particle interval lookup
-                    fast_pos = np.empty((n_active, 3))
                     for i, j in enumerate(active_indices):
                         breakpoints = self._batch_x_list[j]
                         coeffs = self._batch_c_list[j]
@@ -310,51 +307,26 @@ class TrajectoryInterpolator:
                             len(breakpoints) - 2,
                         ))
                         time_offset = time - breakpoints[interval]
-                        fast_pos[i] = (
+                        positions[dest_idx[i]] = (
                             ((coeffs[0, interval] * time_offset
                               + coeffs[1, interval]) * time_offset
                              + coeffs[2, interval]) * time_offset
                             + coeffs[3, interval]
                         )
 
-                fast_pids = self._batch_pids[active]
-                mask[self._batch_idx[active]] = True
-                n_fast = n_active
-            else:
-                fast_pos = np.empty((0, 3))
-                fast_pids = np.empty(0, dtype=int)
-                n_fast = 0
-        else:
-            fast_pos = np.empty((0, 3))
-            fast_pids = np.empty(0, dtype=int)
-            n_fast = 0
+                mask[dest_idx] = True
 
         # --- Slow path: multi-segment particles ---
-        slow_positions = []
-        slow_ids = []
         for j in range(len(self._slow_pids)):
             pid_key = int(self._slow_pids[j])
             segments = self._particle_splines.get(pid_key, [])
             pos = self._evaluate_particle(segments, time)
             if pos is not None:
-                slow_positions.append(pos)
-                slow_ids.append(pid_key)
-                mask[self._slow_idx[j]] = True
+                idx = self._slow_idx[j]
+                positions[idx] = pos
+                mask[idx] = True
 
-        # Combine fast and slow results
-        n_slow = len(slow_positions)
-        count = n_fast + n_slow
-        positions = np.empty((count, 3))
-        active_ids = np.empty(count, dtype=int)
-
-        if n_fast > 0:
-            positions[:n_fast] = fast_pos
-            active_ids[:n_fast] = fast_pids
-        if n_slow > 0:
-            positions[n_fast:] = np.array(slow_positions)
-            active_ids[n_fast:] = np.array(slow_ids, dtype=int)
-
-        return positions, active_ids, mask
+        return positions, mask
 
     def evaluate_trails_batch(
         self,

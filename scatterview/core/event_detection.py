@@ -74,11 +74,12 @@ class EventDetector:
     def _compute_initial_extent(self) -> float:
         """Compute the initial spatial extent of the system."""
         t0 = self._data.times[0]
-        positions, _, _ = self._interp.evaluate_batch(t0)
-        if len(positions) < 2:
+        positions, mask = self._interp.evaluate_batch(t0)
+        active_pos = positions[mask]
+        if len(active_pos) < 2:
             return 1.0
-        center = positions.mean(axis=0)
-        distances = np.linalg.norm(positions - center, axis=1)
+        center = active_pos.mean(axis=0)
+        distances = np.linalg.norm(active_pos - center, axis=1)
         return float(np.max(distances)) or 1.0
 
     def detect_all(self) -> list[Event]:
@@ -220,11 +221,12 @@ class EventDetector:
 
             for t in sample_times:
                 # Get all positions for COM
-                all_pos, all_ids, _ = self._interp.evaluate_batch(t)
-                if len(all_pos) < 2:
+                all_pos, all_mask = self._interp.evaluate_batch(t)
+                active_pos = all_pos[all_mask]
+                if len(active_pos) < 2:
                     continue
 
-                com = all_pos.mean(axis=0)
+                com = active_pos.mean(axis=0)
 
                 # Get this particle's position
                 pos = self._interp._evaluate_particle(

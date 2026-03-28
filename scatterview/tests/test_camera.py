@@ -79,18 +79,14 @@ class TestFramingScope:
         ctrl._core_group_percentile = 75.0  # keep inner 75% = 3 of 4
 
         # 4 particles: 3 clustered near origin, 1 far away
-        positions = np.array([
+        active_pos = np.array([
             [0.0, 0.0, 0.0],
             [0.1, 0.0, 0.0],
             [0.0, 0.1, 0.0],
             [50.0, 50.0, 0.0],  # outlier
         ])
-        ids = np.array([0, 1, 2, 3])
-
-        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        # Outlier (particle 3) should be excluded
-        assert 3 not in framed_ids
-        assert len(framed_pos) == 3
+        framed = ctrl._select_framed_particles(active_pos)
+        assert len(framed) == 3
 
     def test_core_group_keeps_percentage(self):
         """CORE_GROUP at 100% keeps all; at 50% keeps half."""
@@ -98,21 +94,19 @@ class TestFramingScope:
         ctrl = CameraController(view)
         ctrl.framing_scope = FramingScope.CORE_GROUP
 
-        positions = np.array([
+        active_pos = np.array([
             [0.0, 0.0, 0.0],
             [0.1, 0.0, 0.0],
             [0.0, 0.1, 0.0],
             [0.1, 0.1, 0.0],
         ])
-        ids = np.array([0, 1, 2, 3])
-
         ctrl._core_group_percentile = 100.0
-        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        assert len(framed_ids) == 4
+        framed = ctrl._select_framed_particles(active_pos)
+        assert len(framed) == 4
 
         ctrl._core_group_percentile = 50.0
-        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        assert len(framed_ids) == 2
+        framed = ctrl._select_framed_particles(active_pos)
+        assert len(framed) == 2
 
     def test_nearest_neighbors_selects_k_closest(self):
         """NEAREST_NEIGHBORS should frame target + K nearest."""
@@ -121,21 +115,17 @@ class TestFramingScope:
         ctrl.framing_scope = FramingScope.NEAREST_NEIGHBORS
         ctrl.n_neighbors = 2
 
-        positions = np.array([
+        active_pos = np.array([
             [0.0, 0.0, 0.0],  # target
             [1.0, 0.0, 0.0],  # nearest
             [2.0, 0.0, 0.0],  # 2nd nearest
             [100.0, 0.0, 0.0],  # far away
         ])
-        ids = np.array([0, 1, 2, 3])
-        ref = positions[0]  # target position
+        ref = active_pos[0]  # target position
 
-        framed_pos, framed_ids = ctrl._select_framed_particles(
-            positions, ids, reference_pos=ref
-        )
+        framed = ctrl._select_framed_particles(active_pos, reference_pos=ref)
         # Should include target + 2 nearest = 3 particles
-        assert len(framed_ids) == 3
-        assert 3 not in framed_ids  # far particle excluded
+        assert len(framed) == 3
 
     def test_keep_all_overrides_scope(self):
         """keep_all_in_frame=True should override the scope and include everything."""
@@ -144,15 +134,13 @@ class TestFramingScope:
         ctrl.framing_scope = FramingScope.CORE_GROUP
         ctrl.keep_all_in_frame = True
 
-        positions = np.array([
+        active_pos = np.array([
             [0.0, 0.0, 0.0],
             [0.1, 0.0, 0.0],
             [50.0, 50.0, 0.0],  # outlier
         ])
-        ids = np.array([0, 1, 2])
-
-        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        assert len(framed_ids) == 3
+        framed = ctrl._select_framed_particles(active_pos)
+        assert len(framed) == 3
 
     def test_all_scope_returns_everything(self):
         """FramingScope.ALL should always return all particles."""
@@ -160,14 +148,12 @@ class TestFramingScope:
         ctrl = CameraController(view)
         ctrl.framing_scope = FramingScope.ALL
 
-        positions = np.array([
+        active_pos = np.array([
             [0.0, 0.0, 0.0],
             [100.0, 0.0, 0.0],
         ])
-        ids = np.array([0, 1])
-
-        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        assert len(framed_ids) == 2
+        framed = ctrl._select_framed_particles(active_pos)
+        assert len(framed) == 2
 
     def test_tracking_uses_framing_scope(self):
         """Tracking mode should use the framing scope for zoom distance."""
@@ -177,25 +163,25 @@ class TestFramingScope:
         ctrl.mode = CameraMode.TARGET_COMOVING
         ctrl._core_group_percentile = 75.0  # keep inner 3 of 4
 
-        # 3 clustered + 1 outlier
+        # Full-size positions array (n_particles=4)
         positions = np.array([
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
             [100.0, 100.0, 0.0],
         ])
-        ids = np.array([0, 1, 2, 3])
+        mask = np.ones(4, dtype=bool)
 
         # Run with CORE_GROUP (75%) — excludes outlier → smaller distance
         ctrl.framing_scope = FramingScope.CORE_GROUP
         for _ in range(200):
-            ctrl.update(0.0, positions, ids)
+            ctrl.update(0.0, positions, mask)
         core_distance = view.camera.distance
 
         # Run with ALL — includes outlier → much larger distance
         ctrl.framing_scope = FramingScope.ALL
         for _ in range(200):
-            ctrl.update(0.0, positions, ids)
+            ctrl.update(0.0, positions, mask)
         all_distance = view.camera.distance
 
         assert core_distance < all_distance
@@ -207,18 +193,16 @@ class TestFramingScope:
         ctrl.framing_scope = FramingScope.NEAREST_NEIGHBORS
         ctrl._n_neighbors = 3
 
-        positions = np.array([
+        active_pos = np.array([
             [0.0, 0.0, 0.0],
             [0.1, 0.0, 0.0],
             [0.0, 0.1, 0.0],
             [500.0, 500.0, 0.0],  # extreme outlier
         ])
-        ids = np.array([0, 1, 2, 3])
-
-        # No target → uses centroid as reference, selects K+1 nearest
-        framed_pos, framed_ids = ctrl._select_framed_particles(positions, ids)
-        # Should return K+1 = 4 particles (all of them, since K=3 + centroid itself)
-        assert len(framed_ids) <= ctrl._n_neighbors + 1
+        # Set _active_com so nearest neighbors has a fallback reference
+        ctrl._active_com = active_pos.mean(axis=0)
+        framed = ctrl._select_framed_particles(active_pos)
+        assert len(framed) <= ctrl._n_neighbors + 1
 
 
 class TestEventDetection:
