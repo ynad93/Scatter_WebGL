@@ -10,7 +10,7 @@ def render_video_headless(
     filepath: str | Path,
     duration: float = 10.0,
     fps: int = 30,
-    size: tuple[int, int] = (1920, 1080),
+    size: tuple[int, int] = (2560, 1440),
 ) -> None:
     """Render video without GUI (headless batch mode).
 
@@ -28,7 +28,7 @@ def screenshot_headless(
     engine,
     filepath: str | Path,
     sim_time: float | None = None,
-    size: tuple[int, int] = (1920, 1080),
+    size: tuple[int, int] = (2560, 1440),
 ) -> None:
     """Take a screenshot without GUI.
 

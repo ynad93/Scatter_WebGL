@@ -1014,7 +1014,7 @@ class RenderEngine:
                 self._anim_time = (t - self._t_min) / self._time_range
                 self._update_frame()
 
-                img = self._canvas.render(size=render_size)[:, :, :3]
+                img = self._canvas.render(size=render_size)
 
                 # Create stream from actual rendered dimensions (first frame)
                 if stream is None:
@@ -1024,7 +1024,7 @@ class RenderEngine:
                     stream.height = h
                     stream.pix_fmt = "yuv420p"
 
-                frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+                frame = av.VideoFrame.from_ndarray(img, format="rgba")
                 for packet in stream.encode(frame):
                     container.mux(packet)
 
