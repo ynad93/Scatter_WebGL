@@ -142,6 +142,7 @@ def _assemble_trails(
                 out_colors[offset + i, dim] = color_table[color_idx, dim]
 
 
+
 class RenderEngine:
     """Manages the VisPy canvas, particle and trail rendering, camera, and animation."""
 
@@ -196,6 +197,24 @@ class RenderEngine:
 
         self._id_to_idx = {int(pid): i for i, pid in enumerate(data.particle_ids)}
 
+        self._time_unit = D.UNIT_TIME
+
+        # Time overlay
+        self._time_display_enabled = True
+        self._time_font_size = D.TIME_FONT_SIZE
+        self._time_color = D.TIME_COLOR
+        self._time_anchor = D.TIME_ANCHOR
+        self._time_text = None  # VisPy Text visual, created in _build_visuals
+
+        # Star field background
+        self._stars_enabled = False
+        self._star_visual = None
+        self._star_directions = None   # (N, 3) float32 unit vectors, fixed
+        self._star_positions = None    # (N, 3) float32 working buffer, scaled each frame
+        self._star_base_sizes = None   # (N,) float32
+        self._star_base_colors = None  # (N, 4) float32
+        self._star_min_shell_radius = 1.0  # minimum shell radius (system extent)
+
         # Black hole rendering — pre-computed boolean array for vectorized lookup
         self._is_bh = np.zeros(n, dtype=bool)
         if data.startypes is not None:
@@ -211,7 +230,7 @@ class RenderEngine:
         )
         self._view = self._canvas.central_widget.add_view()
         self._view.camera = scene.cameras.TurntableCamera(
-            fov=D.CAMERA_FOV, distance=self._compute_initial_distance(),
+            fov=D.CAMERA_FOV, distance=10.0,
         )
         self._view.camera.set_range()
 
@@ -238,6 +257,7 @@ class RenderEngine:
         self._combined_pos = np.empty((0, 3), dtype=np.float32)
         self._combined_colors = np.empty((0, 4), dtype=np.float32)
         self._combined_times = np.empty(0, dtype=np.float64)
+        self._time_fraction = np.empty(0, dtype=np.float32)
 
         # Two-pointer sliding window indices (si, ei) per particle.
         # During forward playback these advance by 0-2 positions per frame
@@ -267,13 +287,34 @@ class RenderEngine:
         self._pan_keys_held: set[str] = set()
         self._ctrl_held = False
 
-    @staticmethod
-    def _camera_axes(camera):
-        """Compute camera-relative right and forward vectors from azimuth."""
-        az_rad = math.radians(camera.azimuth)
-        right = np.array([math.cos(az_rad), math.sin(az_rad), 0.0])
-        forward = np.array([-math.sin(az_rad), math.cos(az_rad), 0.0])
-        return right, forward
+        # Cached camera trig — computed once per frame in _update_frame,
+        # reused by lighting and panning.  Physics spherical convention:
+        # θ = π/2 − elevation (polar from +z),  φ = azimuth.
+        # VisPy axis mapping:  x = r sinθ sinφ,  y = r sinθ cosφ,  z = r cosθ.
+        self._cos_az = 1.0
+        self._sin_az = 0.0
+        self._cos_el = 1.0
+        self._sin_el = 0.0
+
+        # Normalized world-space light direction (constant, precomputed once)
+        _lw = np.array(D.LIGHT_POSITION, dtype=np.float64)
+        self._light_world = _lw / np.linalg.norm(_lw)
+
+    def _cache_camera_trig(self) -> None:
+        """Precompute sin/cos of camera azimuth and elevation."""
+        az = math.radians(self._view.camera.azimuth)
+        el = math.radians(self._view.camera.elevation)
+        self._cos_az = math.cos(az)
+        self._sin_az = math.sin(az)
+        self._cos_el = math.cos(el)
+        self._sin_el = math.sin(el)
+
+    def _camera_axes(self):
+        """Camera-relative right and forward vectors from cached trig."""
+        return (
+            np.array([self._cos_az, self._sin_az, 0.0]),
+            np.array([-self._sin_az, self._cos_az, 0.0]),
+        )
 
     @staticmethod
     def _has_ctrl(event) -> bool:
@@ -325,7 +366,8 @@ class RenderEngine:
             dy_screen = -cursor_offset_y * world_per_pixel  # screen Y is flipped
 
             # Rotate screen offset into world coordinates
-            right, _ = self._camera_axes(camera)
+            self._cache_camera_trig()
+            right, _ = self._camera_axes()
             up = np.array([0.0, 0.0, 1.0])
 
             center = np.array(camera.center, dtype=np.float64)
@@ -346,6 +388,10 @@ class RenderEngine:
     def _on_key_press(self, event) -> None:
         """Track held keys for smooth continuous panning."""
         key_name = event.key.name
+        if key_name == 'Space':
+            self.toggle_play()
+            event.handled = True
+            return
         if key_name in self._PAN_KEYS:
             self._pan_keys_held.add(key_name)
             # Enable free zoom so auto-framing doesn't fight the pan
@@ -376,7 +422,7 @@ class RenderEngine:
         speed = self._pan_speed * (5.0 if self._ctrl_held else 1.0)
         step = camera.distance * speed
 
-        right, forward = self._camera_axes(camera)
+        right, forward = self._camera_axes()
 
         center = np.array(camera.center, dtype=np.float64)
         for key_name in self._pan_keys_held:
@@ -447,11 +493,57 @@ class RenderEngine:
         idx = np.arange(n) % len(base)
         return base[idx]
 
-    def _compute_initial_distance(self) -> float:
-        positions, mask = self._interp.evaluate_batch(self._data.times[0])
-        if not mask.any():
-            return 10.0
-        return max(np.max(np.linalg.norm(positions[mask], axis=1)) * 5.0, 1.0)
+    def _generate_star_field(self) -> None:
+        """Generate random star directions, sizes, and colors.
+
+        Stores unit vectors on the sphere.  Each frame, these are scaled
+        to a dynamic shell radius that tracks the camera distance so the
+        stars always remain within the viewing frustum.
+        """
+        rng = np.random.default_rng(D.STAR_SEED)
+        n = D.STAR_COUNT
+
+        # Uniform unit vectors on the sphere
+        z = rng.uniform(-1, 1, n)
+        phi = rng.uniform(0, 2 * np.pi, n)
+        r_xy = np.sqrt(1 - z ** 2)
+        self._star_directions = np.column_stack([
+            r_xy * np.cos(phi), r_xy * np.sin(phi), z,
+        ]).astype(np.float32)
+
+        # Shell radius: maximum finite distance any particle reaches from the
+        # origin across the entire simulation, times a safety factor.
+        max_dist = 0.0
+        for pos in self._data.positions.values():
+            finite = np.isfinite(pos).all(axis=1)
+            if finite.any():
+                d = np.linalg.norm(pos[finite], axis=1).max()
+                if d > max_dist:
+                    max_dist = d
+        self._star_min_shell_radius = max(max_dist * D.STAR_SHELL_FACTOR, 1.0)
+
+
+        # Sizes: power-law — many dim, few bright
+        u = rng.uniform(0, 1, n)
+        self._star_base_sizes = (D.STAR_BASE_SIZE * (1.0 + 3.0 * u ** 3)).astype(np.float32)
+
+        # Colors: rough main-sequence distribution
+        colors = np.ones((n, 4), dtype=np.float32)
+        idx = rng.choice(n, int(0.3 * n), replace=False)
+        colors[idx, 0] *= rng.uniform(0.7, 0.9, len(idx)).astype(np.float32)
+        colors[idx, 1] *= rng.uniform(0.8, 0.95, len(idx)).astype(np.float32)
+        idx = rng.choice(n, int(0.1 * n), replace=False)
+        colors[idx, 2] *= rng.uniform(0.4, 0.7, len(idx)).astype(np.float32)
+        idx = rng.choice(n, int(0.05 * n), replace=False)
+        colors[idx, 1] *= rng.uniform(0.3, 0.6, len(idx)).astype(np.float32)
+        colors[idx, 2] *= rng.uniform(0.1, 0.3, len(idx)).astype(np.float32)
+        brightness = rng.uniform(0.3, 1.0, n).astype(np.float32)
+        colors[:, :3] *= brightness[:, np.newaxis]
+        colors[:, 3] = brightness
+        self._star_base_colors = colors
+
+        # Pre-allocated working buffers (reused each frame)
+        self._star_positions = np.empty_like(self._star_directions)
 
     def _get_particle_attrs(self, mask: np.ndarray) -> dict:
         """Compute face_color, edge_color, edge_width, size for active particles.
@@ -461,21 +553,17 @@ class RenderEngine:
         """
         n = int(mask.sum())
         sizes = self._sizes[mask]
+        face_color = self._colors[mask]
+        edge_color = np.zeros((n, 4), dtype=np.float32)
+        edge_width = np.zeros(n, dtype=np.float32)
 
         bh_mask = self._is_bh[mask]
         if bh_mask.any():
-            face_color = self._colors[mask].copy()
-            edge_color = np.zeros((n, 4), dtype=np.float32)
-            edge_width = np.zeros(n, dtype=np.float32)
-            bh_face = np.array(D.BH_FACE_COLOR, dtype=np.float32)
-            face_color[bh_mask] = bh_face
+            face_color = face_color.copy()
+            face_color[bh_mask] = np.array(D.BH_FACE_COLOR, dtype=np.float32)
             edge_color[bh_mask] = self._colors[mask][bh_mask]
             edge_color[bh_mask, 3] = 1.0
             edge_width[bh_mask] = D.BH_EDGE_WIDTH
-        else:
-            face_color = self._colors[mask]
-            edge_color = np.zeros((n, 4), dtype=np.float32)
-            edge_width = np.zeros(n, dtype=np.float32)
 
         return {"face_color": face_color, "edge_color": edge_color,
                 "edge_width": edge_width, "size": sizes}
@@ -503,6 +591,22 @@ class RenderEngine:
         )
         self._particle_visual.set_data(pos=active_pos, **attrs)
         self._update_trails(self._data.times[0], positions, mask)
+
+        # Pre-generate star field data (created lazily when toggled on)
+        self._generate_star_field()
+
+        # Time overlay — attached to the canvas root so it stays fixed on screen
+        self._time_text = scene.visuals.Text(
+            text=D.format_sim_time(self._t_min, self._time_unit),
+            color=self._time_color,
+            font_size=self._time_font_size,
+            pos=D.TIME_OFFSET,
+            anchor_x="left",
+            anchor_y="top",
+            parent=self._canvas.scene,
+        )
+        self._time_text.order = 10
+        self._time_text.visible = self._time_display_enabled
 
     def _rebuild_particle_visual(self) -> None:
         from vispy import scene
@@ -653,6 +757,7 @@ class RenderEngine:
             self._combined_pos = np.empty((self._trail_capacity, 3), dtype=np.float32)
             self._combined_colors = np.empty((self._trail_capacity, 4), dtype=np.float32)
             self._combined_times = np.empty(self._trail_capacity, dtype=np.float64)
+            self._time_fraction = np.empty(self._trail_capacity, dtype=np.float32)
         combined_pos = self._combined_pos[:total_pts]
         combined_colors = self._combined_colors[:total_pts]
 
@@ -678,7 +783,8 @@ class RenderEngine:
 
         # --- Alpha gradient: older points fade out, newest are opaque ---
         valid_time_mask = ~np.isnan(combined_times)
-        time_fraction = np.zeros(total_pts, dtype=np.float32)
+        time_fraction = self._time_fraction[:total_pts]
+        time_fraction[:] = 0.0
         time_fraction[valid_time_mask] = (
             (combined_times[valid_time_mask] - t_trail_start) * inv_trail_window
         )
@@ -716,6 +822,22 @@ class RenderEngine:
                 )
 
     # ------------------------------------------------------------------
+    # Star field
+    # ------------------------------------------------------------------
+
+    def _update_stars(self) -> None:
+        """Update star field positions on the fixed shell.
+
+        Called only when stars are enabled and visual exists.
+        """
+        np.multiply(self._star_directions, self._star_min_shell_radius,
+                    out=self._star_positions)
+        self._star_visual.set_data(
+            pos=self._star_positions, face_color=self._star_base_colors,
+            size=self._star_base_sizes, edge_width=0,
+        )
+
+    # ------------------------------------------------------------------
     # Frame update
     # ------------------------------------------------------------------
 
@@ -732,44 +854,26 @@ class RenderEngine:
         self._update_frame()
 
     def _update_light_direction(self) -> None:
-        """Transform the world-space light direction into eye space.
-
-        VisPy's Markers shader expects the light direction in eye space
-        (camera-relative coordinates).  By transforming a fixed world-space
-        light direction through the camera's view rotation each frame,
-        particles get consistent directional lighting: the bright side
-        faces the light and the dark side faces away, regardless of
-        camera angle.  This gives strong depth cues when orbiting.
+        """Transform the precomputed world-space light direction into eye space
+        using cached camera trig (inverse rotation: cos(-φ)=cosφ, sin(-φ)=-sinφ).
         """
-        camera = self._view.camera
-        world_light_dir = np.array(D.LIGHT_POSITION, dtype=np.float64)
-        world_light_dir /= np.linalg.norm(world_light_dir)
-
-        # Rotate world light direction by the inverse of the camera's
-        # azimuth and elevation to get eye-space direction
-        az = math.radians(-camera.azimuth)
-        el = math.radians(-camera.elevation)
-
-        # Azimuth rotation (around Z axis)
-        cos_az, sin_az = math.cos(az), math.sin(az)
-        x = world_light_dir[0] * cos_az - world_light_dir[1] * sin_az
-        y = world_light_dir[0] * sin_az + world_light_dir[1] * cos_az
-        z = world_light_dir[2]
-
-        # Elevation rotation (around X axis)
-        cos_el, sin_el = math.cos(el), math.sin(el)
-        eye_y = y * cos_el - z * sin_el
-        eye_z = y * sin_el + z * cos_el
-
-        eye_light = np.array([x, eye_y, eye_z])
-        eye_light /= np.linalg.norm(eye_light)
+        w = self._light_world
+        x = w[0] * self._cos_az + w[1] * self._sin_az
+        y = -w[0] * self._sin_az + w[1] * self._cos_az
+        z = w[2]
+        eye_y = y * self._cos_el + z * self._sin_el
+        eye_z = -y * self._sin_el + z * self._cos_el
+        inv_norm = 1.0 / math.sqrt(x * x + eye_y * eye_y + eye_z * eye_z)
+        light = (x * inv_norm, eye_y * inv_norm, eye_z * inv_norm)
 
         if self._particle_visual is not None:
-            self._particle_visual.light_position = tuple(eye_light)
+            self._particle_visual.light_position = light
         if self._subview_markers is not None:
-            self._subview_markers.light_position = tuple(eye_light)
+            self._subview_markers.light_position = light
 
     def _update_frame(self) -> None:
+        self._cache_camera_trig()
+
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
         if not mask.any():
             self._canvas.update()
@@ -789,6 +893,17 @@ class RenderEngine:
             self._particle_visual.set_data(pos=active_pos, **attrs)
 
         self._update_trails(self._current_sim_time, positions, mask)
+
+        # Star field
+        if self._stars_enabled and self._star_visual is not None:
+            self._update_stars()
+
+        # Time overlay — only update the VisPy text when the display string
+        # actually changes (avoids per-frame texture re-render)
+        if self._time_text is not None and self._time_display_enabled:
+            text = D.format_sim_time(self._current_sim_time, self._time_unit)
+            if text != self._time_text.text:
+                self._time_text.text = text
 
         if self._subview_enabled and self._subview_markers is not None:
             self._subview_markers.set_data(
@@ -896,8 +1011,88 @@ class RenderEngine:
         if self._subview_markers is not None:
             self._subview_markers.alpha = self._point_alpha
 
+    # ------------------------------------------------------------------
+    # Units
+    # ------------------------------------------------------------------
+
+    def set_units(self, time_unit: str | None = None) -> None:
+        """Update the time unit label for the overlay."""
+        if time_unit:
+            self._time_unit = time_unit
+
+    # ------------------------------------------------------------------
+    # Time overlay
+    # ------------------------------------------------------------------
+
+    def set_time_display(self, enabled: bool) -> None:
+        self._time_display_enabled = enabled
+        if self._time_text is not None:
+            self._time_text.visible = enabled
+
+    def set_time_font_size(self, size: float) -> None:
+        self._time_font_size = size
+        if self._time_text is not None:
+            self._time_text.font_size = size
+
+    def set_time_color(self, color) -> None:
+        self._time_color = color
+        if self._time_text is not None:
+            self._time_text.color = color
+
+    def set_time_anchor(self, anchor: str) -> None:
+        """Set time overlay position: top-left, top-right, bottom-left, bottom-right."""
+        self._time_anchor = anchor
+        self._reposition_time_text()
+
+    def _reposition_time_text(self) -> None:
+        if self._time_text is None:
+            return
+        w, h = self._canvas.size
+        ox, oy = D.TIME_OFFSET
+        anchors = {
+            "top-left": ((ox, oy), "left", "top"),
+            "top-right": ((w - ox, oy), "right", "top"),
+            "bottom-left": ((ox, h - oy), "left", "bottom"),
+            "bottom-right": ((w - ox, h - oy), "right", "bottom"),
+        }
+        pos, ax, ay = anchors.get(self._time_anchor, anchors["top-left"])
+        self._time_text.pos = pos
+        self._time_text.anchors = (ax, ay)
+
+    # ------------------------------------------------------------------
+    # Star field
+    # ------------------------------------------------------------------
+
+    def enable_stars(self, enabled: bool = True) -> None:
+        from vispy import scene
+
+        self._stars_enabled = enabled
+        if enabled and self._star_visual is None:
+            if self._star_directions is None:
+                self._generate_star_field()
+            np.multiply(self._star_directions, self._star_min_shell_radius,
+                        out=self._star_positions)
+            self._star_visual = scene.Markers(
+                parent=self._view.scene,
+            )
+            self._star_visual.set_data(
+                pos=self._star_positions,
+                face_color=self._star_base_colors,
+                size=self._star_base_sizes,
+                edge_width=0,
+            )
+            self._star_visual.order = -10
+        if self._star_visual is not None:
+            self._star_visual.visible = enabled
+
     def set_camera_controller(self, controller) -> None:
         self._camera_controller = controller
+        positions, mask = self._interp.evaluate_batch(self._current_sim_time)
+        if not mask.any():
+            return
+        center, distance = controller.initialize_framing(positions, mask)
+        self._view.camera.center = tuple(center)
+        self._view.camera.distance = distance
 
     # ------------------------------------------------------------------
     # Sub-view
@@ -928,7 +1123,7 @@ class RenderEngine:
 
         self._subview = self._subview_canvas.central_widget.add_view()
         self._subview.camera = scene.cameras.TurntableCamera(
-            fov=D.SUBVIEW_FOV, distance=self._compute_initial_distance() * 1.5,
+            fov=D.SUBVIEW_FOV, distance=10.0,
         )
 
         from ..core.camera import CameraController, CameraMode

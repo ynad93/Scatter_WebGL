@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from scatterview.core.camera import CameraController, CameraMode, FramingScope
+from scatterview.core.camera import CameraController, CameraMode
 from scatterview.core.data_loader import SimulationData
 from scatterview.core.event_detection import EventDetector
 from scatterview.core.interpolation import TrajectoryInterpolator
@@ -70,13 +70,12 @@ class _FakeView:
         self.camera = _FakeCamera()
 
 
-class TestFramingScope:
-    def test_core_group_rejects_outlier(self):
-        """An ejected particle far from the cluster should be excluded by CORE_GROUP."""
+class TestFraming:
+    def test_n_framed_rejects_outlier(self):
+        """Framing with n_framed=3 should exclude a distant outlier."""
         view = _FakeView()
         ctrl = CameraController(view)
-        ctrl.framing_scope = FramingScope.CORE_GROUP
-        ctrl._core_group_percentile = 75.0  # keep inner 75% = 3 of 4
+        ctrl.n_framed = 3
 
         # 4 particles: 3 clustered near origin, 1 far away
         active_pos = np.array([
@@ -85,14 +84,14 @@ class TestFramingScope:
             [0.0, 0.1, 0.0],
             [50.0, 50.0, 0.0],  # outlier
         ])
+        ctrl._active_com = active_pos.mean(axis=0)
         framed = ctrl._select_framed_particles(active_pos)
         assert len(framed) == 3
 
-    def test_core_group_keeps_percentage(self):
-        """CORE_GROUP at 100% keeps all; at 50% keeps half."""
+    def test_n_framed_all_returns_everything(self):
+        """n_framed >= n_active returns all particles."""
         view = _FakeView()
         ctrl = CameraController(view)
-        ctrl.framing_scope = FramingScope.CORE_GROUP
 
         active_pos = np.array([
             [0.0, 0.0, 0.0],
@@ -100,20 +99,20 @@ class TestFramingScope:
             [0.0, 0.1, 0.0],
             [0.1, 0.1, 0.0],
         ])
-        ctrl._core_group_percentile = 100.0
+        ctrl.n_framed = 4
         framed = ctrl._select_framed_particles(active_pos)
         assert len(framed) == 4
 
-        ctrl._core_group_percentile = 50.0
+        ctrl.n_framed = 2
+        ctrl._active_com = active_pos.mean(axis=0)
         framed = ctrl._select_framed_particles(active_pos)
         assert len(framed) == 2
 
-    def test_nearest_neighbors_selects_k_closest(self):
-        """NEAREST_NEIGHBORS should frame target + K nearest."""
+    def test_n_framed_selects_closest(self):
+        """n_framed should keep the closest particles to the reference."""
         view = _FakeView()
         ctrl = CameraController(view)
-        ctrl.framing_scope = FramingScope.NEAREST_NEIGHBORS
-        ctrl.n_neighbors = 2
+        ctrl.n_framed = 3
 
         active_pos = np.array([
             [0.0, 0.0, 0.0],  # target
@@ -121,17 +120,16 @@ class TestFramingScope:
             [2.0, 0.0, 0.0],  # 2nd nearest
             [100.0, 0.0, 0.0],  # far away
         ])
-        ref = active_pos[0]  # target position
+        ref = active_pos[0]
 
         framed = ctrl._select_framed_particles(active_pos, reference_pos=ref)
-        # Should include target + 2 nearest = 3 particles
         assert len(framed) == 3
 
-    def test_keep_all_overrides_scope(self):
-        """keep_all_in_frame=True should override the scope and include everything."""
+    def test_keep_all_overrides_n_framed(self):
+        """keep_all_in_frame=True should override n_framed."""
         view = _FakeView()
         ctrl = CameraController(view)
-        ctrl.framing_scope = FramingScope.CORE_GROUP
+        ctrl.n_framed = 2
         ctrl.keep_all_in_frame = True
 
         active_pos = np.array([
@@ -142,28 +140,13 @@ class TestFramingScope:
         framed = ctrl._select_framed_particles(active_pos)
         assert len(framed) == 3
 
-    def test_all_scope_returns_everything(self):
-        """FramingScope.ALL should always return all particles."""
-        view = _FakeView()
-        ctrl = CameraController(view)
-        ctrl.framing_scope = FramingScope.ALL
-
-        active_pos = np.array([
-            [0.0, 0.0, 0.0],
-            [100.0, 0.0, 0.0],
-        ])
-        framed = ctrl._select_framed_particles(active_pos)
-        assert len(framed) == 2
-
-    def test_tracking_uses_framing_scope(self):
-        """Tracking mode should use the framing scope for zoom distance."""
+    def test_tracking_uses_n_framed(self):
+        """Tracking mode zoom distance should depend on n_framed."""
         view = _FakeView()
         ctrl = CameraController(view)
         ctrl.free_zoom = False
         ctrl.mode = CameraMode.TARGET_COMOVING
-        ctrl._core_group_percentile = 75.0  # keep inner 3 of 4
 
-        # Full-size positions array (n_particles=4)
         positions = np.array([
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -172,26 +155,25 @@ class TestFramingScope:
         ])
         mask = np.ones(4, dtype=bool)
 
-        # Run with CORE_GROUP (75%) — excludes outlier → smaller distance
-        ctrl.framing_scope = FramingScope.CORE_GROUP
+        # n_framed=3 excludes outlier → smaller distance
+        ctrl.n_framed = 3
         for _ in range(200):
             ctrl.update(0.0, positions, mask)
-        core_distance = view.camera.distance
+        tight_distance = view.camera.distance
 
-        # Run with ALL — includes outlier → much larger distance
-        ctrl.framing_scope = FramingScope.ALL
+        # n_framed=4 includes outlier → much larger distance
+        ctrl.n_framed = 4
         for _ in range(200):
             ctrl.update(0.0, positions, mask)
         all_distance = view.camera.distance
 
-        assert core_distance < all_distance
+        assert tight_distance < all_distance
 
-    def test_nearest_neighbors_fallback_without_target(self):
-        """NEAREST_NEIGHBORS without a target uses centroid as reference."""
+    def test_n_framed_fallback_without_target(self):
+        """Without a target, uses COM as reference."""
         view = _FakeView()
         ctrl = CameraController(view)
-        ctrl.framing_scope = FramingScope.NEAREST_NEIGHBORS
-        ctrl._n_neighbors = 3
+        ctrl.n_framed = 4
 
         active_pos = np.array([
             [0.0, 0.0, 0.0],
@@ -199,10 +181,9 @@ class TestFramingScope:
             [0.0, 0.1, 0.0],
             [500.0, 500.0, 0.0],  # extreme outlier
         ])
-        # Set _active_com so nearest neighbors has a fallback reference
         ctrl._active_com = active_pos.mean(axis=0)
         framed = ctrl._select_framed_particles(active_pos)
-        assert len(framed) <= ctrl._n_neighbors + 1
+        assert len(framed) == 4
 
 
 class TestEventDetection:

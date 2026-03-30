@@ -3,10 +3,9 @@
 Provides composable camera modes: tracking, auto-center,
 auto-rotate, event tracking, target tracking, and manual control.
 
-Framing scope controls which particles drive the camera zoom:
-- ALL: frame every active particle (can chase outliers)
-- CORE_GROUP: ignore outlier particles far from the cluster center
-- NEAREST_NEIGHBORS: frame the target particle + its K nearest neighbors
+Framing controls which particles drive the camera zoom via a single
+count parameter (n_framed): the N closest particles to the reference
+point are kept.  When N >= the active count, all particles are framed.
 """
 
 from __future__ import annotations
@@ -20,21 +19,12 @@ from .. import defaults as D
 
 class CameraMode(Enum):
     MANUAL = auto()
-    EVENT_TRACK = auto()
     TARGET_REST_FRAME = auto()
     TARGET_COMOVING = auto()  # unified tracking: deadzone on target or COM
 
 
-class FramingScope(Enum):
-    ALL = auto()
-    CORE_GROUP = auto()
-    NEAREST_NEIGHBORS = auto()
-
-
 class CameraController:
     """Manages automated camera behavior.
-
-    Can be attached to a RenderEngine to control the VisPy camera.
 
     Args:
         view: VisPy ViewBox whose camera to control.
@@ -77,30 +67,57 @@ class CameraController:
         self._rotation_speed = D.ROTATION_SPEED
         self._azimuth_offset = 0.0
 
-        # Framing: which particles drive the camera
-        self._framing_scope = FramingScope.CORE_GROUP
+        # Framing: which particles drive the camera.
+        # _n_framed = number of closest particles to keep; when >= active
+        # count, all particles are framed (the default).
+        n = len(particle_ids) if particle_ids is not None else 0
+        self._n_framed = n
         self._keep_all_in_frame = False
-        self._core_group_percentile = 100.0  # 100% = no filtering; GUI slider adjusts
-        self._n_neighbors = D.CAMERA_N_NEIGHBORS
+
+        # Framing fraction: what fraction of the screen's vertical
+        # half-extent the framed group is allowed to occupy.  0.75 means
+        # the farthest framed particle appears at 75% of the way from
+        # screen center to the top/bottom edge.
+        self._framing_fraction = D.FRAMING_FRACTION
+        self._cache_fov_trig()
+
+        # Zoom smoothing: exponential damping factor (0–1).  Each frame,
+        # the camera distance moves by this fraction of the gap between
+        # current and ideal.  1.0 = instant tracking, 0.1 = very smooth.
+        self._zoom_smoothing = D.ZOOM_SMOOTHING
+
+        # Center mode: when tracking a target with neighbors, center on
+        # the target particle directly, or on the centroid/CoM of the group.
+        self._use_group_center = False   # False = pin on target particle
+        self._mass_weighted_center = False  # True = CoM, False = centroid
+        self._framed_active_idx = np.empty(0, dtype=np.intp)
+
+        # Event tracking overlay: blends toward upcoming events on top of
+        # the active base mode.  Ramp-in and ramp-out durations control
+        # how long before/after an event the blend is active.
+        self._event_tracking_enabled = False
+        self._event_ramp_in = 2.0   # seconds before event to start blending
+        self._event_ramp_out = 1.0  # seconds after event to finish blending
+        self._event_zoom_tighten = 0.7  # max zoom tightening factor at peak
 
         # Target tracking
         self._target_pid: int | None = None
         self._target_needs_acquisition = False
 
-        # Deadzone: camera holds still until the tracked point drifts
-        # outside this fraction of the visible radius
-        self._deadzone_fraction = 0.5
+        # Panning deadzone: camera center holds still until the tracked
+        # point drifts outside this fraction of the visible radius.
+        # Only affects center panning, not zoom.
+        self._pan_deadzone_fraction = D.PAN_DEADZONE_FRACTION
 
         # Free zoom: when True, user controls distance via scroll wheel;
         # center tracking still works for target modes
         self._free_zoom = False
         self._free_zoom_callbacks: list = []
 
-
         # Camera state — initialized from VisPy camera's current position
         cam_center = self._camera.center
         self._smoothed_center = np.array(cam_center, dtype=np.float64) if cam_center else np.zeros(3)
-        self._smoothed_distance = float(self._camera.distance or 10.0)
+        self._smoothed_framing_radius = 1.0  # overwritten by set_camera_controller
         self._active_com = self._smoothed_center.copy()
 
     # --- Properties ---
@@ -141,12 +158,12 @@ class CameraController:
         self._target_needs_acquisition = pid is not None
 
     @property
-    def framing_scope(self) -> FramingScope:
-        return self._framing_scope
+    def n_framed(self) -> int:
+        return self._n_framed
 
-    @framing_scope.setter
-    def framing_scope(self, value: FramingScope) -> None:
-        self._framing_scope = value
+    @n_framed.setter
+    def n_framed(self, value: int) -> None:
+        self._n_framed = max(1, value)
 
     @property
     def keep_all_in_frame(self) -> bool:
@@ -169,14 +186,49 @@ class CameraController:
             cb(value)
 
     @property
-    def n_neighbors(self) -> int:
-        return self._n_neighbors
+    def use_group_center(self) -> bool:
+        return self._use_group_center
 
-    @n_neighbors.setter
-    def n_neighbors(self, value: int) -> None:
-        self._n_neighbors = max(1, value)
+    @use_group_center.setter
+    def use_group_center(self, value: bool) -> None:
+        self._use_group_center = value
+        self._target_needs_acquisition = True
+
+    @property
+    def mass_weighted_center(self) -> bool:
+        return self._mass_weighted_center
+
+    @mass_weighted_center.setter
+    def mass_weighted_center(self, value: bool) -> None:
+        self._mass_weighted_center = value
+        self._target_needs_acquisition = True
+
+    @property
+    def event_tracking(self) -> bool:
+        return self._event_tracking_enabled
+
+    @event_tracking.setter
+    def event_tracking(self, value: bool) -> None:
+        self._event_tracking_enabled = value
 
     # --- Core update ---
+
+    def initialize_framing(
+        self, positions: np.ndarray, mask: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        """Compute initial framing and set internal state.
+
+        Returns (center, camera_distance) for the caller to apply
+        to the VisPy camera.
+        """
+        active_pos = positions[mask]
+        target_pos = self._find_target(positions)
+        framed = self._select_framed_particles(active_pos, reference_pos=target_pos)
+        center = framed.mean(axis=0)
+        radius = self._compute_framing_radius(framed, center)
+        self._smoothed_center = center.copy()
+        self._smoothed_framing_radius = radius
+        return center, self._ideal_distance(radius)
 
     def update(
         self,
@@ -199,40 +251,35 @@ class CameraController:
         if not mask.any():
             return
 
-        # Extract active-only positions for framing calculations
         active_pos = positions[mask]
-
-        # Mass-weighted center of mass of ALL active particles (computed once)
         self._active_com = self._compute_center_of_mass(active_pos, mask)
 
-        # When a target is first selected, jump the camera to the target
-        # group so the deadzone can maintain tracking from a good position
-        # (instead of slowly chasing from wherever the camera was).
+        # Snap the camera when a setting changes (new target, center mode
+        # toggle, etc.) so the deadzone doesn't silently absorb the shift.
         if self._target_needs_acquisition:
             self._target_needs_acquisition = False
-            target_pos = self._find_target(positions)
-            if target_pos is not None:
-                framed_pos = self._select_framed_particles(
-                    active_pos, reference_pos=target_pos,
-                )
-                group_center = framed_pos.mean(axis=0)
-                framing_radius = self._compute_framing_radius(framed_pos, group_center)
-                fov_rad = np.radians(self._camera.fov / 2)
-                # Distance that fits framing_radius inside the FOV cone,
-                # with 25% padding so particles aren't clipped at screen edges
-                ideal_distance = framing_radius / np.sin(fov_rad) * 1.25
+            center, framing_radius = self._compute_tracking(
+                positions, active_pos, mask, use_deadzone=False,
+            )
+            self._smoothed_framing_radius = framing_radius
+            self._camera.center = tuple(center)
+            self._camera.distance = self._ideal_distance(framing_radius)
 
-                self._smoothed_center = group_center.copy()
-                self._smoothed_distance = ideal_distance
-                self._camera.center = tuple(group_center)
-                self._camera.distance = ideal_distance
-
+        # Base mode computes center and framing radius
         if self._mode == CameraMode.TARGET_COMOVING:
-            self._update_target_comoving(positions, active_pos)
-        elif self._mode == CameraMode.EVENT_TRACK:
-            self._update_event_track(sim_time, positions, active_pos)
+            center, framing_radius = self._compute_tracking(positions, active_pos, mask, use_deadzone=True)
         elif self._mode == CameraMode.TARGET_REST_FRAME:
-            self._update_target_rest(positions, active_pos)
+            center, framing_radius = self._compute_tracking(positions, active_pos, mask, use_deadzone=False)
+        else:
+            center, framing_radius = self._smoothed_center, self._smoothed_framing_radius
+
+        # Event tracking overlay: blend toward upcoming events
+        if self._event_tracking_enabled and self._events:
+            center, framing_radius = self._apply_event_blend(
+                sim_time, center, framing_radius, active_pos, mask,
+            )
+
+        self._apply_camera(center, framing_radius)
 
         if self._auto_rotate_enabled:
             self._apply_rotation()
@@ -244,63 +291,23 @@ class CameraController:
         active_pos: np.ndarray,
         reference_pos: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Select which particles should drive the camera framing.
+        """Select the closest ``n_framed`` particles to the reference point.
 
-        Args:
-            active_pos: (N_active, 3) positions of active particles.
-            reference_pos: Optional reference position (e.g. target particle).
-
-        Returns:
-            Subset of active_pos to frame.
+        When ``n_framed >= n_active`` (or ``keep_all_in_frame``), returns
+        all particles unchanged.  Also stores ``_framed_active_idx``.
         """
-        if self._keep_all_in_frame or len(active_pos) <= 2:
+        n = len(active_pos)
+        n_keep = min(self._n_framed, n)
+
+        if self._keep_all_in_frame or n <= 2 or n_keep >= n:
+            self._framed_active_idx = np.arange(n)
             return active_pos
 
-        scope = self._framing_scope
-
-        if scope == FramingScope.ALL:
-            return active_pos
-
-        if scope == FramingScope.CORE_GROUP:
-            return self._select_core_group(active_pos)
-
-        if scope == FramingScope.NEAREST_NEIGHBORS:
-            return self._select_nearest_neighbors(active_pos, reference_pos)
-
-        return active_pos
-
-    def _select_core_group(self, active_pos: np.ndarray) -> np.ndarray:
-        """Keep the closest X% of particles by distance from centroid.
-
-        Particles are ranked by distance from the unweighted centroid.
-        The closest `core_group_percentile`% by count are kept for
-        framing.  Outliers still render but don't drive the camera.
-        """
-        centroid = active_pos.mean(axis=0)
-        distances = np.linalg.norm(active_pos - centroid, axis=1)
-
-        n_keep = max(2, int(len(active_pos) * self._core_group_percentile / 100.0))
-        closest = np.argsort(distances)[:n_keep]
+        center = reference_pos if reference_pos is not None else self._active_com
+        distances = np.linalg.norm(active_pos - center, axis=1)
+        closest = np.argpartition(distances, n_keep)[:n_keep]
+        self._framed_active_idx = closest
         return active_pos[closest]
-
-    def _select_nearest_neighbors(
-        self,
-        active_pos: np.ndarray,
-        reference_pos: np.ndarray | None,
-    ) -> np.ndarray:
-        """Select the K nearest neighbors around a reference point.
-
-        If a target particle is set, uses its position as the reference.
-        Otherwise uses the mass-weighted center of mass (computed once
-        per frame in update()).
-        """
-        if reference_pos is None:
-            reference_pos = self._active_com
-
-        distances = np.linalg.norm(active_pos - reference_pos, axis=1)
-        k = min(self._n_neighbors + 1, len(active_pos))
-        nearest_idx = np.argsort(distances)[:k]
-        return active_pos[nearest_idx]
 
     # --- Helpers ---
 
@@ -313,38 +320,67 @@ class CameraController:
                 return (active_pos * weights[:, np.newaxis]).sum(axis=0) / total
         return active_pos.mean(axis=0)
 
-    def _compute_framing_radius(self, positions: np.ndarray, center: np.ndarray) -> float:
-        """Compute the framing radius (maximum distance from center).
+    def _tracking_point(
+        self, target_pos: np.ndarray | None, framed_pos: np.ndarray,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        """Determine the camera center point.
 
-        Returns the distance of the farthest particle from center.
-        Since the core group percentile already filters outliers,
-        using max here frames all remaining particles.
+        If ``use_group_center`` is False, pins on the target (or COM if
+        no target).  Otherwise computes the centroid or mass-weighted
+        center of the framed group.
         """
+        if not self._use_group_center:
+            return target_pos if target_pos is not None else self._active_com
+
+        if self._mass_weighted_center and self._mass_array is not None:
+            # Map framed active-space indices to full-array indices for mass lookup
+            full_idx = np.where(mask)[0][self._framed_active_idx]
+            weights = self._mass_array[full_idx]
+            total = weights.sum()
+            if total > 0:
+                return (framed_pos * weights[:, np.newaxis]).sum(axis=0) / total
+
+        return framed_pos.mean(axis=0)
+
+    def _cache_fov_trig(self) -> None:
+        """Recompute cached FOV-derived trig values.
+
+        Called once at init and whenever framing_fraction changes.
+        """
+        half_fov = np.radians(self._camera.fov / 2)
+        self._tan_half_fov = np.tan(half_fov)
+        self._inv_sin_effective_fov = 1.0 / np.sin(half_fov * self._framing_fraction)
+
+    def _ideal_distance(self, framing_radius: float) -> float:
+        """Camera distance that places the farthest framed particle at
+        the framing fraction of the screen's vertical half-extent.
+        """
+        return framing_radius * self._inv_sin_effective_fov
+
+    def _compute_framing_radius(self, positions: np.ndarray, center: np.ndarray) -> float:
+        """Maximum distance from center to any framed particle."""
         distances = np.linalg.norm(positions - center, axis=1)
         if len(distances) == 0:
             return 1.0
         return float(np.max(distances)) or 1.0
 
-    def _apply_deadzone(self, target_position: np.ndarray) -> np.ndarray:
-        """Apply deadzone panning: hold camera until target drifts past threshold.
+    def _apply_pan_deadzone(self, target_position: np.ndarray) -> np.ndarray:
+        """Apply panning deadzone: hold camera center until the tracked
+        point drifts outside the deadzone radius.
 
-        The camera stays still while the target is within `deadzone_fraction`
-        of the visible radius from screen center.  Once it drifts outside,
-        the camera moves exactly enough to place the target on the deadzone
-        edge.  No additional velocity cap — the deadzone itself IS the
-        smoothing.  This ensures the camera always keeps up, even during
-        fast slingshots.
+        The camera stays still while the target is within
+        `pan_deadzone_fraction` of the visible radius from screen center.
+        Once it drifts outside, the camera moves exactly enough to place
+        the target on the deadzone edge.
         """
-        visible_radius = self._smoothed_distance * np.tan(
-            np.radians(self._camera.fov / 2)
-        )
-        deadzone_radius = visible_radius * self._deadzone_fraction
+        visible_radius = float(self._camera.distance) * self._tan_half_fov
+        deadzone_radius = visible_radius * self._pan_deadzone_fraction
 
         offset = target_position - self._smoothed_center
         offset_distance = np.linalg.norm(offset)
 
         if offset_distance > deadzone_radius:
-            # Move camera exactly enough to put target on the deadzone edge
             overshoot = offset_distance - deadzone_radius
             chase_direction = offset / offset_distance
             self._smoothed_center = self._smoothed_center + chase_direction * overshoot
@@ -352,47 +388,27 @@ class CameraController:
         return self._smoothed_center
 
     def _apply_camera(self, center: np.ndarray, framing_radius: float) -> None:
-        """Push smoothed center and distance to the VisPy camera.
+        """Push center and distance to the VisPy camera.
 
-        Center is always updated (target tracking should work even if
-        the user has scrolled to zoom manually).  Distance is only
-        updated when free zoom is off — free zoom gives the user manual
-        control of the zoom level while the camera still tracks.
-
-        Zoom uses the deadzone philosophy: the camera distance holds
-        steady until the ideal framing distance differs from the current
-        by more than the deadzone fraction, then chases to the edge.
+        Center is always updated.  The framing radius is exponentially
+        smoothed (zoom_smoothing controls the rate) to filter frame-to-frame
+        noise from orbital oscillations, then the camera distance is computed
+        deterministically from the smoothed radius.  Free zoom disables
+        automatic distance updates so the user can control zoom manually
+        while center tracking continues.
         """
         self._camera.center = tuple(center)
 
-        # Free zoom: user controls distance manually via scroll wheel.
-        # Center tracking still works so target modes remain functional.
         if self._free_zoom:
             return
 
-        fov_rad = np.radians(self._camera.fov / 2)
-        ideal_distance = framing_radius / np.sin(fov_rad) * 1.25
-
-        # Zoom deadzone: hold if the ideal distance is within ±50% of
-        # the current smoothed distance.  Chase to the edge if outside.
-        # No velocity cap — the deadzone is the only smoothing.
-        current = self._smoothed_distance
-        delta = ideal_distance - current
-        threshold = abs(current) * self._deadzone_fraction
-
-        if abs(delta) > threshold:
-            edge_distance = current + (delta - np.sign(delta) * threshold)
-            self._smoothed_distance = edge_distance
-            self._camera.distance = edge_distance
-        else:
-            self._camera.distance = current
+        self._smoothed_framing_radius += self._zoom_smoothing * (
+            framing_radius - self._smoothed_framing_radius
+        )
+        self._camera.distance = self._ideal_distance(self._smoothed_framing_radius)
 
     def _find_target(self, positions: np.ndarray) -> np.ndarray | None:
-        """Return the target particle's position, or None if not active.
-
-        Args:
-            positions: (n_particles, 3) full-size array (NaN for inactive).
-        """
+        """Return the target particle's position, or None if not active."""
         if self._target_pid is None or len(self._pid_lookup) == 0:
             return None
         pid = int(self._target_pid)
@@ -408,83 +424,77 @@ class CameraController:
 
     # --- Mode implementations ---
 
-    def _update_event_track(
-        self, sim_time: float, positions: np.ndarray, active_pos: np.ndarray,
-    ) -> None:
-        """Event tracking: zoom into upcoming events."""
-        upcoming = [e for e in self._events if e.time >= sim_time]
-        if upcoming:
-            event = min(upcoming, key=lambda e: e.time)
-            dt = event.time - sim_time
-            transition_time = 2.0
-            if dt < transition_time and dt > 0:
-                blend = 1.0 - dt / transition_time
-                event_pos = event.position
-                framed_pos = self._select_framed_particles(
-                    active_pos, reference_pos=event_pos,
-                )
-                com = framed_pos.mean(axis=0)
-                target = (1 - blend) * com + blend * event_pos
-                center = self._apply_deadzone(target)
-                framing_radius = self._compute_framing_radius(framed_pos, center)
-                event_zoom = framing_radius * (1 - blend * 0.7)
-                fov_rad = np.radians(self._camera.fov / 2)
-                distance = event_zoom / np.sin(fov_rad)
-                self._smoothed_distance = distance
-                self._camera.center = tuple(center)
-                self._camera.distance = distance
-                return
-
-        self._update_target_comoving(positions, active_pos)
-
-    def _update_target_rest(
+    def _compute_tracking(
         self, positions: np.ndarray, active_pos: np.ndarray,
-    ) -> None:
-        """Target rest frame: camera locked exactly on target particle.
+        mask: np.ndarray, use_deadzone: bool,
+    ) -> tuple[np.ndarray, float]:
+        """Unified tracking: find target, frame particles, compute center.
 
-        Center is locked directly to the target (no smoothing, no deadzone).
-        Zoom uses _apply_camera which respects the zoom deadzone.
+        When *use_deadzone* is False (rest-frame), locks directly on the
+        tracking point.  Falls back to deadzone if no target is active.
         """
         target_pos = self._find_target(positions)
-        if target_pos is None:
-            self._update_target_comoving(positions, active_pos)
-            return
 
-        self._smoothed_center = target_pos.copy()
+        # Rest frame requires a target; fall back to deadzone
+        if not use_deadzone and target_pos is None:
+            use_deadzone = True
 
         framed_pos = self._select_framed_particles(
             active_pos, reference_pos=target_pos,
         )
-        framing_radius = self._compute_framing_radius(framed_pos, target_pos)
-        self._apply_camera(target_pos, framing_radius)
+        tracking_point = self._tracking_point(target_pos, framed_pos, mask)
 
-    def _update_target_comoving(
-        self, positions: np.ndarray, active_pos: np.ndarray,
-    ) -> None:
-        """Unified deadzone tracking mode.
-
-        If a target particle is set, the deadzone tracks that particle.
-        Otherwise, it tracks the center of mass of the framing scope
-        (Core Group, All, or Nearest Neighbors).
-
-        The camera holds still while the tracked point stays within the
-        deadzone.  Once it drifts past the edge, the camera moves exactly
-        enough to bring it back to the boundary.
-        """
-        target_pos = self._find_target(positions)
-
-        framed_pos = self._select_framed_particles(
-            active_pos, reference_pos=target_pos,
-        )
-
-        if target_pos is not None:
-            tracking_point = target_pos
+        if use_deadzone:
+            center = self._apply_pan_deadzone(tracking_point)
         else:
-            tracking_point = self._active_com
+            self._smoothed_center = tracking_point.copy()
+            center = tracking_point
 
-        center = self._apply_deadzone(tracking_point)
         framing_radius = self._compute_framing_radius(framed_pos, center)
-        self._apply_camera(center, framing_radius)
+        return center, framing_radius
+
+    def _apply_event_blend(
+        self,
+        sim_time: float,
+        base_center: np.ndarray,
+        base_radius: float,
+        active_pos: np.ndarray,
+        mask: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        """Blend the base camera state toward the nearest upcoming event.
+
+        Ramps in over ``_event_ramp_in`` seconds before the event and
+        ramps out over ``_event_ramp_out`` seconds after.  At peak blend
+        the zoom is tightened by ``_event_zoom_tighten``.
+        """
+        # Find the nearest event (before or after current time)
+        best_event = None
+        best_dt = float("inf")
+        for e in self._events:
+            dt = e.time - sim_time
+            if abs(dt) < abs(best_dt):
+                best_dt = dt
+                best_event = e
+
+        if best_event is None:
+            return base_center, base_radius
+
+        dt = best_dt
+        if dt > 0:
+            # Approaching: blend ramps from 0 to 1 over ramp_in seconds
+            if dt > self._event_ramp_in:
+                return base_center, base_radius
+            blend = 1.0 - dt / self._event_ramp_in
+        else:
+            # Receding: blend ramps from 1 to 0 over ramp_out seconds
+            if -dt > self._event_ramp_out:
+                return base_center, base_radius
+            blend = 1.0 + dt / self._event_ramp_out
+
+        event_pos = best_event.position
+        center = (1.0 - blend) * base_center + blend * event_pos
+        radius = base_radius * (1.0 - blend * self._event_zoom_tighten)
+        return center, radius
 
     def _apply_rotation(self) -> None:
         """Apply slow auto-rotation around vertical axis."""

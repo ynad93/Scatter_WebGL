@@ -68,6 +68,14 @@ class TrajectoryInterpolator:
         self._build_splines()
         self._build_batch_eval()
 
+    @staticmethod
+    def _find_interval(breakpoints: np.ndarray, time: float) -> int:
+        """Find the spline interval containing *time*."""
+        return max(0, min(
+            int(np.searchsorted(breakpoints, time, side='right') - 1),
+            len(breakpoints) - 2,
+        ))
+
     def _build_splines(self) -> None:
         """Pre-compute all splines at load time."""
         data = self._data
@@ -283,10 +291,7 @@ class TrajectoryInterpolator:
 
                 if self._shared_x is not None:
                     breakpoints = self._shared_x
-                    interval = max(0, min(
-                        int(np.searchsorted(breakpoints, time, side='right') - 1),
-                        len(breakpoints) - 2,
-                    ))
+                    interval = self._find_interval(breakpoints, time)
                     time_offset = time - breakpoints[interval]
 
                     interval_coeffs = np.empty((n_active, 4, 3))
@@ -303,10 +308,7 @@ class TrajectoryInterpolator:
                     for i, j in enumerate(active_indices):
                         breakpoints = self._batch_x_list[j]
                         coeffs = self._batch_c_list[j]
-                        interval = max(0, min(
-                            int(np.searchsorted(breakpoints, time, side='right') - 1),
-                            len(breakpoints) - 2,
-                        ))
+                        interval = self._find_interval(breakpoints, time)
                         time_offset = time - breakpoints[interval]
                         positions[dest_idx[i]] = (
                             ((coeffs[0, interval] * time_offset

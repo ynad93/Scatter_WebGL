@@ -80,6 +80,27 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Run event detection and print results",
     )
+    parser.add_argument(
+        "--mass-unit",
+        type=str,
+        default=D.UNIT_MASS,
+        choices=D.MASS_UNITS,
+        help=f"Mass unit of the input data (default: {D.UNIT_MASS})",
+    )
+    parser.add_argument(
+        "--distance-unit",
+        type=str,
+        default=D.UNIT_DISTANCE,
+        choices=D.DISTANCE_UNITS,
+        help=f"Distance unit of the input data (default: {D.UNIT_DISTANCE})",
+    )
+    parser.add_argument(
+        "--time-unit",
+        type=str,
+        default=D.UNIT_TIME,
+        choices=D.TIME_UNITS,
+        help=f"Time unit of the input data (default: {D.UNIT_TIME})",
+    )
 
     args = parser.parse_args(argv)
 
@@ -124,6 +145,7 @@ def main(argv: list[str] | None = None) -> None:
             data, interpolator,
             size=(args.width, args.height),
         )
+        engine.set_units(time_unit=args.time_unit)
         if args.trail_length is not None:
             engine.set_trail_length(args.trail_length)
 
@@ -131,9 +153,12 @@ def main(argv: list[str] | None = None) -> None:
         mode_map = {
             "manual": CameraMode.MANUAL,
             "tracking": CameraMode.TARGET_COMOVING,
-            "event-track": CameraMode.EVENT_TRACK,
         }
-        cam.mode = mode_map.get(args.camera, CameraMode.MANUAL)
+        if args.camera == "event-track":
+            cam.mode = CameraMode.TARGET_COMOVING
+            cam.event_tracking = True
+        else:
+            cam.mode = mode_map.get(args.camera, CameraMode.MANUAL)
         if args.target is not None:
             cam.target_particle = args.target
         engine.set_camera_controller(cam)

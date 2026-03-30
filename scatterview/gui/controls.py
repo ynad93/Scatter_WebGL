@@ -58,6 +58,8 @@ class ControlPanel:
         # Build control sections
         self._build_time_controls()
         self._build_appearance_controls()
+        self._build_display_controls()
+        self._build_background_controls()
         self._build_camera_controls()
         self._build_subview_controls()
         self._build_export_controls()
@@ -76,66 +78,62 @@ class ControlPanel:
 
     def _add_slider(
         self, layout, label: str, min_val: float, max_val: float,
-        value: float, callback, steps: int = 100
+        value: float, callback, steps: int = 100, tooltip: str = "",
+        log: bool = False,
     ):
         from PyQt6 import QtCore, QtWidgets
 
-        row = QtWidgets.QHBoxLayout()
-        lbl = QtWidgets.QLabel(label)
-        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        slider.setMinimum(0)
-        slider.setMaximum(steps)
-        slider.setValue(int((value - min_val) / (max_val - min_val) * steps))
-        val_label = QtWidgets.QLabel(f"{value:.3g}")
-
-        def on_change(v):
-            real_val = min_val + (v / steps) * (max_val - min_val)
-            val_label.setText(f"{real_val:.3g}")
-            callback(real_val)
-
-        slider.valueChanged.connect(on_change)
-        row.addWidget(lbl)
-        row.addWidget(slider)
-        row.addWidget(val_label)
-        layout.addLayout(row)
-        # Attach value label for programmatic updates
-        slider._val_label = val_label
-        return slider
-
-    def _add_log_slider(
-        self, layout, label: str, min_val: float, max_val: float,
-        value: float, callback, steps: int = 100
-    ):
-        """Slider that maps linearly in log-space (logarithmic feel)."""
-        from PyQt6 import QtCore, QtWidgets
-
-        log_min = np.log10(min_val)
-        log_max = np.log10(max_val)
-        log_val = np.log10(max(value, min_val))
+        if log:
+            log_min = np.log10(min_val)
+            log_max = np.log10(max_val)
+            to_real = lambda v: 10.0 ** (log_min + (v / steps) * (log_max - log_min))
+            to_slider = lambda r: int(
+                (np.log10(max(r, min_val)) - log_min) / (log_max - log_min) * steps
+            )
+        else:
+            to_real = lambda v: min_val + (v / steps) * (max_val - min_val)
+            to_slider = lambda r: int((r - min_val) / (max_val - min_val) * steps)
 
         row = QtWidgets.QHBoxLayout()
         lbl = QtWidgets.QLabel(label)
+        if tooltip:
+            lbl.setToolTip(tooltip)
         slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         slider.setMinimum(0)
         slider.setMaximum(steps)
-        slider.setValue(int((log_val - log_min) / (log_max - log_min) * steps))
-        val_label = QtWidgets.QLabel(f"{value:.3g}")
+        slider.setValue(to_slider(value))
+        if tooltip:
+            slider.setToolTip(tooltip)
 
-        def on_change(v):
-            log_v = log_min + (v / steps) * (log_max - log_min)
-            real_val = 10.0 ** log_v
-            val_label.setText(f"{real_val:.3g}")
+        val_box = QtWidgets.QLineEdit(f"{value:.3g}")
+        val_box.setFixedWidth(60)
+        val_box.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+
+        def on_slider_change(v):
+            real_val = to_real(v)
+            val_box.blockSignals(True)
+            val_box.setText(f"{real_val:.3g}")
+            val_box.blockSignals(False)
             callback(real_val)
 
-        slider.valueChanged.connect(on_change)
+        def on_text_edited():
+            try:
+                real_val = float(val_box.text())
+            except ValueError:
+                return
+            real_val = max(min_val, min(max_val, real_val))
+            slider.blockSignals(True)
+            slider.setValue(to_slider(real_val))
+            slider.blockSignals(False)
+            callback(real_val)
+
+        slider.valueChanged.connect(on_slider_change)
+        val_box.editingFinished.connect(on_text_edited)
         row.addWidget(lbl)
         row.addWidget(slider)
-        row.addWidget(val_label)
+        row.addWidget(val_box)
         layout.addLayout(row)
-        # Store log params and label for programmatic updates
-        slider._val_label = val_label
-        slider._log_min = log_min
-        slider._log_max = log_max
+        slider._val_label = val_box
         return slider
 
     def _build_time_controls(self) -> None:
@@ -151,6 +149,7 @@ class ControlPanel:
             section, "Time", self._t_min, self._t_max, self._t_min,
             self._on_time_slider_changed,
             steps=self._time_steps,
+            tooltip="Current simulation time. Drag to scrub.",
         )
         self._time_val_label = self._time_slider._val_label
         # Fixed-width label so it doesn't resize as digits change
@@ -173,9 +172,10 @@ class ControlPanel:
         section.addLayout(row)
 
         # Speed slider (logarithmic, 1/60 at center)
-        self._speed_slider = self._add_log_slider(
+        self._speed_slider = self._add_slider(
             section, "Speed", 0.001, 0.1, self._engine._anim_speed,
-            self._on_speed_change,
+            self._on_speed_change, log=True,
+            tooltip="Playback speed: fraction of total simulation\nadvanced per real second.",
         )
 
 
@@ -211,18 +211,6 @@ class ControlPanel:
         """Update playback speed."""
         self._engine.set_speed(speed)
 
-    def _set_log_slider(self, slider, value: float) -> None:
-        """Programmatically update a log-slider's position and label."""
-        log_min = slider._log_min
-        log_max = slider._log_max
-        log_val = np.log10(max(value, 10.0 ** log_min))
-        steps = slider.maximum()
-        pos = int((log_val - log_min) / (log_max - log_min) * steps)
-        pos = max(0, min(steps, pos))
-        slider.blockSignals(True)
-        slider.setValue(pos)
-        slider.blockSignals(False)
-        slider._val_label.setText(f"{value:.3g}")
 
     def _build_appearance_controls(self) -> None:
         from PyQt6 import QtWidgets
@@ -233,6 +221,7 @@ class ControlPanel:
         self._add_slider(
             section, "Point Alpha", 0.0, 1.0, self._engine._point_alpha,
             self._engine.set_point_alpha,
+            tooltip="Particle opacity. 0 = invisible, 1 = fully opaque.",
         )
 
         # Sizing mode toggle
@@ -255,9 +244,10 @@ class ControlPanel:
         section.addWidget(self._depth_cb)
 
         # Global radius scale (logarithmic, 1.0 at center)
-        self._add_log_slider(
+        self._add_slider(
             section, "Radius Scale", 0.1, 10.0, 1.0,
-            self._engine.set_radius_scale,
+            self._engine.set_radius_scale, log=True,
+            tooltip="Global multiplier for all particle sizes.\n1.0 = default.",
         )
 
         # Per-particle scale sliders (only if manageable number)
@@ -270,33 +260,110 @@ class ControlPanel:
                 self._add_slider(
                     section, f"Scale {name}", 0.1, 5.0, 1.0,
                     lambda v, p=pid_key: self._engine.set_particle_size(p, v),
+                    tooltip=f"Size multiplier for particle {name}.",
                 )
 
         # Trail length (logarithmic, fraction of total simulation time)
-        self._trail_slider = self._add_log_slider(
+        self._trail_slider = self._add_slider(
             section, "Trail (frac)", 0.001, 0.5, self._engine._trail_length_frac,
-            self._engine.set_trail_length,
+            self._engine.set_trail_length, log=True,
+            tooltip="Trail length as a fraction of total simulation time.\n"
+                    "0.01 = 1% of the simulation shown as a trail.",
         )
 
         # Trail width
         self._add_slider(
             section, "Trail Width", 0.5, 15.0, self._engine._trail_width,
             self._engine.set_trail_width,
+            tooltip="Trail line width in pixels.",
         )
 
         # Trail alpha
         self._add_slider(
             section, "Trail Alpha", 0.0, 1.0, self._engine._trail_alpha,
             self._engine.set_trail_alpha,
+            tooltip="Peak trail opacity at the head (newest point).\nTrails fade toward the tail.",
         )
 
+
+    def _build_display_controls(self) -> None:
+        from PyQt6 import QtWidgets
+
+        from .. import defaults as _D
+
+        section = self._add_section("Display")
+
+        # Time overlay toggle
+        self._time_cb = QtWidgets.QCheckBox("Show Time")
+        self._time_cb.setChecked(self._engine._time_display_enabled)
+        self._time_cb.toggled.connect(self._engine.set_time_display)
+        section.addWidget(self._time_cb)
+
+        # Font size
+        self._add_slider(
+            section, "Font Size", 8, 36, self._engine._time_font_size,
+            self._engine.set_time_font_size,
+            steps=28,
+            tooltip="Font size of the on-screen time display in points.",
+        )
+
+        # Color preset
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Color"))
+        self._time_color_combo = QtWidgets.QComboBox()
+        color_presets = {
+            "White": (1.0, 1.0, 1.0, 0.9),
+            "Yellow": (1.0, 0.9, 0.3, 0.9),
+            "Cyan": (0.3, 1.0, 1.0, 0.9),
+            "Green": (0.3, 1.0, 0.3, 0.9),
+            "Red": (1.0, 0.4, 0.4, 0.9),
+        }
+        self._time_color_presets = color_presets
+        for name in color_presets:
+            self._time_color_combo.addItem(name)
+        self._time_color_combo.currentTextChanged.connect(
+            lambda text: self._engine.set_time_color(self._time_color_presets[text])
+        )
+        row.addWidget(self._time_color_combo)
+        section.addLayout(row)
+
+        # Position anchor
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Position"))
+        self._time_pos_combo = QtWidgets.QComboBox()
+        for pos in ["top-left", "top-right", "bottom-left", "bottom-right"]:
+            self._time_pos_combo.addItem(pos)
+        self._time_pos_combo.currentTextChanged.connect(self._engine.set_time_anchor)
+        row.addWidget(self._time_pos_combo)
+        section.addLayout(row)
+
+        # Units
+        section.addWidget(QtWidgets.QLabel("Units"))
+        self._time_unit_combo = self._add_unit_combo(
+            section, "Time", _D.TIME_UNITS, self._engine._time_unit,
+            lambda u: self._engine.set_units(time_unit=u),
+        )
+
+    def _build_background_controls(self) -> None:
+        from PyQt6 import QtWidgets
+
+        section = self._add_section("Background")
+
+        # Star field toggle
+        self._stars_cb = QtWidgets.QCheckBox("Show Stars")
+        self._stars_cb.toggled.connect(self._on_stars_toggle)
+        section.addWidget(self._stars_cb)
+
+    def _on_stars_toggle(self, enabled: bool) -> None:
+        self._engine.enable_stars(enabled)
 
     def _build_camera_controls(self) -> None:
         from PyQt6 import QtWidgets
 
-        from ..core.camera import CameraMode, FramingScope
+        from ..core.camera import CameraMode
 
         section = self._add_section("Camera")
+        n_particles = len(self._engine._data.particle_ids)
 
         # Mode selector
         row = QtWidgets.QHBoxLayout()
@@ -308,14 +375,15 @@ class ControlPanel:
         row.addWidget(self._mode_combo)
         section.addLayout(row)
 
-        # Framing scope selector
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Framing"))
-        self._framing_combo = self._make_framing_combo()
-        self._framing_names = self._framing_scope_names
-        self._framing_combo.currentTextChanged.connect(self._on_framing_change)
-        row.addWidget(self._framing_combo)
-        section.addLayout(row)
+        # Framing count: how many closest particles drive the camera
+        self._add_slider(
+            section, "Framed", 1, n_particles, self._camera.n_framed,
+            lambda v: setattr(self._camera, "n_framed", int(v)),
+            steps=max(1, n_particles - 1),
+            tooltip="Number of closest particles to the reference point\n"
+                    "that drive camera zoom. At maximum, all particles\n"
+                    "are framed.",
+        )
 
         # Keep all in frame toggle
         self._keep_all_cb = QtWidgets.QCheckBox("Keep All in Frame")
@@ -337,29 +405,40 @@ class ControlPanel:
         self._camera._free_zoom_callbacks.append(self._on_free_zoom_changed)
         section.addWidget(self._free_zoom_cb)
 
-        # Core group percentile (only visible for CORE_GROUP scope)
-        self._core_group_container = QtWidgets.QWidget()
-        core_layout = QtWidgets.QVBoxLayout(self._core_group_container)
-        core_layout.setContentsMargins(0, 0, 0, 0)
-        self._add_slider(
-            core_layout, "Core %", 1, 100,
-            self._camera._core_group_percentile,
-            lambda v: setattr(self._camera, "_core_group_percentile", v),
-            steps=99,
-        )
-        section.addWidget(self._core_group_container)
+        # Center mode: what point the camera centers on
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Center"))
+        self._center_combo = QtWidgets.QComboBox()
+        self._center_mode_names = {
+            "Target": (False, False),
+            "Group Centroid": (True, False),
+            "Group CoM": (True, True),
+        }
+        tips = {
+            "Target": "Pin the camera on the target particle.",
+            "Group Centroid": "Center on the unweighted centroid\nof the framed group.",
+            "Group CoM": "Center on the mass-weighted center of mass\nof the framed group.",
+        }
+        for i, name in enumerate(self._center_mode_names):
+            self._center_combo.addItem(name)
+            self._center_combo.setItemData(
+                i, tips[name], self._QtCore.Qt.ItemDataRole.ToolTipRole,
+            )
+        self._center_combo.currentTextChanged.connect(self._on_center_mode_change)
+        self._center_combo.setToolTip("What point the camera centers on.")
+        row.addWidget(self._center_combo)
+        section.addLayout(row)
 
-        # Neighbor count (only visible for NEAREST_NEIGHBORS scope)
-        self._neighbor_container = QtWidgets.QWidget()
-        neighbor_layout = QtWidgets.QVBoxLayout(self._neighbor_container)
-        neighbor_layout.setContentsMargins(0, 0, 0, 0)
-        self._neighbor_slider = self._add_slider(
-            neighbor_layout, "Neighbors", 1, 100, self._camera.n_neighbors,
-            lambda v: setattr(self._camera, "n_neighbors", int(v)),
-            steps=99,
+        # Event tracking overlay
+        self._event_cb = QtWidgets.QCheckBox("Event Tracking")
+        self._event_cb.setToolTip(
+            "Smoothly blend toward detected events (close encounters,\n"
+            "mergers) as they approach. Works on top of any camera mode."
         )
-        self._neighbor_container.setVisible(False)
-        section.addWidget(self._neighbor_container)
+        self._event_cb.toggled.connect(
+            lambda v: setattr(self._camera, "event_tracking", v)
+        )
+        section.addWidget(self._event_cb)
 
         # Auto-rotate toggle
         self._rotate_cb = QtWidgets.QCheckBox("Auto-Rotate")
@@ -372,22 +451,54 @@ class ControlPanel:
         self._add_slider(
             section, "Rot. Speed", 0.0, 5.0, self._camera.rotation_speed,
             lambda v: setattr(self._camera, "rotation_speed", v),
+            tooltip="Auto-rotation speed in degrees of azimuth per frame.",
         )
 
-        # Manual control speeds (WASD pan and scroll zoom) — log-spaced
-        self._add_log_slider(
-            section, "Pan Speed", 0.005, 0.1, self._engine._pan_speed,
-            lambda v: setattr(self._engine, "_pan_speed", v),
+        # Manual control speeds (WASD pan and scroll zoom) — only when free zoom
+        self._manual_speed_container = QtWidgets.QWidget()
+        speed_layout = QtWidgets.QVBoxLayout(self._manual_speed_container)
+        speed_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_slider(
+            speed_layout, "Pan Speed", 0.005, 0.1, self._engine._pan_speed,
+            lambda v: setattr(self._engine, "_pan_speed", v), log=True,
+            tooltip="WASD/arrow key pan speed as a fraction of camera\n"
+                    "distance per frame. Scales with zoom level.",
         )
-        self._add_log_slider(
-            section, "Zoom Speed", 0.2, 5.0, self._engine._zoom_speed,
-            lambda v: setattr(self._engine, "_zoom_speed", v),
+        self._add_slider(
+            speed_layout, "Zoom Speed", 0.2, 5.0, self._engine._zoom_speed,
+            lambda v: setattr(self._engine, "_zoom_speed", v), log=True,
+            tooltip="Scroll wheel zoom multiplier.\nHigher = faster zoom per scroll tick.",
+        )
+        self._manual_speed_container.setVisible(self._camera.free_zoom)
+        section.addWidget(self._manual_speed_container)
+
+        # Framing fraction: how much of the screen the framed group occupies
+        self._add_slider(
+            section, "Framing %", 0.3, 1.0, self._camera._framing_fraction,
+            self._on_framing_fraction_change,
+            tooltip="Fraction of the screen's vertical half-extent that\n"
+                    "the framed group is allowed to occupy. 0.75 = the\n"
+                    "farthest particle appears 75% from center to edge.",
         )
 
-        # Deadzone: fraction of visible radius where camera holds still
-        self._deadzone_slider = self._add_slider(
-            section, "Deadzone", 0.1, 0.8, self._camera._deadzone_fraction,
-            lambda v: setattr(self._camera, "_deadzone_fraction", v),
+        # Zoom smoothing: how quickly the camera distance tracks the ideal
+        self._add_slider(
+            section, "Zoom Smooth", 0.05, 1.0, self._camera._zoom_smoothing,
+            lambda v: setattr(self._camera, "_zoom_smoothing", v),
+            tooltip="Exponential damping for camera zoom.\n"
+                    "1.0 = instant tracking, 0.1 = very smooth.\n"
+                    "Each frame, the distance closes this fraction\n"
+                    "of the gap to the ideal.",
+        )
+
+        # Pan deadzone: fraction of visible radius where the center holds still
+        self._add_slider(
+            section, "Pan Deadzone", 0.1, 0.8, self._camera._pan_deadzone_fraction,
+            lambda v: setattr(self._camera, "_pan_deadzone_fraction", v),
+            tooltip="Panning deadzone as a fraction of the visible radius.\n"
+                    "The camera center holds still while the tracked point\n"
+                    "is within this fraction of the screen from center.\n"
+                    "Only affects panning, not zoom.",
         )
 
         # Target particle selector (searchable)
@@ -400,12 +511,36 @@ class ControlPanel:
         row.addWidget(self._target_combo)
         section.addLayout(row)
 
+    def _add_unit_combo(self, layout, label, choices, current, callback):
+        from PyQt6 import QtWidgets
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel(label))
+        combo = QtWidgets.QComboBox()
+        for u in choices:
+            combo.addItem(u)
+        combo.setCurrentText(current)
+        combo.currentTextChanged.connect(callback)
+        row.addWidget(combo)
+        layout.addLayout(row)
+        return combo
+
+    def _on_framing_fraction_change(self, value: float) -> None:
+        self._camera._framing_fraction = value
+        self._camera._cache_fov_trig()
+
+    def _on_center_mode_change(self, text: str) -> None:
+        use_group, mass_weighted = self._center_mode_names[text]
+        self._camera.use_group_center = use_group
+        self._camera.mass_weighted_center = mass_weighted
+
     def _on_free_zoom_changed(self, value: bool) -> None:
-        """Sync checkbox and hide speed sliders when free zoom changes."""
+        """Sync checkbox and show/hide manual speed sliders when free zoom changes."""
         if self._free_zoom_cb.isChecked() != value:
             self._free_zoom_cb.blockSignals(True)
             self._free_zoom_cb.setChecked(value)
             self._free_zoom_cb.blockSignals(False)
+        self._manual_speed_container.setVisible(value)
 
     def _make_particle_combo(self) -> "QtWidgets.QComboBox":
         """Create a searchable combo box with all particle IDs."""
@@ -438,7 +573,6 @@ class ControlPanel:
         self._camera_mode_names = {
             "Manual": CameraMode.MANUAL,
             "Tracking": CameraMode.TARGET_COMOVING,
-            "Event Track": CameraMode.EVENT_TRACK,
             "Target (Rest)": CameraMode.TARGET_REST_FRAME,
         }
         tips = {
@@ -455,10 +589,6 @@ class ControlPanel:
                 "framing group (Core Group / All / Nearest Neighbors).\n"
                 "Enable Auto-Rotate checkbox for slow orbit."
             ),
-            "Event Track": (
-                "Smoothly zoom into detected events (close encounters,\n"
-                "mergers) as they approach in simulation time."
-            ),
             "Target (Rest)": (
                 "Lock the camera center exactly on the Target particle.\n"
                 "Everything else moves relative to the target."
@@ -471,57 +601,11 @@ class ControlPanel:
         combo.setToolTip("Camera behavior mode. Hover items for details.")
         return combo
 
-    def _make_framing_combo(self) -> "QtWidgets.QComboBox":
-        """Create a framing scope combo box with per-item tooltips."""
-        from PyQt6 import QtWidgets
-
-        from ..core.camera import FramingScope
-
-        self._framing_scope_names = {
-            "Core Group": FramingScope.CORE_GROUP,
-            "Nearest Neighbors": FramingScope.NEAREST_NEIGHBORS,
-            "All Particles": FramingScope.ALL,
-        }
-        tips = {
-            "Core Group": (
-                "Ignore outlier particles (beyond 2x the median distance\n"
-                "from the centroid). The camera frames the dense core\n"
-                "without chasing ejected bodies."
-            ),
-            "Nearest Neighbors": (
-                "Frame only the Target particle and its K nearest\n"
-                "neighbors (set K with the Neighbors slider).\n"
-                "Requires a Target to be selected; otherwise falls\n"
-                "back to Core Group."
-            ),
-            "All Particles": (
-                "Frame every active particle. The camera always\n"
-                "zooms out far enough to keep everything visible,\n"
-                "including ejected particles."
-            ),
-        }
-        combo = QtWidgets.QComboBox()
-        for i, name in enumerate(self._framing_scope_names):
-            combo.addItem(name)
-            combo.setItemData(i, tips.get(name, ""), self._QtCore.Qt.ItemDataRole.ToolTipRole)
-        combo.setToolTip("Which particles drive camera center and zoom. Hover items for details.")
-        return combo
-
     def _on_camera_mode_change(self, text: str) -> None:
         from ..core.camera import CameraMode
 
         mode = self._mode_names.get(text, CameraMode.MANUAL)
         self._camera.mode = mode
-
-
-    def _on_framing_change(self, text: str) -> None:
-        from ..core.camera import FramingScope
-
-        scope = self._framing_names.get(text)
-        if scope is not None:
-            self._camera.framing_scope = scope
-            self._core_group_container.setVisible(scope == FramingScope.CORE_GROUP)
-            self._neighbor_container.setVisible(scope == FramingScope.NEAREST_NEIGHBORS)
 
     def _resolve_pid(self, text: str) -> int | None:
         """Resolve a label string from a combo box to an integer particle ID."""
@@ -553,9 +637,10 @@ class ControlPanel:
     def _build_subview_controls(self) -> None:
         from PyQt6 import QtWidgets
 
-        from ..core.camera import CameraMode, FramingScope
+        from ..core.camera import CameraMode
 
         section = self._add_section("Sub-View (PiP)")
+        n_particles = len(self._engine._data.particle_ids)
 
         self._subview_cb = QtWidgets.QCheckBox("Enable Sub-View")
         self._subview_cb.toggled.connect(self._on_subview_toggle)
@@ -579,14 +664,13 @@ class ControlPanel:
         row.addWidget(self._subview_mode_combo)
         section.addLayout(row)
 
-        # Sub-view framing scope
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Framing"))
-        self._subview_framing_combo = self._make_framing_combo()
-        self._subview_framing_names = self._framing_scope_names
-        self._subview_framing_combo.currentTextChanged.connect(self._on_subview_framing_change)
-        row.addWidget(self._subview_framing_combo)
-        section.addLayout(row)
+        # Sub-view framed count
+        self._add_slider(
+            section, "Framed", 1, n_particles, n_particles,
+            lambda v: self._set_subview_n_framed(int(v)),
+            steps=max(1, n_particles - 1),
+            tooltip="Number of closest particles framed in the sub-view.",
+        )
 
         # Sub-view target (searchable)
         row = QtWidgets.QHBoxLayout()
@@ -598,18 +682,11 @@ class ControlPanel:
         row.addWidget(self._subview_target_combo)
         section.addLayout(row)
 
-        # Sub-view neighbor count
-        from .. import defaults as _D
+        # Sub-view pan deadzone
         self._add_slider(
-            section, "Neighbors", 1, 10, _D.CAMERA_N_NEIGHBORS,
-            lambda v: self._set_subview_neighbors(int(v)),
-            steps=9,
-        )
-
-        # Sub-view deadzone
-        self._add_slider(
-            section, "Deadzone", 0.1, 0.8, 0.4,
-            self._set_subview_deadzone,
+            section, "Pan Deadzone", 0.1, 0.8, 0.4,
+            self._set_subview_pan_deadzone,
+            tooltip="Panning deadzone fraction for the sub-view camera.",
         )
 
         # Sub-view auto-rotate
@@ -621,9 +698,7 @@ class ControlPanel:
         if enabled:
             corner = self._corner_combo.currentText()
             self._engine.enable_subview(corner=corner)
-            # Apply current sub-view settings to the new controller
             self._on_subview_mode_change(self._subview_mode_combo.currentText())
-            self._on_subview_framing_change(self._subview_framing_combo.currentText())
             self._on_subview_target_change(self._subview_target_combo.currentText())
             self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
         else:
@@ -637,28 +712,20 @@ class ControlPanel:
         if mode is not None:
             ctrl.mode = mode
 
-    def _on_subview_framing_change(self, text: str) -> None:
-        ctrl = self._engine._subview_camera_controller
-        if ctrl is None:
-            return
-        scope = self._subview_framing_names.get(text)
-        if scope is not None:
-            ctrl.framing_scope = scope
-
     def _on_subview_target_change(self, text: str) -> None:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.target_particle = self._resolve_pid(text)
 
-    def _set_subview_deadzone(self, value: float) -> None:
+    def _set_subview_pan_deadzone(self, value: float) -> None:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
-            ctrl._deadzone_fraction = value
+            ctrl._pan_deadzone_fraction = value
 
-    def _set_subview_neighbors(self, n: int) -> None:
+    def _set_subview_n_framed(self, n: int) -> None:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
-            ctrl.n_neighbors = n
+            ctrl.n_framed = n
 
     def _on_subview_rotate_toggle(self, enabled: bool) -> None:
         ctrl = self._engine._subview_camera_controller
