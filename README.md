@@ -300,8 +300,18 @@ World-space directional lighting: the light direction is fixed in world coordina
 - **Shift + left drag**: pan
 
 ### Keyboard
+
+All keys are continuous while held. **Ctrl** multiplies speed by 5x for any action below.
+
 - **Space**: play/pause
-- **WASD / Arrow keys**: pan camera (continuous while held, Ctrl = 5x speed)
+- **WASD**: pan forward/backward/left/right (relative to camera facing)
+- **Arrow Up/Down**: pan up/down
+- **Arrow Left/Right**: pan left/right
+- **Shift + Arrow Up/Down**: pan forward/backward (instead of vertical)
+- **Shift + Arrow Left/Right**: scrub time backward/forward
+- **Alt + WASD / Arrow keys**: orbit camera — Left/Right rotate azimuth, Up/Down rotate elevation
+
+Pressing any pan key automatically switches to Manual camera mode.
 
 ### GUI Sliders
 - **Time**: scrub through simulation

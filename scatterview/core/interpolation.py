@@ -7,7 +7,8 @@ more physically accurate trajectory rendering.
 
 from __future__ import annotations
 
-import multiprocessing
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,37 +18,6 @@ from .. import defaults as D
 from .data_loader import SimulationData
 
 
-# ---- Module-level worker for multiprocessing (fork inherits parent memory) ----
-
-_worker_interp = None  # TrajectoryInterpolator, set by pool initializer or before fork
-
-
-def _init_trail_worker(interp) -> None:
-    """Multiprocessing pool initializer: store the interpolator in the worker.
-
-    Args:
-        interp: TrajectoryInterpolator instance to share with the worker.
-    """
-    global _worker_interp
-    _worker_interp = interp
-
-
-def _eval_trail_worker(args: tuple) -> tuple[int, np.ndarray, np.ndarray] | None:
-    """Evaluate one particle's trail at simulation timesteps + 1-pass refinement.
-
-    Args:
-        args: Tuple of (pid, t_end, trail_length) — particle ID, end time,
-            and trail duration in simulation time units.
-
-    Returns:
-        (pid, positions, times) tuple, or None if the particle has no data.
-    """
-    pid, t_end, trail_length = args
-    result = _worker_interp.evaluate_trail(pid, t_end, trail_length)
-    if result is None:
-        return None
-    pos, times = result
-    return (pid, pos, times)
 
 
 @dataclass
@@ -418,35 +388,37 @@ class TrajectoryInterpolator:
         packed arrays so that render-time trail extraction is purely
         searchsorted + slice — zero spline evaluation per frame.
 
-        Uses multiprocessing to evaluate particles in parallel (fork-based
-        — workers inherit the interpolator via copy-on-write, no pickling).
+        Uses threads for parallelism.  The heavy work (scipy spline
+        evaluation and vectorized numpy refinement) releases the GIL,
+        so threads achieve real parallelism without the copy-on-write
+        overhead of fork-based multiprocessing.
 
         Args:
-            n_workers: Number of worker processes. Defaults to CPU count.
+            n_workers: Number of threads. By default, sized so each thread
+                handles at least 20 particles, clamped to [1, cpu_count].
 
         Returns:
             PrecomputedTrails with packed arrays and an offset table.
         """
         pids = [int(pid) for pid in self._data.particle_ids]
-        t_start = self._data.times[0]
-        t_end = self._data.times[-1]
-        trail_length = t_end - t_start
+        t_end = float(self._data.times[-1])
+        trail_length = t_end - float(self._data.times[0])
 
         if n_workers is None:
-            n_workers = multiprocessing.cpu_count()
+            n_workers = os.cpu_count()
 
-        global _worker_interp
-        _worker_interp = self  # set before fork so workers inherit it
-        args = [(pid, float(t_end), trail_length) for pid in pids]
+        def _eval_one(pid):
+            result = self.evaluate_trail(pid, t_end, trail_length)
+            if result is None:
+                return None
+            pos, times = result
+            return (pid, pos, times)
 
         if n_workers > 1 and len(pids) > 1:
-            chunksize = max(1, len(pids) // n_workers)
-            with multiprocessing.Pool(
-                n_workers, initializer=_init_trail_worker, initargs=(self,),
-            ) as pool:
-                raw_results = pool.map(_eval_trail_worker, args, chunksize=chunksize)
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                raw_results = list(pool.map(_eval_one, pids))
         else:
-            raw_results = [_eval_trail_worker(a) for a in args]
+            raw_results = [_eval_one(pid) for pid in pids]
 
         # Pack results into contiguous arrays with offset table
         pid_to_idx: dict[int, int] = {}
@@ -657,20 +629,28 @@ class TrajectoryInterpolator:
         if points_to_insert.sum() == 0:
             return positions, times
 
-        new_times = []
-        for i in range(n_segments):
-            n_new = points_to_insert[i]
-            if n_new > 0:
-                t_a, t_b = times[i], times[i + 1]
-                # Interior points only (exclude endpoints which already exist)
-                fractions = np.linspace(0, 1, n_new + 2)[1:-1]
-                new_times.append(t_a + fractions * (t_b - t_a))
+        # Vectorized insertion time generation: expand per-segment counts
+        # into flat arrays via np.repeat, then compute all fractions and
+        # times in one pass — no Python loop.
+        active_mask = points_to_insert > 0
+        active_n = points_to_insert[active_mask]
+        active_idx = np.nonzero(active_mask)[0]
+        total_insertions = int(active_n.sum())
 
-        if not new_times:
-            return positions, times
+        # Which original segment each insertion belongs to
+        orig_seg = np.repeat(active_idx, active_n)
 
-        # Evaluate the spline at the new insertion times
-        insertion_times = np.concatenate(new_times)
+        # Local position within each segment: k = 1, 2, ..., n_new
+        group_starts = np.empty(len(active_n) + 1, dtype=np.intp)
+        group_starts[0] = 0
+        np.cumsum(active_n, out=group_starts[1:])
+        local_k = np.arange(total_insertions) - np.repeat(group_starts[:-1], active_n) + 1
+
+        # Fraction within each segment: k / (n_new + 1)
+        fractions = local_k / (np.repeat(active_n, active_n) + 1)
+
+        # Compute insertion times via linear interpolation
+        insertion_times = times[orig_seg] + fractions * (times[orig_seg + 1] - times[orig_seg])
         insertion_positions = self._eval_times(segments, insertion_times)
         if insertion_positions is None:
             return positions, times

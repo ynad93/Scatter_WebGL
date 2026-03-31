@@ -474,7 +474,11 @@ class RenderEngine:
         step = camera.distance * speed
 
         right, forward = self._camera_axes()
-        up = np.array([0.0, 0.0, 1.0])
+        up = np.array([
+            -self._sin_el * self._sin_az,
+            self._sin_el * self._cos_az,
+            self._cos_el,
+        ])
 
         center = np.array(camera.center, dtype=np.float64)
         time_step = 0.0
