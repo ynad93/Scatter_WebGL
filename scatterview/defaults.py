@@ -14,7 +14,6 @@ ANIM_SPEED = 0.01              # fraction of total sim duration advanced per sec
 POINT_ALPHA = 1.0              # particle opacity (0 = invisible, 1 = opaque)
 TRAIL_ALPHA = 0.6              # peak trail opacity (at the head / newest point)
 TRAIL_LENGTH_FRAC = 0.005      # trail window as fraction of total simulation time
-TRAIL_WIDTH = 3.0              # trail line width in pixels
 
 # --- Particle sizing ---
 RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode (screen pixels)
@@ -27,7 +26,11 @@ CAMERA_FOV = 45                # field of view in degrees
 ROTATION_SPEED = 0.5           # auto-rotate: degrees of azimuth per frame
 FRAMING_FRACTION = 0.90        # framed particles stay within this fraction
                                # of the screen's vertical half-extent
-ZOOM_SMOOTHING = 0.05          # exponential damping for zoom (0=frozen, 1=instant)
+ZOOM_MEMORY_FRAMES = 60        # rolling-average window for framing radius (frames)
+                               # camera distance tracks the mean radius over this
+                               # many frames, filtering orbital oscillations while
+                               # responding smoothly to scale changes.
+                               # At 60 Hz, 120 frames = 2-second memory.
 PAN_DEADZONE_FRACTION = 0.5    # panning deadzone: fraction of visible radius
 
 # --- Black hole rendering (BSE stellar evolution codes) ---
@@ -137,7 +140,7 @@ def c_in_units(dist_unit: str = UNIT_DISTANCE,
 TIME_FONT_SIZE = 14            # points
 TIME_COLOR = (1.0, 1.0, 1.0, 0.9)
 TIME_ANCHOR = "top-left"       # top-left | top-right | bottom-left | bottom-right
-TIME_OFFSET = (15, 15)         # pixel offset from the anchor corner
+TIME_OFFSET = (15, 25)         # pixel offset from the anchor corner
 
 _SUPERSCRIPT = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
 
@@ -169,7 +172,7 @@ def format_sim_time(t: float, unit: str | None = None, decimals: int = 2) -> str
 
 
 # --- Star field ---
-STAR_COUNT = 8000              # background stars on the spherical shell
+STAR_COUNT = 5000              # background stars on the spherical shell
 STAR_SHELL_FACTOR = 2.0        # shell radius = factor × max particle distance
 STAR_SEED = 42                 # RNG seed for reproducibility
-STAR_BASE_SIZE = 1.5           # base marker size in pixels
+STAR_BASE_SIZE = 1.0           # base marker size in pixels

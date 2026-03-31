@@ -40,11 +40,14 @@ class ControlPanel:
         self._window = QtWidgets.QMainWindow()
         self._window.setWindowTitle("ScatterView 2.0")
         self._window.resize(1400, 800)
+        self._apply_dark_theme()
 
         # Central widget with horizontal layout
         central = QtWidgets.QWidget()
         self._window.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         # 3D viewport on the left (stretch factor 3)
         canvas_widget = engine.canvas.native
@@ -72,6 +75,153 @@ class ControlPanel:
 
         # Stretch at bottom
         self._panel_layout.addStretch()
+
+    def _apply_dark_theme(self) -> None:
+        """Apply a dark theme stylesheet inspired by Windows 11 / Fluent."""
+        self._window.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                font-family: "Segoe UI", "Noto Sans", sans-serif;
+                font-size: 11pt;
+            }
+            QGroupBox {
+                background-color: #2d2d2d;
+                border: 1px solid #3d3d3d;
+                border-radius: 6px;
+                margin-top: 8px;
+                padding: 12px 8px 8px 8px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 4px;
+                color: #9cdcfe;
+            }
+            QPushButton {
+                background-color: #3a3a3a;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                padding: 5px 16px;
+                color: #e0e0e0;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #454545;
+                border-color: #6a6a6a;
+            }
+            QPushButton:pressed {
+                background-color: #505050;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #3d3d3d;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #9cdcfe;
+                width: 14px;
+                height: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #b4e8ff;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4a7a9b;
+                border-radius: 2px;
+            }
+            QComboBox {
+                background-color: #3a3a3a;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                padding: 3px 8px;
+                color: #e0e0e0;
+                min-height: 20px;
+            }
+            QComboBox:hover {
+                border-color: #6a6a6a;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #9cdcfe;
+                margin-right: 6px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2d2d2d;
+                border: 1px solid #4a4a4a;
+                selection-background-color: #3a5a7a;
+                color: #e0e0e0;
+            }
+            QLineEdit {
+                background-color: #2a2a2a;
+                border: 1px solid #3d3d3d;
+                border-radius: 3px;
+                padding: 2px 4px;
+                color: #e0e0e0;
+                selection-background-color: #3a5a7a;
+            }
+            QLineEdit:focus {
+                border-color: #9cdcfe;
+            }
+            QCheckBox {
+                spacing: 6px;
+                color: #e0e0e0;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid #555555;
+                border-radius: 3px;
+                background-color: #2a2a2a;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #4a90d9;
+                border-color: #4a90d9;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #7ab0e0;
+            }
+            QScrollArea {
+                border: none;
+                background-color: #1e1e1e;
+            }
+            QScrollBar:vertical {
+                background: #1e1e1e;
+                width: 14px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: #4a4a4a;
+                border-radius: 7px;
+                min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #6a6a6a;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QLabel {
+                color: #c0c0c0;
+            }
+            QToolTip {
+                background-color: #2d2d2d;
+                border: 1px solid #4a4a4a;
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: #e0e0e0;
+                font-size: 10pt;
+            }
+        """)
 
     def _add_section(self, title: str) -> "QtWidgets.QVBoxLayout":
         """Add a labelled group box to the control panel.
@@ -309,13 +459,6 @@ class ControlPanel:
                     "0.01 = 1% of the simulation shown as a trail.",
         )
 
-        # Trail width
-        self._add_slider(
-            section, "Trail Width", 0.5, 15.0, self._engine._trail_width,
-            self._engine.set_trail_width,
-            tooltip="Trail line width in pixels.",
-        )
-
         # Trail alpha
         self._add_slider(
             section, "Trail Alpha", 0.0, 1.0, self._engine._trail_alpha,
@@ -395,6 +538,14 @@ class ControlPanel:
         self._stars_cb.toggled.connect(self._on_stars_toggle)
         section.addWidget(self._stars_cb)
 
+        # Star count
+        self._add_slider(
+            section, "Star Count", 500, 20000, _D.STAR_COUNT,
+            lambda v: self._engine.set_star_count(int(v)),
+            log=True,
+            tooltip="Number of background stars on the spherical shell.",
+        )
+
         # Star shell distance
         self._add_slider(
             section, "Star Distance", 0.1, 100.0, _D.STAR_SHELL_FACTOR,
@@ -429,21 +580,30 @@ class ControlPanel:
         row.addWidget(self._mode_combo)
         section.addLayout(row)
 
+        # Target particle selector (searchable) — directly below Mode
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Target"))
+        self._target_combo = self._make_particle_combo()
+        self._target_combo.activated.connect(
+            lambda _: self._on_target_change(self._target_combo.currentText())
+        )
+        row.addWidget(self._target_combo)
+        section.addLayout(row)
+
         # Framing count: how many closest particles drive the camera
-        self._add_slider(
+        self._framed_slider = self._add_slider(
             section, "Framed", 1, n_particles, self._camera.n_framed,
-            lambda v: setattr(self._camera, "n_framed", int(v)),
+            self._on_framed_change,
             steps=max(1, n_particles - 1),
             tooltip="Number of closest particles to the reference point\n"
                     "that drive camera zoom. At maximum, all particles\n"
                     "are framed.",
         )
 
-        # Keep all in frame toggle
+        # Keep all in frame toggle — synced with Framed slider
         self._keep_all_cb = QtWidgets.QCheckBox("Keep All in Frame")
-        self._keep_all_cb.toggled.connect(
-            lambda v: setattr(self._camera, "keep_all_in_frame", v)
-        )
+        self._keep_all_cb.setChecked(self._camera.n_framed >= n_particles)
+        self._keep_all_cb.toggled.connect(self._on_keep_all_toggle)
         section.addWidget(self._keep_all_cb)
 
         # Free zoom toggle
@@ -483,17 +643,6 @@ class ControlPanel:
         self._center_combo.setToolTip("What point the camera centers on.")
         row.addWidget(self._center_combo)
         section.addLayout(row)
-
-        # Event tracking overlay
-        self._event_cb = QtWidgets.QCheckBox("Event Tracking")
-        self._event_cb.setToolTip(
-            "Smoothly blend toward detected events (close encounters,\n"
-            "mergers) as they approach. Works on top of any camera mode."
-        )
-        self._event_cb.toggled.connect(
-            lambda v: setattr(self._camera, "event_tracking", v)
-        )
-        section.addWidget(self._event_cb)
 
         # Auto-rotate toggle
         self._rotate_cb = QtWidgets.QCheckBox("Auto-Rotate")
@@ -536,14 +685,14 @@ class ControlPanel:
                     "farthest particle appears 75% from center to edge.",
         )
 
-        # Zoom smoothing: how quickly the camera distance tracks the ideal
+        # Zoom memory: how many frames the camera remembers peak framing radius
         self._add_slider(
-            section, "Zoom Smooth", 0.05, 1.0, self._camera._zoom_smoothing,
-            lambda v: setattr(self._camera, "_zoom_smoothing", v),
-            tooltip="Exponential damping for camera zoom.\n"
-                    "1.0 = instant tracking, 0.1 = very smooth.\n"
-                    "Each frame, the distance closes this fraction\n"
-                    "of the gap to the ideal.",
+            section, "Zoom Memory", 10, 600, self._camera._zoom_memory_frames,
+            self._on_zoom_memory_change,
+            tooltip="Rolling-average window (frames) for camera zoom.\n"
+                    "The camera distance tracks the mean framing radius\n"
+                    "over this many frames.  At 60 Hz,\n"
+                    "60 frames = 1 second of memory.",
         )
 
         # Pan deadzone: fraction of visible radius where the center holds still
@@ -555,16 +704,6 @@ class ControlPanel:
                     "is within this fraction of the screen from center.\n"
                     "Only affects panning, not zoom.",
         )
-
-        # Target particle selector (searchable)
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Target"))
-        self._target_combo = self._make_particle_combo()
-        self._target_combo.activated.connect(
-            lambda _: self._on_target_change(self._target_combo.currentText())
-        )
-        row.addWidget(self._target_combo)
-        section.addLayout(row)
 
     def _add_unit_combo(self, layout, label, choices, current, callback):
         """Add a labelled combo box for unit selection.
@@ -592,6 +731,34 @@ class ControlPanel:
         layout.addLayout(row)
         return combo
 
+    def _on_framed_change(self, value: float) -> None:
+        """Update the camera's n_framed and sync the Keep All checkbox.
+
+        Args:
+            value: New framed count (float from slider, truncated to int).
+        """
+        n = int(value)
+        self._camera.n_framed = n
+        n_particles = len(self._engine._data.particle_ids)
+        self._keep_all_cb.blockSignals(True)
+        self._keep_all_cb.setChecked(n >= n_particles)
+        self._keep_all_cb.blockSignals(False)
+
+    def _on_keep_all_toggle(self, checked: bool) -> None:
+        """Sync Keep All in Frame with the Framed slider.
+
+        Args:
+            checked: Whether to keep all particles in frame.
+        """
+        self._camera.keep_all_in_frame = checked
+        if checked:
+            n_particles = len(self._engine._data.particle_ids)
+            self._camera.n_framed = n_particles
+            self._framed_slider.blockSignals(True)
+            self._framed_slider.setValue(self._framed_slider.maximum())
+            self._framed_slider._val_label.setText(str(n_particles))
+            self._framed_slider.blockSignals(False)
+
     def _on_framing_fraction_change(self, value: float) -> None:
         """Update the camera framing fraction and recompute FOV trig.
 
@@ -600,6 +767,21 @@ class ControlPanel:
         """
         self._camera._framing_fraction = value
         self._camera._cache_fov_trig()
+
+    def _on_zoom_memory_change(self, value: float) -> None:
+        """Resize the rolling-average ring buffer for zoom memory.
+
+        Args:
+            value: New window length in frames.
+        """
+        n = max(1, int(value))
+        cam = self._camera
+        # Preserve the current average when resizing
+        avg = cam._smoothed_framing_radius
+        cam._zoom_memory_frames = n
+        cam._radius_ring = np.full(n, avg, dtype=np.float64)
+        cam._radius_ring_sum = avg * n
+        cam._radius_ring_idx = 0
 
     def _on_center_mode_change(self, text: str) -> None:
         """Update camera center mode from the combo box selection.
@@ -742,24 +924,32 @@ class ControlPanel:
     def _build_subview_controls(self) -> None:
         from PyQt6 import QtWidgets
 
-        from ..core.camera import CameraMode
+        from .. import defaults as _D
 
-        section = self._add_section("Sub-View (PiP)")
+        section = self._add_section("Sub-View")
         n_particles = len(self._engine._data.particle_ids)
 
         self._subview_cb = QtWidgets.QCheckBox("Enable Sub-View")
         self._subview_cb.toggled.connect(self._on_subview_toggle)
         section.addWidget(self._subview_cb)
 
+        # Layout: PiP corners or split screen
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Corner"))
-        self._corner_combo = QtWidgets.QComboBox()
-        for corner in ["bottom-right", "bottom-left", "top-right", "top-left"]:
-            self._corner_combo.addItem(corner)
-        row.addWidget(self._corner_combo)
+        row.addWidget(QtWidgets.QLabel("Layout"))
+        self._layout_combo = QtWidgets.QComboBox()
+        self._subview_layouts = [
+            "PiP Bottom-Right", "PiP Bottom-Left",
+            "PiP Top-Right", "PiP Top-Left",
+            "Split Left | Right", "Split Top | Bottom",
+        ]
+        for name in self._subview_layouts:
+            self._layout_combo.addItem(name)
+        self._layout_combo.currentTextChanged.connect(self._on_subview_layout_change)
+        row.addWidget(self._layout_combo)
         section.addLayout(row)
 
-        # Sub-view camera mode
+        # --- Camera ---
+        # Mode
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Mode"))
         self._subview_mode_combo = self._make_mode_combo()
@@ -769,15 +959,7 @@ class ControlPanel:
         row.addWidget(self._subview_mode_combo)
         section.addLayout(row)
 
-        # Sub-view framed count
-        self._add_slider(
-            section, "Framed", 1, n_particles, n_particles,
-            lambda v: self._set_subview_n_framed(int(v)),
-            steps=max(1, n_particles - 1),
-            tooltip="Number of closest particles framed in the sub-view.",
-        )
-
-        # Sub-view target (searchable)
+        # Target
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Target"))
         self._subview_target_combo = self._make_particle_combo()
@@ -787,32 +969,109 @@ class ControlPanel:
         row.addWidget(self._subview_target_combo)
         section.addLayout(row)
 
-        # Sub-view pan deadzone
+        # Framed count
         self._add_slider(
-            section, "Pan Deadzone", 0.1, 0.8, 0.4,
-            self._set_subview_pan_deadzone,
-            tooltip="Panning deadzone fraction for the sub-view camera.",
+            section, "Framed", 1, n_particles, n_particles,
+            lambda v: self._set_subview_n_framed(int(v)),
+            steps=max(1, n_particles - 1),
+            tooltip="Number of closest particles framed in the sub-view.",
         )
 
-        # Sub-view auto-rotate
+        # Center mode
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Center"))
+        self._subview_center_combo = QtWidgets.QComboBox()
+        for name in ["Target", "Group Centroid", "Group CoM"]:
+            self._subview_center_combo.addItem(name)
+        self._subview_center_combo.currentTextChanged.connect(self._on_subview_center_change)
+        row.addWidget(self._subview_center_combo)
+        section.addLayout(row)
+
+        # Auto-rotate
         self._subview_rotate_cb = QtWidgets.QCheckBox("Auto-Rotate")
         self._subview_rotate_cb.toggled.connect(self._on_subview_rotate_toggle)
         section.addWidget(self._subview_rotate_cb)
 
+        self._add_slider(
+            section, "Rot. Speed", 0.0, 5.0, _D.ROTATION_SPEED,
+            self._set_subview_rotation_speed,
+            tooltip="Auto-rotation speed in degrees of azimuth per frame.",
+        )
+
+        # Pan deadzone
+        self._add_slider(
+            section, "Pan Deadzone", 0.1, 0.8, _D.PAN_DEADZONE_FRACTION,
+            self._set_subview_pan_deadzone,
+            tooltip="Panning deadzone fraction for the sub-view camera.",
+        )
+
+        # Framing %
+        self._add_slider(
+            section, "Framing %", 0.3, 1.0, _D.FRAMING_FRACTION,
+            self._on_subview_framing_fraction_change,
+            tooltip="Fraction of the screen's vertical half-extent\n"
+                    "for framing in the sub-view.",
+        )
+
+        # --- Appearance ---
+        # Depth scaling
+        self._subview_depth_cb = QtWidgets.QCheckBox("Depth Scaling")
+        self._subview_depth_cb.setToolTip(
+            "Closer particles appear larger in the sub-view.\n"
+            "Uses GPU-native perspective projection on marker sizes."
+        )
+        self._subview_depth_cb.toggled.connect(self._on_subview_depth_toggle)
+        section.addWidget(self._subview_depth_cb)
+
+        # Point alpha
+        self._add_slider(
+            section, "Point Alpha", 0.0, 1.0, _D.POINT_ALPHA,
+            self._set_subview_point_alpha,
+            tooltip="Particle opacity in the sub-view.",
+        )
+
+        # Radius scale
+        self._add_slider(
+            section, "Radius Scale", 0.1, 10.0, 1.0,
+            self._set_subview_radius_scale, log=True,
+            tooltip="Global size multiplier for sub-view particles.",
+        )
+
+        # Trail alpha
+        self._add_slider(
+            section, "Trail Alpha", 0.0, 1.0, _D.TRAIL_ALPHA,
+            self._set_subview_trail_alpha,
+            tooltip="Peak trail opacity in the sub-view.",
+        )
+
     def _on_subview_toggle(self, enabled: bool) -> None:
-        """Enable or disable the picture-in-picture sub-view.
+        """Enable or disable the sub-view.
 
         Args:
             enabled: Whether to show the sub-view.
         """
         if enabled:
-            corner = self._corner_combo.currentText()
-            self._engine.enable_subview(corner=corner)
-            self._on_subview_mode_change(self._subview_mode_combo.currentText())
+            layout = self._layout_combo.currentText()
+            self._engine.enable_subview(layout=layout)
+            # Apply all saved settings to the fresh controller.
+            # Target must be set before mode so acquisition framing
+            # uses the correct reference particle.
             self._on_subview_target_change(self._subview_target_combo.currentText())
+            self._on_subview_mode_change(self._subview_mode_combo.currentText())
             self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
+            self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
         else:
             self._engine.disable_subview()
+
+    def _on_subview_layout_change(self, text: str) -> None:
+        """Re-create the sub-view with the new layout if currently enabled."""
+        if self._subview_cb.isChecked():
+            self._engine.disable_subview()
+            self._engine.enable_subview(layout=text)
+            self._on_subview_target_change(self._subview_target_combo.currentText())
+            self._on_subview_mode_change(self._subview_mode_combo.currentText())
+            self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
+            self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
 
     def _on_subview_mode_change(self, text: str) -> None:
         """Set the sub-view camera mode.
@@ -857,6 +1116,16 @@ class ControlPanel:
         if ctrl is not None:
             ctrl.n_framed = n
 
+    def _on_subview_depth_toggle(self, enabled: bool) -> None:
+        """Toggle depth scaling on the sub-view markers.
+
+        Args:
+            enabled: Whether closer particles appear larger.
+        """
+        markers = self._engine._subview_markers
+        if markers is not None:
+            markers.scaling = "visual" if enabled else False
+
     def _on_subview_rotate_toggle(self, enabled: bool) -> None:
         """Toggle auto-rotation on the sub-view camera.
 
@@ -866,6 +1135,42 @@ class ControlPanel:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.auto_rotate = enabled
+
+    def _set_subview_rotation_speed(self, value: float) -> None:
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is not None:
+            ctrl.rotation_speed = value
+
+    def _on_subview_center_change(self, text: str) -> None:
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is None:
+            return
+        center_modes = {
+            "Target": (False, False),
+            "Group Centroid": (True, False),
+            "Group CoM": (True, True),
+        }
+        use_group, mass_weighted = center_modes.get(text, (False, False))
+        ctrl.use_group_center = use_group
+        ctrl.mass_weighted_center = mass_weighted
+
+    def _on_subview_framing_fraction_change(self, value: float) -> None:
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is not None:
+            ctrl._framing_fraction = value
+            ctrl._cache_fov_trig()
+
+    def _set_subview_point_alpha(self, value: float) -> None:
+        markers = self._engine._subview_markers
+        if markers is not None:
+            markers.alpha = value
+
+    def _set_subview_radius_scale(self, value: float) -> None:
+        """Store the sub-view radius scale for use during set_data calls."""
+        self._engine._subview_radius_scale = value
+
+    def _set_subview_trail_alpha(self, value: float) -> None:
+        self._engine._subview_trail_alpha = value
 
     def _build_export_controls(self) -> None:
         from PyQt6 import QtWidgets

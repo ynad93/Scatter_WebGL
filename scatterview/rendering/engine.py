@@ -177,7 +177,6 @@ class RenderEngine:
         self._point_alpha = D.POINT_ALPHA
         self._trail_alpha = D.TRAIL_ALPHA
         self._trail_length_frac = D.TRAIL_LENGTH_FRAC
-        self._trail_width = D.TRAIL_WIDTH
 
         # Manual control speeds (WASD pan and scroll zoom)
         self._pan_speed = 0.02       # fraction of camera distance per frame
@@ -217,6 +216,7 @@ class RenderEngine:
         # Star field background
         self._stars_enabled = True
         self._star_visual = None
+        self._star_count = D.STAR_COUNT
         self._star_directions = None   # (N, 3) float32 unit vectors, fixed
         self._star_positions = None    # (N, 3) float32 working buffer, scaled each frame
         self._star_base_sizes = None   # (N,) float32
@@ -234,22 +234,28 @@ class RenderEngine:
                     if idx is not None:
                         self._is_bh[idx] = True
 
-        # VisPy canvas and view
+        # VisPy canvas and view — use a grid so split-screen can add
+        # the sub-view as a sibling cell rather than an overlay.
         self._canvas = scene.SceneCanvas(
             keys="interactive", size=size, title=title, show=False,
         )
-        self._view = self._canvas.central_widget.add_view()
+        self._grid = self._canvas.central_widget.add_grid()
+        self._view = self._grid.add_view(row=0, col=0)
         self._view.camera = scene.cameras.TurntableCamera(
             fov=D.CAMERA_FOV, distance=10.0,
         )
         self._view.camera.set_range()
 
-        # Sub-view (picture-in-picture)
+        # Sub-view — own ViewBox on the same canvas
         self._subview = None
-        self._subview_canvas = None
         self._subview_enabled = False
-        self._subview_markers = None
         self._subview_camera_controller = None
+        self._subview_markers = None
+        self._subview_trail_line = None
+        self._subview_star_visual = None
+        self._subview_layout = None
+        self._subview_radius_scale = 1.0
+        self._subview_trail_alpha = D.TRAIL_ALPHA
 
         # Visuals
         self._particle_visual = None
@@ -278,9 +284,9 @@ class RenderEngine:
         self._trail_prev_time = -np.inf
 
         # Trail alpha gradient: maps time fraction (0=oldest, 1=newest) to
-        # opacity via a t^1.5 power curve.  Trails fade from transparent at
+        # opacity via a linear curve.  Trails fade from transparent at
         # the tail to opaque at the head.
-        self._alpha_lut = (np.linspace(0, 1, 1024) ** 1.5).astype(np.float32)
+        self._alpha_lut = np.linspace(0, 1, 1024, dtype=np.float32)
 
         self._build_visuals()
 
@@ -618,7 +624,7 @@ class RenderEngine:
         stars always remain within the viewing frustum.
         """
         rng = np.random.default_rng(D.STAR_SEED)
-        n = D.STAR_COUNT
+        n = self._star_count
 
         # Uniform unit vectors on the sphere
         z = rng.uniform(-1, 1, n)
@@ -921,30 +927,32 @@ class RenderEngine:
         combined_colors[:, 3] = alpha_table[alpha_index] * self._trail_alpha
 
         if self._trail_line is not None:
-            self._trail_line.set_data(
-                pos=combined_pos, color=combined_colors,
-                width=self._trail_width,
-            )
+            self._trail_line.set_data(pos=combined_pos, color=combined_colors)
             self._trail_line.visible = True
         else:
             self._trail_line = scene.Line(
                 pos=combined_pos, color=combined_colors,
-                parent=self._view.scene, width=self._trail_width,
+                parent=self._view.scene, width=1,
                 antialias=True, connect="strip",
             )
 
+        # Sub-view: pass the same trail arrays with sub-view appearance
         if self._subview_enabled and self._subview is not None:
-            sub_width = max(1.5, self._trail_width * 0.7)
+            if self._subview_trail_alpha != self._trail_alpha:
+                sub_colors = combined_colors.copy()
+                alpha_ratio = self._subview_trail_alpha / max(self._trail_alpha, 1e-6)
+                sub_colors[:, 3] *= alpha_ratio
+            else:
+                sub_colors = combined_colors
             if self._subview_trail_line is not None:
                 self._subview_trail_line.set_data(
-                    pos=combined_pos, color=combined_colors,
-                    width=sub_width,
+                    pos=combined_pos, color=sub_colors,
                 )
                 self._subview_trail_line.visible = True
             else:
                 self._subview_trail_line = scene.Line(
-                    pos=combined_pos, color=combined_colors,
-                    parent=self._subview.scene, width=sub_width,
+                    pos=combined_pos, color=sub_colors,
+                    parent=self._subview.scene, width=1,
                     antialias=True, connect="strip",
                 )
 
@@ -963,6 +971,11 @@ class RenderEngine:
             pos=self._star_positions, face_color=self._star_base_colors,
             size=self._star_base_sizes, edge_width=0,
         )
+        if self._subview_star_visual is not None:
+            self._subview_star_visual.set_data(
+                pos=self._star_positions, face_color=self._star_base_colors,
+                size=self._star_base_sizes, edge_width=0,
+            )
 
     # ------------------------------------------------------------------
     # Frame update
@@ -1027,6 +1040,15 @@ class RenderEngine:
 
         self._update_trails(self._current_sim_time, positions, mask)
 
+        # Sub-view: feed the same computed data to its own visuals
+        if self._subview_enabled and self._subview_markers is not None:
+            sub_size = attrs["size"] * self._subview_radius_scale
+            self._subview_markers.set_data(
+                pos=active_pos, face_color=attrs["face_color"],
+                size=sub_size, edge_color=attrs["edge_color"],
+                edge_width=attrs["edge_width"],
+            )
+
         # Star field
         if self._stars_enabled and self._star_visual is not None:
             self._update_stars()
@@ -1037,15 +1059,6 @@ class RenderEngine:
             text = D.format_sim_time(self._current_sim_time, self._time_unit)
             if text != self._time_text.text:
                 self._time_text.text = text
-
-        if self._subview_enabled and self._subview_markers is not None:
-            self._subview_markers.set_data(
-                pos=active_pos, face_color=attrs["face_color"],
-                size=attrs["size"] * 0.7, edge_color=attrs["edge_color"],
-                edge_width=attrs["edge_width"],
-            )
-            if self._subview_canvas is not None:
-                self._subview_canvas.update()
 
         self._canvas.update()
 
@@ -1182,15 +1195,6 @@ class RenderEngine:
         """
         self._trail_alpha = np.clip(alpha, 0.0, 1.0)
 
-    def set_trail_width(self, width: float) -> None:
-        """Set trail line width.
-
-        Args:
-            width: Line width in pixels (clamped to >= 0.5).
-        """
-        self._trail_width = max(0.5, width)
-
-
     def set_point_alpha(self, alpha: float) -> None:
         """Set particle marker opacity.
 
@@ -1318,6 +1322,29 @@ class RenderEngine:
             self._star_max_particle_dist * self._star_shell_factor, 1.0,
         )
 
+    def set_star_count(self, count: int) -> None:
+        """Change the number of background stars and regenerate the field.
+
+        Args:
+            count: Number of stars on the spherical shell.
+        """
+        self._star_count = max(100, int(count))
+        self._generate_star_field()
+        if self._star_visual is not None:
+            self._star_visual.set_data(
+                pos=self._star_positions,
+                face_color=self._star_base_colors,
+                size=self._star_base_sizes,
+                edge_width=0,
+            )
+        if self._subview_star_visual is not None:
+            self._subview_star_visual.set_data(
+                pos=self._star_positions,
+                face_color=self._star_base_colors,
+                size=self._star_base_sizes,
+                edge_width=0,
+            )
+
     def set_camera_controller(self, controller) -> None:
         """Attach a CameraController and initialize its framing.
 
@@ -1336,40 +1363,56 @@ class RenderEngine:
     # Sub-view
     # ------------------------------------------------------------------
 
-    def enable_subview(self, corner: str = "bottom-right", size_frac: float = 0.3) -> None:
-        """Create and show a picture-in-picture sub-view.
+    def enable_subview(self, layout: str = "PiP Bottom-Right", size_frac: float = 0.3) -> None:
+        """Create a sub-view on the same canvas.
+
+        Supports PiP (overlay in a corner) and split-screen layouts.
+        The sub-view has its own scene and visuals but shares the same
+        OpenGL context.  Per-frame data is computed once and passed to
+        both sets of visuals.
 
         Args:
-            corner: Screen corner for placement — "bottom-right", "bottom-left",
-                "top-right", or "top-left".
-            size_frac: Fraction of main canvas size for the sub-view (0 to 1).
+            layout: Layout name — "PiP Bottom-Right", "PiP Bottom-Left",
+                "PiP Top-Right", "PiP Top-Left",
+                "Split Left | Right", "Split Top | Bottom".
+            size_frac: Fraction of main canvas size for PiP mode (0 to 1).
         """
         from vispy import scene
 
-        if self._subview_canvas is not None:
+        if self._subview is not None:
             return
 
-        main_widget = self._canvas.native
-        w, h = main_widget.width(), main_widget.height()
-        sw, sh = int(w * size_frac), int(h * size_frac)
-        margin = 10
-        corners = {
-            "bottom-right": (w - sw - margin, h - sh - margin),
-            "bottom-left": (margin, h - sh - margin),
-            "top-right": (w - sw - margin, margin),
-            "top-left": (margin, margin),
-        }
-        x, y = corners.get(corner, corners["bottom-right"])
+        w, h = self._canvas.size
+        self._subview_layout = layout
 
-        self._subview_canvas = scene.SceneCanvas(keys=None, show=False, parent=main_widget)
-        self._subview_canvas.native.setFixedSize(sw, sh)
-        self._subview_canvas.native.move(x, y)
-        self._subview_canvas.native.setStyleSheet("border: 2px solid white; background: black;")
+        # PiP needs explicit position; split uses the grid layout
+        sx, sy = 0, 0
+        if not layout.startswith("Split"):
+            sw, sh = int(w * size_frac), int(h * size_frac)
+            margin = 10
+            pip_corners = {
+                "PiP Bottom-Right": (w - sw - margin, h - sh - margin),
+                "PiP Bottom-Left": (margin, h - sh - margin),
+                "PiP Top-Right": (w - sw - margin, margin),
+                "PiP Top-Left": (margin, margin),
+            }
+            sx, sy = pip_corners.get(layout, pip_corners["PiP Bottom-Right"])
 
-        self._subview = self._subview_canvas.central_widget.add_view()
+        # Create sub-view: grid cell for split, overlay for PiP
+        if layout.startswith("Split"):
+            if "Left" in layout:
+                self._subview = self._grid.add_view(row=0, col=1)
+            else:
+                self._subview = self._grid.add_view(row=1, col=0)
+        else:
+            self._subview = self._canvas.central_widget.add_view()
+            self._subview.pos = (sx, sy)
+            self._subview.size = (sw, sh)
+
         self._subview.camera = scene.cameras.TurntableCamera(
             fov=D.SUBVIEW_FOV, distance=10.0,
         )
+        self._subview.border_color = (1.0, 1.0, 1.0, 0.6)
 
         from ..core.camera import CameraController, CameraMode
         self._subview_camera_controller = CameraController(
@@ -1377,10 +1420,11 @@ class RenderEngine:
         )
         self._subview_camera_controller.mode = CameraMode.TARGET_COMOVING
 
+        # Create visuals in the sub-view's own scene
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
         active_pos = positions[mask] if mask.any() else np.zeros((1, 3), dtype=np.float32)
-
         attrs = self._get_particle_attrs(mask)
+
         self._subview_markers = scene.Markers(
             spherical=True, light_color=D.LIGHT_COLOR,
             light_position=D.LIGHT_POSITION, light_ambient=D.LIGHT_AMBIENT,
@@ -1388,23 +1432,55 @@ class RenderEngine:
         )
         self._subview_markers.set_data(
             pos=active_pos, face_color=attrs["face_color"],
-            size=attrs["size"] * 0.7, edge_color=attrs["edge_color"],
+            size=attrs["size"], edge_color=attrs["edge_color"],
             edge_width=attrs["edge_width"],
         )
 
-        self._subview_canvas.native.show()
+        # Star field for the sub-view (same data, own visual)
+        if self._stars_enabled and self._star_positions is not None:
+            self._subview_star_visual = scene.Markers(
+                parent=self._subview.scene,
+            )
+            self._subview_star_visual.set_data(
+                pos=self._star_positions,
+                face_color=self._star_base_colors,
+                size=self._star_base_sizes,
+                edge_width=0,
+            )
+            self._subview_star_visual.order = -10
+
+        # Defer framing to the first _update_frame call so the GUI
+        # has a chance to apply target/mode settings first.
+        # The controller's _target_needs_acquisition flag (set when
+        # target_particle is assigned) triggers an immediate snap.
+
         self._subview_enabled = True
 
     def disable_subview(self) -> None:
-        if self._subview_canvas is not None:
-            self._subview_canvas.native.hide()
-            self._subview_canvas.native.setParent(None)
-            self._subview_canvas = None
+        if self._subview is not None:
+            # Remove from grid's internal layout tracking if it was
+            # added as a grid cell (split mode).
+            if self._subview_layout and self._subview_layout.startswith("Split"):
+                grid = self._grid
+                to_remove = [
+                    k for k, v in grid._grid_widgets.items()
+                    if v[4] is self._subview
+                ]
+                for k in to_remove:
+                    row, col = grid._grid_widgets[k][:2]
+                    del grid._grid_widgets[k]
+                    if row in grid._cells and col in grid._cells[row]:
+                        del grid._cells[row][col]
+                grid._need_solver_recreate = True
+
+            self._subview.parent = None
             self._subview = None
             self._subview_markers = None
-            self._subview_camera_controller = None
             self._subview_trail_line = None
+            self._subview_star_visual = None
+            self._subview_camera_controller = None
             self._subview_enabled = False
+            self._subview_layout = None
 
     # ------------------------------------------------------------------
     # Display / export

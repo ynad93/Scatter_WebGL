@@ -394,8 +394,7 @@ class TrajectoryInterpolator:
         overhead of fork-based multiprocessing.
 
         Args:
-            n_workers: Number of threads. By default, sized so each thread
-                handles at least 20 particles, clamped to [1, cpu_count].
+            n_workers: Number of threads.
 
         Returns:
             PrecomputedTrails with packed arrays and an offset table.

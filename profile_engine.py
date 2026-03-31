@@ -74,7 +74,10 @@ def _wrap(obj, attr: str, label: str, collector: TimingCollector):
 # Startup profiling
 # ---------------------------------------------------------------------------
 
-def profile_startup(datafile: str, worker_counts: list[int]) -> tuple:
+def profile_startup(datafile: str, worker_counts: list[int],
+                    trail_length: float | None = None,
+                    target: str | None = None,
+                    n_framed: int | None = None) -> tuple:
     """Profile every stage of startup, return (data, interp, engine, cam, timings)."""
     import multiprocessing
 
@@ -115,11 +118,11 @@ def profile_startup(datafile: str, worker_counts: list[int]) -> tuple:
     # Measure per-particle trail eval cost
     pid = int(data.particle_ids[0])
     t_end = float(data.times[-1])
-    trail_length = t_end - float(data.times[0])
+    full_time_range = t_end - float(data.times[0])
     eval_times = []
     for _ in range(10):
         tt0 = time.perf_counter()
-        interp.evaluate_trail(pid, t_end, trail_length)
+        interp.evaluate_trail(pid, t_end, full_time_range)
         tt1 = time.perf_counter()
         eval_times.append(tt1 - tt0)
     per_particle_ms = np.median(eval_times) * 1000
@@ -165,6 +168,30 @@ def profile_startup(datafile: str, worker_counts: list[int]) -> tuple:
     timings["camera_init"] = t9 - t8
     print(f"  RenderEngine.__init__: {timings['engine_init']:.3f}s (includes trail precomp)")
     print(f"  CameraController:      {timings['camera_init']:.3f}s")
+
+    # Apply benchmark overrides
+    if trail_length is not None:
+        engine.set_trail_length(trail_length)
+        print(f"  [override] trail_length = {trail_length}")
+    if target is not None:
+        # Resolve string label to integer pid
+        target_pid = None
+        if data.id_labels is not None:
+            for int_id, label in data.id_labels.items():
+                if label == target:
+                    target_pid = int_id
+                    break
+        if target_pid is None:
+            try:
+                target_pid = int(target)
+            except ValueError:
+                raise ValueError(f"Target '{target}' not found in particle labels: "
+                                 f"{list(data.id_labels.values()) if data.id_labels else 'no labels'}")
+        cam.target_particle = target_pid
+        print(f"  [override] target = {target} (pid={target_pid})")
+    if n_framed is not None:
+        cam.n_framed = n_framed
+        print(f"  [override] n_framed = {n_framed}")
 
     # Summary
     total = timings["load"] + timings["splines_total"] + timings["engine_init"] + timings["camera_init"]
@@ -400,6 +427,12 @@ def main():
                         help="Only profile startup, skip runtime")
     parser.add_argument("--runtime-only", action="store_true",
                         help="Only profile runtime (fastest startup)")
+    parser.add_argument("--trail-length", type=float, default=None,
+                        help="Trail length as fraction of total time range")
+    parser.add_argument("--target", type=str, default=None,
+                        help="Target particle ID or label (e.g. 'IMBH')")
+    parser.add_argument("--n-framed", type=int, default=None,
+                        help="Number of nearest neighbors for camera framing")
     args = parser.parse_args()
 
     import multiprocessing
@@ -420,6 +453,9 @@ def main():
     print()
     data, interp, engine, cam, startup_timings = profile_startup(
         args.datafile, worker_counts,
+        trail_length=args.trail_length,
+        target=args.target,
+        n_framed=args.n_framed,
     )
 
     if args.startup_only:

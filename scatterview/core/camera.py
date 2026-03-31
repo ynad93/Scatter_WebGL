@@ -82,10 +82,15 @@ class CameraController:
         self._framing_fraction = D.FRAMING_FRACTION
         self._cache_fov_trig()
 
-        # Zoom smoothing: exponential damping factor (0–1).  Each frame,
-        # the camera distance moves by this fraction of the gap between
-        # current and ideal.  1.0 = instant tracking, 0.1 = very smooth.
-        self._zoom_smoothing = D.ZOOM_SMOOTHING
+        # Zoom memory: rolling-average window for framing radius.
+        # The camera distance tracks the mean radius over the last N
+        # frames, filtering out orbital oscillations while responding
+        # smoothly to genuine scale changes.  A running sum avoids
+        # recomputing the full mean each frame.
+        self._zoom_memory_frames = D.ZOOM_MEMORY_FRAMES
+        self._radius_ring = np.ones(D.ZOOM_MEMORY_FRAMES, dtype=np.float64)
+        self._radius_ring_sum = float(D.ZOOM_MEMORY_FRAMES)
+        self._radius_ring_idx = 0
 
         # Center mode: when tracking a target with neighbors, center on
         # the target particle directly, or on the centroid/CoM of the group.
@@ -165,6 +170,7 @@ class CameraController:
     @n_framed.setter
     def n_framed(self, value: int) -> None:
         self._n_framed = max(1, value)
+        self._target_needs_acquisition = True
 
     @property
     def keep_all_in_frame(self) -> bool:
@@ -173,6 +179,7 @@ class CameraController:
     @keep_all_in_frame.setter
     def keep_all_in_frame(self, value: bool) -> None:
         self._keep_all_in_frame = value
+        self._target_needs_acquisition = True
 
     @property
     def free_zoom(self) -> bool:
@@ -234,6 +241,9 @@ class CameraController:
         radius = self._compute_framing_radius(framed, center)
         self._smoothed_center = center.copy()
         self._smoothed_framing_radius = radius
+        # Seed the ring buffer so the camera starts at the correct zoom.
+        self._radius_ring[:] = radius
+        self._radius_ring_sum = radius * len(self._radius_ring)
         return center, self._ideal_distance(radius)
 
     def update(
@@ -268,8 +278,11 @@ class CameraController:
                 positions, active_pos, mask, use_deadzone=False,
             )
             self._smoothed_framing_radius = framing_radius
-            self._camera.center = tuple(center)
-            self._camera.distance = self._ideal_distance(framing_radius)
+            self._radius_ring[:] = framing_radius
+            self._radius_ring_sum = framing_radius * len(self._radius_ring)
+            self._camera._center = (float(center[0]), float(center[1]), float(center[2]))
+            self._camera._distance = self._ideal_distance(framing_radius)
+            self._camera.view_changed()
 
         # Base mode computes center and framing radius
         if self._mode == CameraMode.TARGET_COMOVING:
@@ -302,6 +315,12 @@ class CameraController:
         When ``n_framed >= n_active`` (or ``keep_all_in_frame``), returns
         all particles unchanged.  Also stores ``_framed_active_idx``.
 
+        Uses a hysteresis band to prevent the framed set from flickering
+        when two particles are nearly equidistant from the reference
+        point.  The current set is kept unless the candidate set's
+        farthest member is more than 5% closer than the current set's
+        farthest member.
+
         Args:
             active_pos: (n_active, 3) positions of currently active particles.
             reference_pos: (3,) point to measure distances from. Falls back
@@ -319,6 +338,19 @@ class CameraController:
 
         center = reference_pos if reference_pos is not None else self._active_com
         distances = np.linalg.norm(active_pos - center, axis=1)
+
+        # Hysteresis: keep the current set unless the candidate set is
+        # meaningfully tighter (farthest member >5% closer).
+        prev = self._framed_active_idx
+        if len(prev) == n_keep and prev.max() < n:
+            current_max_dist = distances[prev].max()
+            candidate = np.argpartition(distances, n_keep)[:n_keep]
+            candidate_max_dist = distances[candidate].max()
+            if candidate_max_dist >= current_max_dist * 0.95:
+                return active_pos[prev]
+            self._framed_active_idx = candidate
+            return active_pos[candidate]
+
         closest = np.argpartition(distances, n_keep)[:n_keep]
         self._framed_active_idx = closest
         return active_pos[closest]
@@ -382,22 +414,33 @@ class CameraController:
         """
         half_fov = np.radians(self._camera.fov / 2)
         self._tan_half_fov = np.tan(half_fov)
-        self._inv_sin_effective_fov = 1.0 / np.sin(half_fov * self._framing_fraction)
+        effective_angle = half_fov * self._framing_fraction
+        self._inv_tan_effective_fov = 1.0 / np.tan(effective_angle)
 
     def _ideal_distance(self, framing_radius: float) -> float:
         """Camera distance that places the farthest framed particle at
         the framing fraction of the screen's vertical half-extent.
 
+        Uses ``tan`` (not ``sin``) because the framing radius is a
+        projected (on-screen-plane) distance, so the relationship is
+        ``tan(θ) = r / d``.
+
         Args:
-            framing_radius: Maximum distance from center to any framed particle.
+            framing_radius: Maximum effective projected distance from
+                center to any framed particle.
 
         Returns:
             Camera distance in world units.
         """
-        return framing_radius * self._inv_sin_effective_fov
+        return framing_radius * self._inv_tan_effective_fov
 
     def _compute_framing_radius(self, positions: np.ndarray, center: np.ndarray) -> float:
-        """Maximum distance from center to any framed particle.
+        """Maximum 3D distance from center to any framed particle.
+
+        Uses the rotation-invariant 3D distance so the framing radius
+        does not change when the user orbits the camera.  Depth-axis
+        orbital oscillations are handled by the rolling average in
+        ``_apply_camera`` rather than by view-dependent projection.
 
         Args:
             positions: (n_framed, 3) positions of the framed particles.
@@ -406,9 +449,9 @@ class CameraController:
         Returns:
             Scalar radius encompassing all framed particles (minimum 1.0).
         """
-        distances = np.linalg.norm(positions - center, axis=1)
-        if len(distances) == 0:
+        if len(positions) == 0:
             return 1.0
+        distances = np.linalg.norm(positions - center, axis=1)
         return float(np.max(distances)) or 1.0
 
     def _apply_pan_deadzone(self, target_position: np.ndarray) -> np.ndarray:
@@ -442,26 +485,53 @@ class CameraController:
     def _apply_camera(self, center: np.ndarray, framing_radius: float) -> None:
         """Push center and distance to the VisPy camera.
 
-        Center is always updated.  The framing radius is exponentially
-        smoothed (zoom_smoothing controls the rate) to filter frame-to-frame
-        noise from orbital oscillations, then the camera distance is computed
-        deterministically from the smoothed radius.  Free zoom disables
-        automatic distance updates so the user can control zoom manually
-        while center tracking continues.
+        Uses a rolling average over the framing radius so the camera
+        tracks the natural scale of the framed group without reacting
+        to frame-to-frame orbital oscillations.  Each frame one sample
+        enters and one leaves the window, so the target distance drifts
+        continuously with no discontinuities.
+
+        Writes to the camera's internal state directly and calls
+        view_changed() at most once per frame to avoid redundant
+        VisPy transform recomputation.
 
         Args:
             center: (3,) world-space camera center position.
-            framing_radius: Raw (unsmoothed) radius encompassing framed particles.
+            framing_radius: Raw (instantaneous) radius encompassing framed particles.
         """
-        self._camera.center = tuple(center)
+        cam = self._camera
+        new_center = (float(center[0]), float(center[1]), float(center[2]))
+        center_changed = new_center != cam._center
 
         if self._free_zoom:
+            if center_changed:
+                cam._center = new_center
+                cam.view_changed()
             return
 
-        self._smoothed_framing_radius += self._zoom_smoothing * (
-            framing_radius - self._smoothed_framing_radius
-        )
-        self._camera.distance = self._ideal_distance(self._smoothed_framing_radius)
+        # Update the running sum: subtract the sample being overwritten,
+        # write the new sample, add it.
+        ring = self._radius_ring
+        idx = self._radius_ring_idx
+        self._radius_ring_sum -= ring[idx]
+        ring[idx] = framing_radius
+        self._radius_ring_sum += framing_radius
+        self._radius_ring_idx = (idx + 1) % len(ring)
+
+        # Camera distance tracks the rolling average directly
+        self._smoothed_framing_radius = self._radius_ring_sum / len(ring)
+        new_distance = self._ideal_distance(self._smoothed_framing_radius)
+        cur_distance = cam._distance
+        distance_changed = (cur_distance is None
+                            or abs(new_distance - cur_distance) > 1e-4 * cur_distance)
+
+        if center_changed:
+            cam._center = new_center
+        if distance_changed:
+            cam._distance = new_distance
+
+        if center_changed or distance_changed:
+            cam.view_changed()
 
     def _find_target(self, positions: np.ndarray) -> np.ndarray | None:
         """Return the target particle's position, or None if not active.
