@@ -9,6 +9,11 @@ from . import defaults as D
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Entry point for the ScatterView CLI.
+
+    Args:
+        argv: Command-line arguments. Uses sys.argv if None.
+    """
     parser = argparse.ArgumentParser(
         prog="scatterview",
         description="ScatterView: N-body simulation visualization tool",
@@ -193,8 +198,9 @@ def main(argv: list[str] | None = None) -> None:
     except ImportError:
         _app = None
 
-    print("Launching interactive viewer...")
+    print("Precomputing trails and building renderer...")
     engine, cam = _build_engine_and_camera()
+    print("Launching interactive viewer...")
 
     # Try to launch with GUI controls
     if _app is not None:

@@ -23,12 +23,25 @@ _worker_interp = None  # TrajectoryInterpolator, set by pool initializer or befo
 
 
 def _init_trail_worker(interp) -> None:
+    """Multiprocessing pool initializer: store the interpolator in the worker.
+
+    Args:
+        interp: TrajectoryInterpolator instance to share with the worker.
+    """
     global _worker_interp
     _worker_interp = interp
 
 
 def _eval_trail_worker(args: tuple) -> tuple[int, np.ndarray, np.ndarray] | None:
-    """Evaluate one particle's trail at simulation timesteps + 1-pass refinement."""
+    """Evaluate one particle's trail at simulation timesteps + 1-pass refinement.
+
+    Args:
+        args: Tuple of (pid, t_end, trail_length) — particle ID, end time,
+            and trail duration in simulation time units.
+
+    Returns:
+        (pid, positions, times) tuple, or None if the particle has no data.
+    """
     pid, t_end, trail_length = args
     result = _worker_interp.evaluate_trail(pid, t_end, trail_length)
     if result is None:
@@ -63,6 +76,12 @@ class TrajectoryInterpolator:
     """
 
     def __init__(self, data: SimulationData):
+        """Build splines for all particle trajectories.
+
+        Args:
+            data: Loaded simulation data containing positions, times,
+                valid intervals, and optionally velocities.
+        """
         self._data = data
         self._particle_splines: dict[int, list[_SegmentSpline]] = {}
         self._build_splines()
@@ -70,7 +89,16 @@ class TrajectoryInterpolator:
 
     @staticmethod
     def _find_interval(breakpoints: np.ndarray, time: float) -> int:
-        """Find the spline interval containing *time*."""
+        """Find the spline interval containing *time*.
+
+        Args:
+            breakpoints: (M+1,) sorted knot times of the spline.
+            time: Query time to locate.
+
+        Returns:
+            Interval index k such that breakpoints[k] <= time < breakpoints[k+1],
+            clamped to [0, M-1].
+        """
         return max(0, min(
             int(np.searchsorted(breakpoints, time, side='right') - 1),
             len(breakpoints) - 2,
@@ -106,7 +134,14 @@ class TrajectoryInterpolator:
             self._particle_splines[pid_key] = segments
 
     def _get_particle_times(self, pid_key: int) -> np.ndarray:
-        """Get the time values corresponding to this particle's valid positions."""
+        """Get the time values corresponding to this particle's valid positions.
+
+        Args:
+            pid_key: Integer particle ID.
+
+        Returns:
+            1-D array of simulation times within this particle's valid intervals.
+        """
         intervals = self._data.valid_intervals.get(pid_key, [])
         all_times = self._data.times
 
@@ -124,7 +159,18 @@ class TrajectoryInterpolator:
         vel: np.ndarray | None,
         intervals: list[tuple[float, float]],
     ) -> list[_SegmentSpline]:
-        """Build separate splines for each continuous time segment."""
+        """Build separate splines for each continuous time segment.
+
+        Args:
+            times: (T,) array of this particle's valid time values.
+            pos: (T, 3) contiguous position data across all segments.
+            vel: (T, 3) velocity data (same layout as pos), or None.
+            intervals: List of (t_start, t_end) valid-interval tuples from
+                the data loader.
+
+        Returns:
+            List of _SegmentSpline objects, one per continuous segment.
+        """
         segments = []
 
         for t_start, t_end in intervals:
@@ -271,6 +317,9 @@ class TrajectoryInterpolator:
         call, then vectorized coefficient gather and Horner evaluation.
         Falls back to per-particle evaluation for multi-segment particles.
 
+        Args:
+            time: Simulation time to evaluate at.
+
         Returns:
             positions: (n_particles, 3) array — NaN for inactive particles.
             mask: (n_particles,) bool — True where particle is active.
@@ -342,7 +391,13 @@ class TrajectoryInterpolator:
         Uses each particle's simulation timesteps as the seed grid,
         then refines per-particle.
 
-        Returns dict of pid -> (positions, times).
+        Args:
+            pids: List of integer particle IDs to evaluate.
+            t_end: End time of the trail window (current simulation time).
+            trail_length: Duration of the trail window in simulation time units.
+
+        Returns:
+            Dict of pid -> (positions, times) for particles with data.
         """
         results = {}
         for pid in pids:
@@ -378,7 +433,7 @@ class TrajectoryInterpolator:
         trail_length = t_end - t_start
 
         if n_workers is None:
-            n_workers = min(multiprocessing.cpu_count(), 4)
+            n_workers = multiprocessing.cpu_count()
 
         global _worker_interp
         _worker_interp = self  # set before fork so workers inherit it
@@ -466,27 +521,60 @@ class TrajectoryInterpolator:
         return positions, times
 
     def evaluate_spline(self, pid: int, times: np.ndarray) -> np.ndarray | None:
-        """Evaluate a single particle's spline at the given times."""
+        """Evaluate a single particle's spline at the given times.
+
+        Args:
+            pid: Integer particle ID.
+            times: (N,) array of simulation times to evaluate at.
+
+        Returns:
+            (N, 3) position array, or None if the particle has no splines.
+        """
         segments = self._particle_splines.get(pid, [])
         if not segments:
             return None
         return self._eval_times(segments, times)
 
     def evaluate_single(self, pid: int, time: float) -> np.ndarray | None:
-        """Evaluate one particle at one scalar time. Returns (3,) array or None."""
+        """Evaluate one particle at one scalar time.
+
+        Args:
+            pid: Integer particle ID.
+            time: Simulation time to evaluate at.
+
+        Returns:
+            (3,) position array, or None if the particle doesn't exist at this time.
+        """
         return self._evaluate_particle(self._particle_splines.get(pid, []), time)
 
     def refine_trail(
         self, pid: int, times: np.ndarray, positions: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Run angle-based refinement on a particle's trail segment."""
+        """Run angle-based refinement on a particle's trail segment.
+
+        Args:
+            pid: Integer particle ID (used to look up spline segments).
+            times: (N,) seed time grid for the trail.
+            positions: (N, 3) positions at the seed times.
+
+        Returns:
+            (refined_positions, refined_times) tuple with inserted points.
+        """
         segments = self._particle_splines.get(pid, [])
         return self._refine_trail(segments, times, positions)
 
     def _eval_times(
         self, segments: list, times: np.ndarray
     ) -> np.ndarray | None:
-        """Evaluate spline at an array of times."""
+        """Evaluate spline at an array of times.
+
+        Args:
+            segments: List of _SegmentSpline objects for this particle.
+            times: (N,) sorted array of query times.
+
+        Returns:
+            (N, 3) position array (NaN for gaps), or None if no valid data.
+        """
         # Fast path: single segment covering the whole range
         if len(segments) == 1:
             seg = segments[0]
@@ -520,6 +608,15 @@ class TrajectoryInterpolator:
         adjacent segments.  Seeded from the simulation's adaptive timesteps,
         very few insertions are needed — the integrator already concentrates
         steps at close encounters and fast orbital phases.
+
+        Args:
+            segments: List of _SegmentSpline objects for this particle.
+            times: (N,) seed time grid.
+            positions: (N, 3) positions at the seed times.
+
+        Returns:
+            (refined_positions, refined_times) sorted by time, with
+            additional points inserted at sharp bends.
         """
         if len(positions) < 3:
             return positions, times
@@ -587,7 +684,16 @@ class TrajectoryInterpolator:
     def _evaluate_particle(
         self, segments: list[_SegmentSpline], time: float
     ) -> np.ndarray | None:
-        """Evaluate a single particle's position at a given time."""
+        """Evaluate a single particle's position at a given time.
+
+        Args:
+            segments: List of _SegmentSpline objects for this particle.
+            time: Simulation time to evaluate at.
+
+        Returns:
+            (3,) position array, or None if the particle doesn't exist
+            at this time (outside all segments and beyond clamp tolerance).
+        """
         for seg in segments:
             if seg.t_start <= time <= seg.t_end:
                 return seg.spline(time) if seg.spline else seg.constant_pos
@@ -614,7 +720,16 @@ class TrajectoryInterpolator:
 
 
 class _SegmentSpline:
-    """A spline covering one continuous time segment of a particle's trajectory."""
+    """A spline covering one continuous time segment of a particle's trajectory.
+
+    Args:
+        t_start: First valid time in this segment.
+        t_end: Last valid time in this segment.
+        spline: A scipy CubicSpline or CubicHermiteSpline interpolating
+            (x, y, z) over [t_start, t_end], or None for single-point segments.
+        constant_pos: (3,) fallback position for single-point segments
+            (used when spline is None).
+    """
 
     __slots__ = ("t_start", "t_end", "spline", "constant_pos")
 
@@ -627,5 +742,5 @@ class _SegmentSpline:
     ):
         self.t_start = t_start
         self.t_end = t_end
-        self.spline = spline  # single 3D CubicSpline/CubicHermiteSpline, or None
-        self.constant_pos = constant_pos  # fallback for single-point segments
+        self.spline = spline
+        self.constant_pos = constant_pos

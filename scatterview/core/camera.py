@@ -28,8 +28,9 @@ class CameraController:
 
     Args:
         view: VisPy ViewBox whose camera to control.
-        masses: Optional dict of particle ID -> mass array for mass-weighted COM.
-        events: Optional list of detected events for event-tracking mode.
+        masses: Dict of particle ID -> mass array for mass-weighted COM, or None.
+        events: List of detected Event objects for event-tracking mode, or None.
+        particle_ids: Sorted array of integer particle IDs for pid-to-index lookup.
     """
 
     def __init__(
@@ -218,8 +219,13 @@ class CameraController:
     ) -> tuple[np.ndarray, float]:
         """Compute initial framing and set internal state.
 
-        Returns (center, camera_distance) for the caller to apply
-        to the VisPy camera.
+        Args:
+            positions: (n_particles, 3) full-size position array (NaN for inactive).
+            mask: (n_particles,) bool — True where particle is active.
+
+        Returns:
+            (center, camera_distance) tuple for the caller to apply
+            to the VisPy camera.
         """
         active_pos = positions[mask]
         target_pos = self._find_target(positions)
@@ -295,6 +301,14 @@ class CameraController:
 
         When ``n_framed >= n_active`` (or ``keep_all_in_frame``), returns
         all particles unchanged.  Also stores ``_framed_active_idx``.
+
+        Args:
+            active_pos: (n_active, 3) positions of currently active particles.
+            reference_pos: (3,) point to measure distances from. Falls back
+                to the current center of mass if None.
+
+        Returns:
+            (n_keep, 3) subset of active_pos for the framed particles.
         """
         n = len(active_pos)
         n_keep = min(self._n_framed, n)
@@ -312,7 +326,15 @@ class CameraController:
     # --- Helpers ---
 
     def _compute_center_of_mass(self, active_pos: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Compute center of mass of active particles, weighted by mass if available."""
+        """Compute center of mass of active particles, weighted by mass if available.
+
+        Args:
+            active_pos: (n_active, 3) positions of currently active particles.
+            mask: (n_particles,) bool — used to index into the full mass array.
+
+        Returns:
+            (3,) center of mass position.
+        """
         if self._mass_array is not None:
             weights = self._mass_array[mask]
             total = weights.sum()
@@ -329,6 +351,16 @@ class CameraController:
         If ``use_group_center`` is False, pins on the target (or COM if
         no target).  Otherwise computes the centroid or mass-weighted
         center of the framed group.
+
+        Args:
+            target_pos: (3,) position of the target particle, or None if no
+                target is active.
+            framed_pos: (n_framed, 3) positions of the framed particle subset.
+            mask: (n_particles,) bool — used to map framed indices to full-array
+                indices for mass lookup.
+
+        Returns:
+            (3,) camera center position.
         """
         if not self._use_group_center:
             return target_pos if target_pos is not None else self._active_com
@@ -355,11 +387,25 @@ class CameraController:
     def _ideal_distance(self, framing_radius: float) -> float:
         """Camera distance that places the farthest framed particle at
         the framing fraction of the screen's vertical half-extent.
+
+        Args:
+            framing_radius: Maximum distance from center to any framed particle.
+
+        Returns:
+            Camera distance in world units.
         """
         return framing_radius * self._inv_sin_effective_fov
 
     def _compute_framing_radius(self, positions: np.ndarray, center: np.ndarray) -> float:
-        """Maximum distance from center to any framed particle."""
+        """Maximum distance from center to any framed particle.
+
+        Args:
+            positions: (n_framed, 3) positions of the framed particles.
+            center: (3,) camera center point.
+
+        Returns:
+            Scalar radius encompassing all framed particles (minimum 1.0).
+        """
         distances = np.linalg.norm(positions - center, axis=1)
         if len(distances) == 0:
             return 1.0
@@ -373,6 +419,12 @@ class CameraController:
         `pan_deadzone_fraction` of the visible radius from screen center.
         Once it drifts outside, the camera moves exactly enough to place
         the target on the deadzone edge.
+
+        Args:
+            target_position: (3,) world-space position of the tracked point.
+
+        Returns:
+            (3,) updated smoothed camera center.
         """
         visible_radius = float(self._camera.distance) * self._tan_half_fov
         deadzone_radius = visible_radius * self._pan_deadzone_fraction
@@ -396,6 +448,10 @@ class CameraController:
         deterministically from the smoothed radius.  Free zoom disables
         automatic distance updates so the user can control zoom manually
         while center tracking continues.
+
+        Args:
+            center: (3,) world-space camera center position.
+            framing_radius: Raw (unsmoothed) radius encompassing framed particles.
         """
         self._camera.center = tuple(center)
 
@@ -408,7 +464,15 @@ class CameraController:
         self._camera.distance = self._ideal_distance(self._smoothed_framing_radius)
 
     def _find_target(self, positions: np.ndarray) -> np.ndarray | None:
-        """Return the target particle's position, or None if not active."""
+        """Return the target particle's position, or None if not active.
+
+        Args:
+            positions: (n_particles, 3) full-size position array (NaN for inactive).
+
+        Returns:
+            (3,) position of the target particle, or None if the target is
+            unset, out of range, or inactive this frame.
+        """
         if self._target_pid is None or len(self._pid_lookup) == 0:
             return None
         pid = int(self._target_pid)
@@ -432,6 +496,16 @@ class CameraController:
 
         When *use_deadzone* is False (rest-frame), locks directly on the
         tracking point.  Falls back to deadzone if no target is active.
+
+        Args:
+            positions: (n_particles, 3) full-size position array (NaN for inactive).
+            active_pos: (n_active, 3) positions of currently active particles.
+            mask: (n_particles,) bool — True where particle is active.
+            use_deadzone: If True, apply panning deadzone; if False, lock
+                directly on the tracking point.
+
+        Returns:
+            (center, framing_radius) tuple.
         """
         target_pos = self._find_target(positions)
 
@@ -466,6 +540,16 @@ class CameraController:
         Ramps in over ``_event_ramp_in`` seconds before the event and
         ramps out over ``_event_ramp_out`` seconds after.  At peak blend
         the zoom is tightened by ``_event_zoom_tighten``.
+
+        Args:
+            sim_time: Current simulation time.
+            base_center: (3,) camera center from the base tracking mode.
+            base_radius: Framing radius from the base tracking mode.
+            active_pos: (n_active, 3) positions of currently active particles.
+            mask: (n_particles,) bool — True where particle is active.
+
+        Returns:
+            (blended_center, blended_radius) tuple.
         """
         # Find the nearest event (before or after current time)
         best_event = None

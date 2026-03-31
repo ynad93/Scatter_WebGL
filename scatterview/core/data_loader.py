@@ -70,6 +70,17 @@ def load(filepath: str | Path, fmt: str | None = None, **kwargs) -> SimulationDa
 
 
 def _detect_format(filepath: Path) -> str:
+    """Infer data format from the file extension.
+
+    Args:
+        filepath: Path to the data file.
+
+    Returns:
+        Format string ('csv' or 'hdf5').
+
+    Raises:
+        ValueError: If the extension is not recognized.
+    """
     suffix = filepath.suffix.lower()
     format_map = {
         ".csv": "csv",
@@ -104,6 +115,18 @@ def load_csv(
     Optional columns: mass, vx, vy, vz.
 
     Handles particles that appear/disappear mid-simulation (null/NaN coordinates).
+
+    Args:
+        filepath: Path to the CSV file.
+        id_col: Column name for particle identifiers.
+        time_col: Column name for simulation time.
+        pos_cols: Column names for (x, y, z) position components.
+        vel_cols: Column names for (vx, vy, vz) velocity components, or None to skip.
+        mass_col: Column name for particle mass, or None to skip.
+        radius_col: Column name for particle radius, or None to skip.
+
+    Returns:
+        SimulationData with all fields populated.
     """
     df = pd.read_csv(filepath)
 
@@ -249,6 +272,13 @@ def _compute_valid_intervals(
 
     Returns a list of (t_start, t_end) tuples for each unbroken
     sequence of valid (non-null) timesteps.
+
+    Args:
+        times: (N,) array of simulation times for this particle's rows.
+        valid_mask: (N,) bool array — True where position data is finite.
+
+    Returns:
+        List of (t_start, t_end) tuples for each contiguous valid segment.
     """
     if not np.any(valid_mask):
         return []
@@ -278,7 +308,6 @@ def _compute_valid_intervals(
 def load_hdf5(
     filepath: Path,
     field_map: dict[str, str] | None = None,
-    snapshot_group_pattern: str = "snapshot_{:04d}",
 ) -> SimulationData:
     """Load simulation data from an HDF5 file.
 
@@ -287,12 +316,15 @@ def load_hdf5(
        (time, ID), columns include x, y, z and optionally vx, vy, vz,
        mass, k (startype), radius.
     2. Single-file with datasets: /times, /positions (N, T, 3), /ids (N,).
-    3. Snapshot groups: /snapshot_0000/positions (N, 3), etc.
+    3. Snapshot groups: any top-level group whose name starts with
+       "snapshot" or "snap_" is treated as a snapshot.  Groups are
+       sorted numerically by the digits in their name, so both
+       zero-padded (snapshot_0000) and unpadded (snap_0, snap_1, ...,
+       snap_102) names work correctly.
 
     Args:
         filepath: Path to the HDF5 file.
         field_map: Optional mapping from standard names to HDF5 dataset paths.
-        snapshot_group_pattern: Format string for snapshot group names.
     """
     import h5py
 
@@ -317,7 +349,7 @@ def load_hdf5(
         if fmap["positions"] in f:
             return _load_hdf5_single(f, fmap)
         else:
-            return _load_hdf5_snapshots(f, fmap, snapshot_group_pattern)
+            return _load_hdf5_snapshots(f, fmap)
 
 
 def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
@@ -336,6 +368,12 @@ def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
     Columns (detected flexibly):
         Required: x, y, z
         Optional: vx, vy, vz, mass, radius, k (BSE stellar type)
+
+    Args:
+        filepath: Path to the HDF5 file containing a pandas table.
+
+    Returns:
+        SimulationData with all fields populated.
     """
     df = pd.read_hdf(filepath)
 
@@ -453,7 +491,16 @@ def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
 
 
 def _load_hdf5_single(f, fmap: dict[str, str]) -> SimulationData:
-    """Load from a single HDF5 file with arrays: positions (N, T, 3), etc."""
+    """Load from a single HDF5 file with arrays: positions (N, T, 3), etc.
+
+    Args:
+        f: Open h5py.File handle.
+        fmap: Mapping from standard field names ('ids', 'times', 'positions',
+            'velocities', 'masses') to HDF5 dataset paths within the file.
+
+    Returns:
+        SimulationData with all fields populated.
+    """
     import h5py
 
     pos_data = f[fmap["positions"]][:]  # (N, T, 3)
@@ -502,9 +549,23 @@ def _load_hdf5_single(f, fmap: dict[str, str]) -> SimulationData:
     )
 
 
-def _load_hdf5_snapshots(f, fmap: dict[str, str], pattern: str) -> SimulationData:
-    """Load from snapshot groups: /snapshot_0000/, /snapshot_0001/, etc."""
-    # Find all snapshot groups
+def _load_hdf5_snapshots(f, fmap: dict[str, str]) -> SimulationData:
+    """Load from snapshot groups: /snapshot_0000/, /snap_0/, etc.
+
+    Detects any top-level group whose name starts with "snapshot" or
+    "snap_".  Groups are sorted numerically by the digits in their name,
+    so both zero-padded (snapshot_0000) and unpadded (snap_0, snap_102)
+    names work correctly.
+
+    Args:
+        f: Open h5py.File handle.
+        fmap: Mapping from standard field names to HDF5 dataset paths.
+
+    Returns:
+        SimulationData with all fields populated.
+    """
+    # Find all snapshot groups (any key starting with "snapshot" or "snap_"),
+    # sorted by the numeric value of the digits in the name.
     snap_groups = sorted(
         [k for k in f.keys() if k.startswith("snapshot") or k.startswith("snap_")],
         key=lambda k: int("".join(filter(str.isdigit, k)) or "0"),

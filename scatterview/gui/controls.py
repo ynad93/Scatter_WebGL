@@ -19,6 +19,12 @@ class ControlPanel:
     """
 
     def __init__(self, engine: RenderEngine, camera_controller: CameraController):
+        """Build the Qt control panel and attach it to the rendering engine.
+
+        Args:
+            engine: RenderEngine instance providing the VisPy canvas and API.
+            camera_controller: CameraController driving the main viewport camera.
+        """
         from PyQt6 import QtCore, QtGui, QtWidgets
 
         self._engine = engine
@@ -68,6 +74,14 @@ class ControlPanel:
         self._panel_layout.addStretch()
 
     def _add_section(self, title: str) -> "QtWidgets.QVBoxLayout":
+        """Add a labelled group box to the control panel.
+
+        Args:
+            title: Section header text.
+
+        Returns:
+            QVBoxLayout inside the new group box.
+        """
         from PyQt6 import QtWidgets
 
         group = QtWidgets.QGroupBox(title)
@@ -81,6 +95,22 @@ class ControlPanel:
         value: float, callback, steps: int = 100, tooltip: str = "",
         log: bool = False,
     ):
+        """Add a labelled slider with a numeric text box to a layout.
+
+        Args:
+            layout: Parent QLayout to add the slider row to.
+            label: Text label shown to the left of the slider.
+            min_val: Minimum real-valued bound.
+            max_val: Maximum real-valued bound.
+            value: Initial real value.
+            callback: Called with the new real value when the slider moves.
+            steps: Number of discrete slider positions (resolution).
+            tooltip: Hover tooltip text for the label and slider.
+            log: If True, slider maps logarithmically between min_val and max_val.
+
+        Returns:
+            The QSlider widget.
+        """
         from PyQt6 import QtCore, QtWidgets
 
         if log:
@@ -180,7 +210,11 @@ class ControlPanel:
 
 
     def _on_time_slider_changed(self, value: float) -> None:
-        """User dragged the time slider — update engine."""
+        """User dragged the time slider — update engine.
+
+        Args:
+            value: New simulation time from the slider.
+        """
         self._engine.sim_time = value
 
     def _sync_time_slider(self) -> None:
@@ -208,7 +242,11 @@ class ControlPanel:
 
 
     def _on_speed_change(self, speed: float) -> None:
-        """Update playback speed."""
+        """Update playback speed.
+
+        Args:
+            speed: New animation speed (fraction of sim duration per second).
+        """
         self._engine.set_speed(speed)
 
 
@@ -347,14 +385,30 @@ class ControlPanel:
     def _build_background_controls(self) -> None:
         from PyQt6 import QtWidgets
 
+        from .. import defaults as _D
+
         section = self._add_section("Background")
 
         # Star field toggle
         self._stars_cb = QtWidgets.QCheckBox("Show Stars")
+        self._stars_cb.setChecked(self._engine._stars_enabled)
         self._stars_cb.toggled.connect(self._on_stars_toggle)
         section.addWidget(self._stars_cb)
 
+        # Star shell distance
+        self._add_slider(
+            section, "Star Distance", 0.1, 100.0, _D.STAR_SHELL_FACTOR,
+            self._engine.set_star_shell_factor, log=True,
+            tooltip="Star shell radius as a multiple of the farthest\n"
+                    "particle distance. Larger values push stars further out.",
+        )
+
     def _on_stars_toggle(self, enabled: bool) -> None:
+        """Toggle star field visibility.
+
+        Args:
+            enabled: Whether to show background stars.
+        """
         self._engine.enable_stars(enabled)
 
     def _build_camera_controls(self) -> None:
@@ -403,6 +457,7 @@ class ControlPanel:
             lambda v: setattr(self._camera, "free_zoom", v)
         )
         self._camera._free_zoom_callbacks.append(self._on_free_zoom_changed)
+        self._engine._manual_mode_callbacks.append(self._on_forced_manual_mode)
         section.addWidget(self._free_zoom_cb)
 
         # Center mode: what point the camera centers on
@@ -512,6 +567,18 @@ class ControlPanel:
         section.addLayout(row)
 
     def _add_unit_combo(self, layout, label, choices, current, callback):
+        """Add a labelled combo box for unit selection.
+
+        Args:
+            layout: Parent QLayout to add the row to.
+            label: Text label shown to the left.
+            choices: List of unit strings to populate the combo box.
+            current: Initially selected unit string.
+            callback: Called with the new unit string when selection changes.
+
+        Returns:
+            The QComboBox widget.
+        """
         from PyQt6 import QtWidgets
 
         row = QtWidgets.QHBoxLayout()
@@ -526,16 +593,36 @@ class ControlPanel:
         return combo
 
     def _on_framing_fraction_change(self, value: float) -> None:
+        """Update the camera framing fraction and recompute FOV trig.
+
+        Args:
+            value: New framing fraction in [0, 1].
+        """
         self._camera._framing_fraction = value
         self._camera._cache_fov_trig()
 
     def _on_center_mode_change(self, text: str) -> None:
+        """Update camera center mode from the combo box selection.
+
+        Args:
+            text: Selected center mode name ("Target", "Group Centroid", or "Group CoM").
+        """
         use_group, mass_weighted = self._center_mode_names[text]
         self._camera.use_group_center = use_group
         self._camera.mass_weighted_center = mass_weighted
 
+    def _on_forced_manual_mode(self) -> None:
+        """Sync the mode combo box when arrow-key panning forces manual mode."""
+        self._mode_combo.blockSignals(True)
+        self._mode_combo.setCurrentText("Manual")
+        self._mode_combo.blockSignals(False)
+
     def _on_free_zoom_changed(self, value: bool) -> None:
-        """Sync checkbox and show/hide manual speed sliders when free zoom changes."""
+        """Sync checkbox and show/hide manual speed sliders when free zoom changes.
+
+        Args:
+            value: New free-zoom state from the CameraController callback.
+        """
         if self._free_zoom_cb.isChecked() != value:
             self._free_zoom_cb.blockSignals(True)
             self._free_zoom_cb.setChecked(value)
@@ -602,13 +689,26 @@ class ControlPanel:
         return combo
 
     def _on_camera_mode_change(self, text: str) -> None:
+        """Set the camera mode from the combo box selection.
+
+        Args:
+            text: Selected mode name ("Manual", "Tracking", or "Target (Rest)").
+        """
         from ..core.camera import CameraMode
 
         mode = self._mode_names.get(text, CameraMode.MANUAL)
         self._camera.mode = mode
 
     def _resolve_pid(self, text: str) -> int | None:
-        """Resolve a label string from a combo box to an integer particle ID."""
+        """Resolve a label string from a combo box to an integer particle ID.
+
+        Args:
+            text: Combo box text — either "None", a numeric ID string, or a
+                string label from id_labels.
+
+        Returns:
+            Integer particle ID, or None if text is "None" or unresolvable.
+        """
         if text == "None":
             return None
         labels = self._engine._data.id_labels
@@ -621,6 +721,11 @@ class ControlPanel:
             return None
 
     def _on_target_change(self, text: str) -> None:
+        """Set the main camera's target particle from the combo box.
+
+        Args:
+            text: Selected particle label or "None".
+        """
         from ..core.camera import CameraMode
 
         pid = self._resolve_pid(text)
@@ -695,6 +800,11 @@ class ControlPanel:
         section.addWidget(self._subview_rotate_cb)
 
     def _on_subview_toggle(self, enabled: bool) -> None:
+        """Enable or disable the picture-in-picture sub-view.
+
+        Args:
+            enabled: Whether to show the sub-view.
+        """
         if enabled:
             corner = self._corner_combo.currentText()
             self._engine.enable_subview(corner=corner)
@@ -705,6 +815,11 @@ class ControlPanel:
             self._engine.disable_subview()
 
     def _on_subview_mode_change(self, text: str) -> None:
+        """Set the sub-view camera mode.
+
+        Args:
+            text: Selected mode name from the combo box.
+        """
         ctrl = self._engine._subview_camera_controller
         if ctrl is None:
             return
@@ -713,21 +828,41 @@ class ControlPanel:
             ctrl.mode = mode
 
     def _on_subview_target_change(self, text: str) -> None:
+        """Set the sub-view camera's target particle.
+
+        Args:
+            text: Selected particle label or "None".
+        """
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.target_particle = self._resolve_pid(text)
 
     def _set_subview_pan_deadzone(self, value: float) -> None:
+        """Set the sub-view camera's panning deadzone fraction.
+
+        Args:
+            value: Deadzone fraction in [0, 1].
+        """
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl._pan_deadzone_fraction = value
 
     def _set_subview_n_framed(self, n: int) -> None:
+        """Set how many particles are framed in the sub-view.
+
+        Args:
+            n: Number of closest particles to frame.
+        """
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.n_framed = n
 
     def _on_subview_rotate_toggle(self, enabled: bool) -> None:
+        """Toggle auto-rotation on the sub-view camera.
+
+        Args:
+            enabled: Whether to enable auto-rotation.
+        """
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.auto_rotate = enabled

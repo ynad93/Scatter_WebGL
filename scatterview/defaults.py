@@ -7,8 +7,8 @@ this module rather than hardcoding their own values.
 import math
 
 # --- Animation ---
-ANIM_SPEED = 1.0 / 60.0       # fraction of total sim duration advanced per second
-                               # (1/60 ≈ 60-second full playback at 1x speed)
+ANIM_SPEED = 0.01              # fraction of total sim duration advanced per second
+                               # (0.01 ≈ 100-second full playback at 1x speed)
 
 # --- Appearance ---
 POINT_ALPHA = 1.0              # particle opacity (0 = invisible, 1 = opaque)
@@ -101,7 +101,16 @@ _C_CGS = 2.99792458e10        # cm s⁻¹
 
 def G_in_units(mass_unit: str = UNIT_MASS, dist_unit: str = UNIT_DISTANCE,
                time_unit: str = UNIT_TIME) -> float:
-    """Gravitational constant G in the given unit system."""
+    """Gravitational constant G in the given unit system.
+
+    Args:
+        mass_unit: Mass unit label (key into _MASS_TO_CGS).
+        dist_unit: Distance unit label (key into _DISTANCE_TO_CGS).
+        time_unit: Time unit label (key into _TIME_TO_CGS).
+
+    Returns:
+        G in the specified unit system.
+    """
     m = _MASS_TO_CGS[mass_unit]
     d = _DISTANCE_TO_CGS[dist_unit]
     t = _TIME_TO_CGS[time_unit]
@@ -110,7 +119,15 @@ def G_in_units(mass_unit: str = UNIT_MASS, dist_unit: str = UNIT_DISTANCE,
 
 def c_in_units(dist_unit: str = UNIT_DISTANCE,
                time_unit: str = UNIT_TIME) -> float:
-    """Speed of light c in the given unit system."""
+    """Speed of light c in the given unit system.
+
+    Args:
+        dist_unit: Distance unit label (key into _DISTANCE_TO_CGS).
+        time_unit: Time unit label (key into _TIME_TO_CGS).
+
+    Returns:
+        c in the specified unit system.
+    """
     d = _DISTANCE_TO_CGS[dist_unit]
     t = _TIME_TO_CGS[time_unit]
     return _C_CGS * t / d
@@ -130,6 +147,14 @@ def format_sim_time(t: float, unit: str | None = None, decimals: int = 2) -> str
 
     Uses scientific notation for values outside [0.01, 9999].
     Example: 3140000.0 with unit="yr" → "3.14 × 10⁶ yr"
+
+    Args:
+        t: Simulation time value to format.
+        unit: Unit label appended to the formatted string. Defaults to UNIT_TIME.
+        decimals: Number of decimal places in the mantissa.
+
+    Returns:
+        Human-readable time string with unit suffix.
     """
     unit = unit or UNIT_TIME
     if t == 0.0:
@@ -145,6 +170,6 @@ def format_sim_time(t: float, unit: str | None = None, decimals: int = 2) -> str
 
 # --- Star field ---
 STAR_COUNT = 8000              # background stars on the spherical shell
-STAR_SHELL_FACTOR = 1.5        # shell radius = factor × max particle distance
+STAR_SHELL_FACTOR = 2.0        # shell radius = factor × max particle distance
 STAR_SEED = 42                 # RNG seed for reproducibility
 STAR_BASE_SIZE = 1.5           # base marker size in pixels

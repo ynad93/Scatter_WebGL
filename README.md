@@ -55,6 +55,8 @@ engine.show()
 
 ## Data Format
 
+Format is auto-detected from the file extension (`.csv`, `.h5`, `.hdf5`), or forced with `--format` / `fmt=`.
+
 ### CSV
 
 The CSV must have columns:
@@ -63,15 +65,181 @@ The CSV must have columns:
 ID, time, x, y, z
 ```
 
-Optional columns: `vx, vy, vz` (velocities — enables CubicHermiteSpline for physically accurate orbital interpolation), `mass`, `radius`, `startype` (BSE stellar evolution code).
+Optional columns: `vx, vy, vz` (velocities — enables CubicHermiteSpline for physically accurate orbital interpolation), `mass`, `radius` (also detected as `r` or `rad`), `startype` (also `kstar` or `k` — BSE stellar evolution code).
 
-Each particle gets one row per timestep. Particles can appear/disappear mid-simulation (gaps are handled via per-segment splines). An example CSV is in `data/ScatterParts.csv`.
+Column names are case-insensitive. The time column also accepts `t` if `time` is not present.
+
+Each particle gets one row per timestep. Particles can appear/disappear mid-simulation — use empty cells or NaN for position columns at timesteps where a particle doesn't exist (gaps are handled via per-segment splines). An example CSV is in `data/ScatterParts.csv`.
 
 ### HDF5
 
-Two layouts are supported:
-- **Single-file**: datasets `times (T,)`, `positions (N, T, 3)`, `particle_ids (N,)`
-- **Snapshot groups**: groups named by snapshot index, each containing `positions (N, 3)`, `particle_ids (N,)`
+Three layouts are supported, tried in this order:
+
+#### 1. Multi-index DataFrame (pandas HDF5 table)
+
+The recommended format for N-body codes that already use pandas. Write your DataFrame with a two-level multi-index where level 0 is simulation time and level 1 is particle ID:
+
+```python
+import pandas as pd
+
+# df has columns: x, y, z, and optionally vx, vy, vz, mass, radius, k
+# index levels: (time, particle_id)
+df.index = pd.MultiIndex.from_arrays([times, ids], names=["time", "id"])
+df.to_hdf("simulation.h5", key="data")
+```
+
+**Required columns:** `x`, `y`, `z` (also accepts `r0/r1/r2` or `pos_x/pos_y/pos_z`)
+
+**Optional columns:**
+- `vx`, `vy`, `vz` (or `v0/v1/v2`, `vel_x/vel_y/vel_z`) — velocities for Hermite spline interpolation
+- `mass` (or `m`) — particle masses for mass-weighted center of mass
+- `radius` (or `rad`) — particle radii for size scaling
+- `k` (or `startype`, `kstar`, `stellar_type`) — BSE stellar type code (14 = black hole)
+
+Column names are detected case-insensitively. Particle IDs can be integers or strings (strings are mapped to integer keys internally; the original labels are preserved for GUI display).
+
+All bodies are assumed to share the same block timesteps. Per-particle data is extracted via `df.xs(pid, level=1)`, which reads directly from HDF5 without expanding the full table into memory.
+
+#### HDF5 structure primer
+
+An HDF5 file works like a filesystem. **Groups** are directories, **datasets** are files (numpy arrays on disk), and **attributes** are small metadata tags attached to any group or dataset. The root of the file is itself a group, `/`.
+
+Here is a 3-body simulation stored as snapshot groups (Layout 3) — each timestep gets its own directory:
+
+```
+simulation.h5                         <- the file (root group "/")
+├── snap_0/                           <- group (like a directory: mkdir snap_0)
+│   ├── positions                     <- dataset (like a file: a (3,3) numpy array)
+│   ├── ids                           <- dataset: [0, 1, 2]
+│   └── (time = 0.0)                  <- attribute (metadata tag on the group)
+├── snap_1/
+│   ├── positions                     <- same datasets, different timestep
+│   ├── ids
+│   └── (time = 0.5)
+└── snap_2/
+    ├── positions
+    ├── ids
+    └── (time = 1.0)
+```
+
+With `h5py`, groups behave like dicts — you access datasets and subgroups by string key, the same way you would navigate a directory tree:
+
+```python
+import h5py
+import numpy as np
+
+# --- Writing (creating the file above) ---
+with h5py.File("simulation.h5", "w") as f:
+    for i, t in enumerate([0.0, 0.5, 1.0]):
+        # Create a group (like mkdir snap_0/)
+        grp = f.create_group(f"snap_{i}")       # no zero-padding needed
+
+        # Create datasets inside it (like writing files into that directory)
+        grp.create_dataset("positions", data=positions_at_t[i])  # (N, 3)
+        grp.create_dataset("ids", data=np.array([0, 1, 2]))
+
+        # Attach an attribute (a metadata tag, not a dataset)
+        grp.attrs["time"] = t
+
+# --- Reading ---
+with h5py.File("simulation.h5", "r") as f:
+    # List keys at the root (like ls /)
+    print(list(f.keys()))
+    # ['snap_0', 'snap_1', 'snap_2']
+
+    # Navigate into a group by key (like cd snap_0/)
+    snap = f["snap_0"]                  # group object, acts like a dict
+
+    # Read a dataset inside it (like reading a file in that directory)
+    pos = snap["positions"][:]           # numpy array, shape (3, 3)
+
+    # Read an attribute on the group
+    t = snap.attrs["time"]               # 0.0
+
+    # List datasets inside a group (like ls snap_0/)
+    print(list(snap.keys()))             # ['positions', 'ids']
+```
+
+The three ScatterView layouts use this structure differently:
+- **Layout 1** (multi-index): pandas handles the HDF5 structure internally via `df.to_hdf()` — you don't create groups or datasets manually.
+- **Layout 2** (single-file): everything lives at the root as top-level datasets — no groups, like a flat directory with just files in `/`.
+- **Layout 3** (snapshots): each timestep is a group (subdirectory) containing that snapshot's datasets, as shown above.
+
+#### 2. Single-file arrays
+
+All data lives at the root level — no groups, just top-level datasets:
+
+```
+simulation.h5
+├── positions    (N, T, 3)   <- required
+├── ids          (N,)        <- optional, defaults to 0..N-1
+├── times        (T,)        <- optional, defaults to 0..T-1
+├── velocities   (N, T, 3)  <- optional
+└── masses       (N,) or (N, T)  <- optional
+```
+
+NaN positions mark timesteps where a particle doesn't exist.
+
+```python
+import h5py
+import numpy as np
+
+with h5py.File("simulation.h5", "w") as f:
+    f.create_dataset("positions", data=pos)    # (N, T, 3) float64
+    f.create_dataset("ids", data=ids)          # (N,) int
+    f.create_dataset("times", data=times)      # (T,) float64
+    f.create_dataset("velocities", data=vel)   # (N, T, 3) float64
+    f.create_dataset("masses", data=masses)    # (N,) or (N, T) float64
+```
+
+#### 3. Snapshot groups
+
+Each timestep lives in its own group (subdirectory). Any top-level group whose name starts with `snapshot` or `snap_` is treated as a snapshot. Groups are sorted numerically by the digits in their name, so both zero-padded (`snapshot_0000`, `snapshot_0001`) and unpadded (`snap_0`, `snap_1`, ..., `snap_102`) names work correctly.
+
+```
+simulation.h5
+├── snap_0/
+│   ├── positions   (N, 3)
+│   ├── ids         (N,)
+│   └── (time = 0.0)          <- attribute, or a "times" dataset
+├── snap_1/
+│   ├── positions   (N, 3)
+│   ├── ids         (N,)
+│   └── (time = 0.5)
+└── ...
+```
+
+Time for each snapshot is read from three sources, tried in order:
+1. A `times` dataset inside the group — `f["snap_0"]["times"]`
+2. A `time` attribute on the group — `f["snap_0"].attrs["time"]`
+3. The snapshot index (0, 1, 2, ...) as a last resort
+
+```python
+import h5py
+
+with h5py.File("simulation.h5", "w") as f:
+    for i, t in enumerate(timesteps):
+        grp = f.create_group(f"snap_{i}")              # no zero-padding needed
+        grp.create_dataset("positions", data=pos_at_t[i])  # (N, 3)
+        grp.create_dataset("ids", data=ids)                 # (N,)
+        grp.attrs["time"] = t                                # scalar
+```
+
+#### Custom dataset names
+
+For layouts 2 and 3, pass a `field_map` dict to remap dataset names if your file uses different keys:
+
+```python
+from scatterview.core.data_loader import load
+
+data = load("simulation.h5", field_map={
+    "positions": "coords",
+    "ids": "particle_ids",
+    "times": "t",
+    "velocities": "vel",
+    "masses": "m",
+})
+```
 
 ## Architecture
 

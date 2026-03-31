@@ -151,6 +151,14 @@ class RenderEngine:
         size: tuple[int, int] = (1280, 720),
         title: str = "ScatterView",
     ):
+        """Create the rendering engine.
+
+        Args:
+            data: Loaded simulation data (positions, times, masses, etc.).
+            interpolator: Pre-built TrajectoryInterpolator for spline evaluation.
+            size: Initial canvas size as (width, height) in pixels.
+            title: Window title string.
+        """
         from vispy import app, scene
 
         self._data = data
@@ -207,13 +215,15 @@ class RenderEngine:
         self._time_text = None  # VisPy Text visual, created in _build_visuals
 
         # Star field background
-        self._stars_enabled = False
+        self._stars_enabled = True
         self._star_visual = None
         self._star_directions = None   # (N, 3) float32 unit vectors, fixed
         self._star_positions = None    # (N, 3) float32 working buffer, scaled each frame
         self._star_base_sizes = None   # (N,) float32
         self._star_base_colors = None  # (N, 4) float32
-        self._star_min_shell_radius = 1.0  # minimum shell radius (system extent)
+        self._star_max_particle_dist = 1.0  # max distance any particle reaches from origin
+        self._star_shell_factor = D.STAR_SHELL_FACTOR
+        self._star_min_shell_radius = 1.0  # computed as max_dist * factor
 
         # Black hole rendering — pre-computed boolean array for vectorized lookup
         self._is_bh = np.zeros(n, dtype=bool)
@@ -283,9 +293,12 @@ class RenderEngine:
         self._canvas.events.key_press.connect(self._on_key_press)
         self._canvas.events.key_release.connect(self._on_key_release)
 
-        # Keyboard pan: track which keys are held for smooth continuous movement
+        # Keyboard pan/rotate: track which keys are held for smooth continuous movement
         self._pan_keys_held: set[str] = set()
         self._ctrl_held = False
+        self._alt_held = False
+        self._shift_held = False
+        self._manual_mode_callbacks: list = []  # called when arrow-key pan forces manual mode
 
         # Cached camera trig — computed once per frame in _update_frame,
         # reused by lighting and panning.  Physics spherical convention:
@@ -318,7 +331,11 @@ class RenderEngine:
 
     @staticmethod
     def _has_ctrl(event) -> bool:
-        """Check if Ctrl is held during a VisPy input event."""
+        """Check if Ctrl is held during a VisPy input event.
+
+        Args:
+            event: VisPy input event with a `modifiers` attribute.
+        """
         return any(m.name.lower() == 'control' for m in event.modifiers)
 
     def _on_mouse_wheel(self, event) -> None:
@@ -331,6 +348,9 @@ class RenderEngine:
         offset proportional to the zoom amount.
 
         Holding Ctrl multiplies zoom speed by 5x.
+
+        Args:
+            event: VisPy mouse wheel event with `delta` and `pos` attributes.
         """
         if self._camera_controller is not None and not self._camera_controller.free_zoom:
             self._camera_controller.free_zoom = True
@@ -386,7 +406,11 @@ class RenderEngine:
     _PAN_KEYS = {'W', 'Up', 'S', 'Down', 'A', 'Left', 'D', 'Right'}
 
     def _on_key_press(self, event) -> None:
-        """Track held keys for smooth continuous panning."""
+        """Track held keys for smooth continuous panning/rotation.
+
+        Args:
+            event: VisPy key press event with `key.name` attribute.
+        """
         key_name = event.key.name
         if key_name == 'Space':
             self.toggle_play()
@@ -394,48 +418,129 @@ class RenderEngine:
             return
         if key_name in self._PAN_KEYS:
             self._pan_keys_held.add(key_name)
-            # Enable free zoom so auto-framing doesn't fight the pan
-            if self._camera_controller is not None and not self._camera_controller.free_zoom:
-                self._camera_controller.free_zoom = True
+            # Switch to manual mode so auto-tracking doesn't fight the pan
+            if not self._alt_held and self._camera_controller is not None:
+                from ..core.camera import CameraMode
+                if self._camera_controller.mode != CameraMode.MANUAL:
+                    self._camera_controller.mode = CameraMode.MANUAL
+                    for cb in self._manual_mode_callbacks:
+                        cb()
+                if not self._camera_controller.free_zoom:
+                    self._camera_controller.free_zoom = True
         if key_name == 'Control':
             self._ctrl_held = True
+        if key_name == 'Alt':
+            self._alt_held = True
+        if key_name == 'Shift':
+            self._shift_held = True
 
     def _on_key_release(self, event) -> None:
-        """Stop panning when key is released."""
+        """Stop panning/rotation when key is released.
+
+        Args:
+            event: VisPy key release event with `key.name` attribute.
+        """
         key_name = event.key.name
         self._pan_keys_held.discard(key_name)
         if key_name == 'Control':
             self._ctrl_held = False
+        if key_name == 'Alt':
+            self._alt_held = False
+        if key_name == 'Shift':
+            self._shift_held = False
 
     def _apply_keyboard_pan(self) -> None:
-        """Apply smooth continuous panning from held keys.
+        """Apply smooth continuous panning and time scrubbing from held keys.
 
         Called each frame from _on_timer.  Pan speed is proportional to
         camera distance so it feels consistent at any zoom level.
-        Holding Ctrl multiplies speed by 5x.
+        Holding Ctrl multiplies speed by 5x.  Skipped when Alt is held
+        (arrow keys rotate instead).
+
+        Default:
+            Up/Down — move up/down (world Z)
+            Left/Right, A/D — move left/right
+            W/S — move forward/backward
+
+        Shift held:
+            Up/Down — move forward/backward
+            Left/Right — scrub time forward/backward
         """
-        if not self._pan_keys_held:
+        if not self._pan_keys_held or self._alt_held:
             return
 
         camera = self._view.camera
-        # Pan speed scales with camera distance so it feels consistent at any zoom
         speed = self._pan_speed * (5.0 if self._ctrl_held else 1.0)
         step = camera.distance * speed
 
         right, forward = self._camera_axes()
+        up = np.array([0.0, 0.0, 1.0])
 
         center = np.array(camera.center, dtype=np.float64)
+        time_step = 0.0
+
         for key_name in self._pan_keys_held:
-            if key_name in ('W', 'Up'):
+            if self._shift_held:
+                # Shift: Up/Down = forward/backward, Left/Right = time scrub
+                if key_name in ('Up',):
+                    center += forward * step
+                elif key_name in ('Down',):
+                    center -= forward * step
+                elif key_name in ('Left',):
+                    time_step -= 1.0
+                elif key_name in ('Right',):
+                    time_step += 1.0
+            else:
+                # Default: Up/Down = vertical, Left/Right = horizontal
+                if key_name in ('Up',):
+                    center += up * step
+                elif key_name in ('Down',):
+                    center -= up * step
+                elif key_name in ('Left',):
+                    center -= right * step
+                elif key_name in ('Right',):
+                    center += right * step
+
+            # WASD always pan (unaffected by Shift)
+            if key_name == 'W':
                 center += forward * step
-            elif key_name in ('S', 'Down'):
+            elif key_name == 'S':
                 center -= forward * step
-            elif key_name in ('A', 'Left'):
+            elif key_name == 'A':
                 center -= right * step
-            elif key_name in ('D', 'Right'):
+            elif key_name == 'D':
                 center += right * step
 
         camera.center = tuple(center)
+
+        if time_step != 0.0:
+            scrub_speed = self._anim_speed * (5.0 if self._ctrl_held else 1.0)
+            self._anim_time = max(0.0, min(1.0, self._anim_time + time_step * scrub_speed / 60.0))
+            self._current_sim_time = self._t_min + self._anim_time * self._time_range
+
+    _ROTATE_SPEED_DEG = 1.5  # degrees per frame for keyboard rotation
+
+    def _apply_keyboard_rotate(self) -> None:
+        """Apply smooth continuous orbit rotation from held arrow keys + Alt.
+
+        Called each frame from _on_timer.  Left/Right change azimuth,
+        Up/Down change elevation.  Holding Ctrl multiplies speed by 5x.
+        """
+        if not self._pan_keys_held or not self._alt_held:
+            return
+
+        camera = self._view.camera
+        speed = self._ROTATE_SPEED_DEG * (5.0 if self._ctrl_held else 1.0)
+
+        for key_name in self._pan_keys_held:
+            if key_name in ('A', 'Left'):
+                camera.azimuth -= speed
+            elif key_name in ('D', 'Right'):
+                camera.azimuth += speed
+            elif key_name in ('W', 'Up'):
+                camera.elevation = min(90.0, camera.elevation + speed)
+            elif key_name in ('S', 'Down'):
+                camera.elevation = max(-90.0, camera.elevation - speed)
 
     # ------------------------------------------------------------------
     # Sizing
@@ -484,6 +589,14 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _default_colors(self, n: int) -> np.ndarray:
+        """Generate a default RGBA color palette cycling through 8 distinct colors.
+
+        Args:
+            n: Number of particles to assign colors to.
+
+        Returns:
+            (n, 4) float32 RGBA array.
+        """
         base = np.array([
             [1.0, 0.3, 0.3, 1.0], [0.3, 0.6, 1.0, 1.0],
             [0.3, 1.0, 0.3, 1.0], [1.0, 0.8, 0.2, 1.0],
@@ -520,7 +633,8 @@ class RenderEngine:
                 d = np.linalg.norm(pos[finite], axis=1).max()
                 if d > max_dist:
                     max_dist = d
-        self._star_min_shell_radius = max(max_dist * D.STAR_SHELL_FACTOR, 1.0)
+        self._star_max_particle_dist = max_dist
+        self._star_min_shell_radius = max(max_dist * self._star_shell_factor, 1.0)
 
 
         # Sizes: power-law — many dim, few bright
@@ -592,8 +706,10 @@ class RenderEngine:
         self._particle_visual.set_data(pos=active_pos, **attrs)
         self._update_trails(self._data.times[0], positions, mask)
 
-        # Pre-generate star field data (created lazily when toggled on)
+        # Generate star field and create visual if enabled by default
         self._generate_star_field()
+        if self._stars_enabled:
+            self.enable_stars(True)
 
         # Time overlay — attached to the canvas root so it stays fixed on screen
         self._time_text = scene.visuals.Text(
@@ -647,6 +763,13 @@ class RenderEngine:
 
     def _update_trails(self, time: float, positions: np.ndarray,
                        mask: np.ndarray) -> None:
+        """Extract visible trail windows and upload geometry to VisPy.
+
+        Args:
+            time: Current simulation time.
+            positions: (n_particles, 3) full-size position array (NaN for inactive).
+            mask: (n_particles,) bool — True where particle is active.
+        """
         from vispy import scene
 
         # Trail window: [t_trail_start, time] covers trail_length_frac
@@ -842,6 +965,11 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _on_timer(self, event) -> None:
+        """Advance animation and render a frame.
+
+        Args:
+            event: VisPy timer event with `dt` attribute (seconds since last tick).
+        """
         if self._playing:
             dt = event.dt if hasattr(event, "dt") else 1.0 / 60.0
             self._anim_time += self._anim_speed * dt
@@ -851,6 +979,7 @@ class RenderEngine:
                 self._trail_ei[:] = -1
             self._current_sim_time = self._t_min + self._anim_time * self._time_range
         self._apply_keyboard_pan()
+        self._apply_keyboard_rotate()
         self._update_frame()
 
     def _update_light_direction(self) -> None:
@@ -956,24 +1085,52 @@ class RenderEngine:
             self.play()
 
     def set_speed(self, speed: float) -> None:
+        """Set playback speed.
+
+        Args:
+            speed: Fraction of total simulation duration advanced per real second.
+        """
         self._anim_speed = max(0.001, speed)
 
     def set_particle_color(self, pid: int, rgba: tuple[float, ...]) -> None:
+        """Set the color of a single particle.
+
+        Args:
+            pid: Integer particle ID.
+            rgba: (R, G, B, A) color tuple with values in [0, 1].
+        """
         idx = self._id_to_idx.get(pid)
         if idx is not None:
             self._colors[idx] = np.array(rgba, dtype=np.float32)
 
     def set_particle_size(self, pid: int, size: float) -> None:
+        """Set the per-particle size multiplier.
+
+        Args:
+            pid: Integer particle ID.
+            size: Scale factor relative to the base size (1.0 = default).
+        """
         idx = self._id_to_idx.get(pid)
         if idx is not None:
             self._per_particle_scale[idx] = size
             self._recompute_sizes()
 
     def set_radius_scale(self, scale: float) -> None:
+        """Set the global radius multiplier applied to all particles.
+
+        Args:
+            scale: Multiplier for particle sizes (clamped to >= 0.01).
+        """
         self._radius_scale = max(0.01, scale)
         self._recompute_sizes()
 
     def set_sizing_mode(self, absolute: bool) -> None:
+        """Switch between absolute (world-unit) and relative (pixel) sizing.
+
+        Args:
+            absolute: If True, particle sizes are in world units (same as x,y,z).
+                If False, sizes are in screen pixels.
+        """
         if absolute == self._sizing_absolute:
             return
         self._sizing_absolute = absolute
@@ -981,30 +1138,61 @@ class RenderEngine:
         self._rebuild_particle_visual()
 
     def set_depth_scaling(self, enabled: bool) -> None:
+        """Toggle perspective depth scaling on particle markers.
+
+        Args:
+            enabled: If True, closer particles appear larger (perspective projection).
+        """
         if enabled == self._depth_scaling:
             return
         self._depth_scaling = enabled
         self._rebuild_particle_visual()
 
     def set_black_hole(self, pid: int, is_bh: bool = True) -> None:
+        """Mark or unmark a particle as a black hole for special rendering.
+
+        Args:
+            pid: Integer particle ID.
+            is_bh: If True, render with black-hole styling (dark face, colored edge ring).
+        """
         idx = self._id_to_idx.get(pid)
         if idx is not None:
             self._is_bh[idx] = is_bh
 
     def set_trail_length(self, frac: float) -> None:
+        """Set trail length as a fraction of total simulation time.
+
+        Args:
+            frac: Fraction in [0, 1]. E.g. 0.01 = 1% of the simulation shown as trail.
+        """
         self._trail_length_frac = np.clip(frac, 0.0, 1.0)
         # Reset two-pointer cache — trail window bounds changed
         self._trail_si[:] = -1
         self._trail_ei[:] = -1
 
     def set_trail_alpha(self, alpha: float) -> None:
+        """Set peak trail opacity at the head (newest point).
+
+        Args:
+            alpha: Opacity in [0, 1]. Trails fade from 0 at the tail to this value.
+        """
         self._trail_alpha = np.clip(alpha, 0.0, 1.0)
 
     def set_trail_width(self, width: float) -> None:
+        """Set trail line width.
+
+        Args:
+            width: Line width in pixels (clamped to >= 0.5).
+        """
         self._trail_width = max(0.5, width)
 
 
     def set_point_alpha(self, alpha: float) -> None:
+        """Set particle marker opacity.
+
+        Args:
+            alpha: Opacity in [0, 1]. 0 = invisible, 1 = fully opaque.
+        """
         self._point_alpha = np.clip(alpha, 0.0, 1.0)
         if self._particle_visual is not None:
             self._particle_visual.alpha = self._point_alpha
@@ -1016,7 +1204,11 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def set_units(self, time_unit: str | None = None) -> None:
-        """Update the time unit label for the overlay."""
+        """Update the time unit label for the overlay.
+
+        Args:
+            time_unit: Time unit string (e.g. "yr", "Myr"). No-op if None.
+        """
         if time_unit:
             self._time_unit = time_unit
 
@@ -1025,22 +1217,42 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def set_time_display(self, enabled: bool) -> None:
+        """Show or hide the on-screen time overlay.
+
+        Args:
+            enabled: If True, the simulation time is drawn on the canvas.
+        """
         self._time_display_enabled = enabled
         if self._time_text is not None:
             self._time_text.visible = enabled
 
     def set_time_font_size(self, size: float) -> None:
+        """Set the font size of the time overlay.
+
+        Args:
+            size: Font size in points.
+        """
         self._time_font_size = size
         if self._time_text is not None:
             self._time_text.font_size = size
 
     def set_time_color(self, color) -> None:
+        """Set the color of the time overlay text.
+
+        Args:
+            color: Any VisPy-compatible color (RGBA tuple, color name, etc.).
+        """
         self._time_color = color
         if self._time_text is not None:
             self._time_text.color = color
 
     def set_time_anchor(self, anchor: str) -> None:
-        """Set time overlay position: top-left, top-right, bottom-left, bottom-right."""
+        """Set time overlay position.
+
+        Args:
+            anchor: Corner name — "top-left", "top-right", "bottom-left",
+                or "bottom-right".
+        """
         self._time_anchor = anchor
         self._reposition_time_text()
 
@@ -1064,6 +1276,11 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def enable_stars(self, enabled: bool = True) -> None:
+        """Toggle the background star field.
+
+        Args:
+            enabled: If True, show a spherical shell of background stars.
+        """
         from vispy import scene
 
         self._stars_enabled = enabled
@@ -1085,7 +1302,24 @@ class RenderEngine:
         if self._star_visual is not None:
             self._star_visual.visible = enabled
 
+    def set_star_shell_factor(self, factor: float) -> None:
+        """Set the star field shell radius as a multiple of the max particle distance.
+
+        Args:
+            factor: Multiplier applied to the maximum particle distance from the
+                origin. Larger values push stars further out.
+        """
+        self._star_shell_factor = max(0.1, factor)
+        self._star_min_shell_radius = max(
+            self._star_max_particle_dist * self._star_shell_factor, 1.0,
+        )
+
     def set_camera_controller(self, controller) -> None:
+        """Attach a CameraController and initialize its framing.
+
+        Args:
+            controller: CameraController instance to drive the VisPy camera.
+        """
         self._camera_controller = controller
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
         if not mask.any():
@@ -1099,6 +1333,13 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def enable_subview(self, corner: str = "bottom-right", size_frac: float = 0.3) -> None:
+        """Create and show a picture-in-picture sub-view.
+
+        Args:
+            corner: Screen corner for placement — "bottom-right", "bottom-left",
+                "top-right", or "top-left".
+            size_frac: Fraction of main canvas size for the sub-view (0 to 1).
+        """
         from vispy import scene
 
         if self._subview_canvas is not None:
@@ -1172,6 +1413,12 @@ class RenderEngine:
         app.run()
 
     def screenshot(self, filepath: str | Path, size: tuple[int, int] | None = None) -> None:
+        """Save the current frame as a PNG image.
+
+        Args:
+            filepath: Output file path.
+            size: Render resolution as (width, height). Uses canvas size if None.
+        """
         from vispy import io
         img = self._canvas.render(size=size)
         io.write_png(str(filepath), img)
@@ -1182,6 +1429,18 @@ class RenderEngine:
         t_start: float | None = None, t_end: float | None = None,
         progress_callback: callable | None = None,
     ) -> None:
+        """Render the simulation to a video file.
+
+        Args:
+            filepath: Output file path (.mp4 or .gif).
+            duration: Video duration in real-time seconds.
+            fps: Frames per second.
+            size: Render resolution as (width, height). Uses canvas size if None.
+            t_start: Simulation start time. Uses data start if None.
+            t_end: Simulation end time. Uses data end if None.
+            progress_callback: Called as callback(current_frame, total_frames).
+                If it raises InterruptedError, rendering is cancelled.
+        """
         import av
 
         t0 = t_start if t_start is not None else self._t_min
