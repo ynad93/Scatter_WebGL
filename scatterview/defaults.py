@@ -47,13 +47,13 @@ LIGHT_COLOR = "white"
 LIGHT_POSITION = (-0.5, -0.3, 1.0)  # world-space direction, upper-left offset from camera
 
 # --- Window ---
-WINDOW_WIDTH = 1280
-WINDOW_HEIGHT = 720
+WINDOW_WIDTH = 1920
+WINDOW_HEIGHT = 1080
 SUBVIEW_FOV = 60
 
 # --- Video export ---
 VIDEO_DURATION = 10.0          # default export duration in seconds
-VIDEO_FPS = 30                 # default export frame rate
+VIDEO_FPS = 60                 # default export frame rate
 
 # --- Trail refinement ---
 REFINE_ANGLE_DEG = 3.0         # maximum chord angle (degrees) between consecutive

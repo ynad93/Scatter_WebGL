@@ -31,6 +31,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Data format (auto-detected from extension if not specified)",
     )
     parser.add_argument(
+        "--key",
+        type=str,
+        default=None,
+        help="HDF5 key holding the phase-space data. Required when the file "
+             "contains multiple pandas datasets or nests data under a group.",
+    )
+    parser.add_argument(
         "--output", "-o",
         type=str,
         default=None,
@@ -113,7 +120,10 @@ def main(argv: list[str] | None = None) -> None:
     from .core.data_loader import load
 
     print(f"Loading {args.datafile}...")
-    data = load(args.datafile, fmt=args.format)
+    load_kwargs = {}
+    if args.key is not None:
+        load_kwargs["key"] = args.key
+    data = load(args.datafile, fmt=args.format, **load_kwargs)
     print(
         f"Loaded {len(data.particle_ids)} particles, "
         f"{len(data.times)} timesteps "

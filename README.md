@@ -29,6 +29,20 @@ Dependencies: `numpy`, `scipy`, `vispy`, `PyQt6`, `numba`. Optional: `imageio[py
 
 ### Command line
 
+Loading an HDF5 file (layout auto-detected — see [Data Format](#data-format)):
+
+```bash
+python -m scatterview simulation.h5
+```
+
+If the file contains multiple pandas datasets or nests the data under a non-root group, pass `--key` to point at it:
+
+```bash
+python -m scatterview simulation.h5 --key simulation
+```
+
+Loading a CSV file:
+
 ```bash
 python -m scatterview data/ScatterParts.csv
 ```
@@ -38,6 +52,44 @@ Or with options:
 ```bash
 python -m scatterview simulation.csv --camera auto-frame --trail-length 0.01 --width 1920 --height 1080
 ```
+
+#### Arguments
+
+Positional:
+
+- `datafile` — Path to the simulation data file (CSV or HDF5). Format is inferred from the extension unless `--format` overrides it.
+
+Data loading:
+
+- `--format`, `-f` `{csv,hdf5}` — Force the data format. Default: auto-detected from the file extension (`.csv` → csv; `.h5`/`.hdf5` → hdf5).
+- `--key KEY` — HDF5 key (group or pandas dataset name) holding the phase-space data. Use this when the file contains multiple pandas datasets or nests the data under a non-root group. Without it, the loader assumes the chosen layout lives at the top level and raises a `ValueError` otherwise. CSV files ignore this flag. Default: `None`.
+
+Output:
+
+- `--output`, `-o` `PATH` — If set, ScatterView runs in batch mode and writes to `PATH` instead of launching the GUI. A `.png` suffix saves a single screenshot; any other extension is rendered as a video (MP4 recommended, delegated to `imageio`/`pyav`). Default: `None` (interactive GUI).
+- `--duration FLOAT` — Video duration in seconds (ignored for `.png` output and interactive mode). Default: `10.0`.
+- `--fps INT` — Video frames per second (ignored for `.png` and interactive mode). Default: `60`.
+- `--width INT` — Window/render width in pixels. Applies to both interactive viewer and batch output. Default: `1920`.
+- `--height INT` — Window/render height in pixels. Default: `1080`.
+
+Camera:
+
+- `--camera {manual,tracking,event-track}` — Initial camera mode. `manual` = full user control, `tracking` = deadzone comoving tracking of the `--target` particle (or group COM if none), `event-track` = tracking with automatic retargeting onto detected close encounters. Default: `tracking`.
+- `--target INT` — Particle ID to track when using a tracking camera mode. Must exist in the data file. Default: `None` (camera frames the whole cluster / core group instead).
+
+Trails:
+
+- `--trail-length FLOAT` — Trail length as a fraction of the total simulation time range (0 = no trail, 1 = trail spans the entire run). Default: `0.005`.
+
+Analysis:
+
+- `--detect-events` — Run the close-encounter event detector on load and print detected events to the terminal. Does not alter rendering. Default: off.
+
+Units (affect axis labels, HUD readouts, and unit conversions — they do **not** rescale or reinterpret the numerical values in your data file, which the loader always takes at face value):
+
+- `--mass-unit {Msun,kg,g}` — Mass unit of the input data. Default: `Msun`.
+- `--distance-unit {AU,pc,kpc,Mpc,Rsun,km,m,cm}` — Distance unit of the input data. Default: `AU`.
+- `--time-unit {yr,Myr,Gyr,kyr,s}` — Time unit of the input data. Default: `yr`.
 
 ### From Python
 

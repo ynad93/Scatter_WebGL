@@ -307,6 +307,7 @@ def _compute_valid_intervals(
 
 def load_hdf5(
     filepath: Path,
+    key: str | None = None,
     field_map: dict[str, str] | None = None,
 ) -> SimulationData:
     """Load simulation data from an HDF5 file.
@@ -322,17 +323,33 @@ def load_hdf5(
        zero-padded (snapshot_0000) and unpadded (snap_0, snap_1, ...,
        snap_102) names work correctly.
 
+    By default the loader assumes the chosen layout begins at the top
+    level of the file.  If ``key`` is given, that key is treated as the
+    effective root: pandas reads use ``pd.read_hdf(..., key=key)``, and
+    raw-h5py layouts look for ``positions`` / ``snapshot*`` groups inside
+    the ``key`` group.  If no layout matches, the loader raises a
+    ``ValueError`` rather than silently returning empty data.
+
     Args:
         filepath: Path to the HDF5 file.
+        key: Optional HDF5 key identifying the group (or pandas dataset)
+            that holds the phase-space data.  Required when the file
+            contains multiple pandas datasets or nests the data under a
+            non-root group.
         field_map: Optional mapping from standard names to HDF5 dataset paths.
     """
     import h5py
 
-    # Try multi-index DataFrame first (pandas HDF5 table format)
+    # Try multi-index DataFrame first (pandas HDF5 table format).
+    # If the user passed a key, trust it — let pandas errors propagate.
+    # If not, a failure here just means this file isn't a pandas table;
+    # fall through to the raw-h5py layouts.
     try:
-        return _load_hdf5_multiindex(filepath)
-    except (KeyError, ValueError, TypeError, ImportError):
-        pass
+        return _load_hdf5_multiindex(filepath, key=key)
+    except (KeyError, ValueError, TypeError, ImportError) as pandas_err:
+        if key is not None:
+            raise
+        pandas_error = pandas_err
 
     default_field_map = {
         "ids": "ids",
@@ -348,13 +365,31 @@ def load_hdf5(
     fmap = default_field_map
 
     with h5py.File(filepath, "r") as f:
-        if fmap["positions"] in f:
-            return _load_hdf5_single(f, fmap)
-        else:
-            return _load_hdf5_snapshots(f, fmap)
+        root = f[key] if key is not None else f
+
+        if fmap["positions"] in root:
+            return _load_hdf5_single(root, fmap)
+
+        snap_groups = [
+            k for k in root.keys()
+            if k.startswith("snapshot") or k.startswith("snap_")
+        ]
+        if snap_groups:
+            return _load_hdf5_snapshots(root, fmap)
+
+        where = f"key {key!r}" if key is not None else "the top level"
+        raise ValueError(
+            f"HDF5 file '{filepath}' has no recognized ScatterView layout at "
+            f"{where}. Expected one of:\n"
+            f"  1. A pandas multi-index DataFrame (pass key= to select among "
+            f"multiple datasets)\n"
+            f"  2. A '{fmap['positions']}' dataset\n"
+            f"  3. Groups named 'snapshot*' or 'snap_*'\n"
+            f"Pandas load error was: {pandas_error}"
+        )
 
 
-def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
+def _load_hdf5_multiindex(filepath: Path, key: str | None = None) -> SimulationData:
     """Load from a pandas HDF5 table with multi-index (time, ID).
 
     Expected format: DataFrame written with ``df.to_hdf(path, key=...)``
@@ -377,7 +412,7 @@ def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
     Returns:
         SimulationData with all fields populated.
     """
-    df = pd.read_hdf(filepath)
+    df = pd.read_hdf(filepath) if key is None else pd.read_hdf(filepath, key=key)
 
     if not isinstance(df.index, pd.MultiIndex) or df.index.nlevels < 2:
         raise ValueError("HDF5 file does not contain a multi-index DataFrame")
