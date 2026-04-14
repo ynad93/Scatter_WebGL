@@ -75,31 +75,6 @@ Each particle gets one row per timestep. Particles can appear/disappear mid-simu
 
 Three layouts are supported, tried in this order:
 
-#### 1. Multi-index DataFrame (pandas HDF5 table)
-
-The recommended format for N-body codes that already use pandas. Write your DataFrame with a two-level multi-index where level 0 is simulation time and level 1 is particle ID:
-
-```python
-import pandas as pd
-
-# df has columns: x, y, z, and optionally vx, vy, vz, mass, radius, k
-# index levels: (time, particle_id)
-df.index = pd.MultiIndex.from_arrays([times, ids], names=["time", "id"])
-df.to_hdf("simulation.h5", key="data")
-```
-
-**Required columns:** `x`, `y`, `z` (also accepts `r0/r1/r2` or `pos_x/pos_y/pos_z`)
-
-**Optional columns:**
-- `vx`, `vy`, `vz` (or `v0/v1/v2`, `vel_x/vel_y/vel_z`) — velocities for Hermite spline interpolation
-- `mass` (or `m`) — particle masses for mass-weighted center of mass
-- `radius` (or `rad`) — particle radii for size scaling
-- `k` (or `startype`, `kstar`, `stellar_type`) — BSE stellar type code (14 = black hole)
-
-Column names are detected case-insensitively. Particle IDs can be integers or strings (strings are mapped to integer keys internally; the original labels are preserved for GUI display).
-
-All bodies are assumed to share the same block timesteps. Per-particle data is extracted via `df.xs(pid, level=1)`, which reads directly from HDF5 without expanding the full table into memory.
-
 #### HDF5 structure primer
 
 An HDF5 file works like a filesystem. **Groups** are directories, **datasets** are files (numpy arrays on disk), and **attributes** are small metadata tags attached to any group or dataset. The root of the file is itself a group, `/`.
@@ -165,31 +140,113 @@ The three ScatterView layouts use this structure differently:
 - **Layout 2** (single-file): everything lives at the root as top-level datasets — no groups, like a flat directory with just files in `/`.
 - **Layout 3** (snapshots): each timestep is a group (subdirectory) containing that snapshot's datasets, as shown above.
 
-#### 2. Single-file arrays
+#### 1. Multi-index DataFrame (pandas HDF5 table)
 
-All data lives at the root level — no groups, just top-level datasets:
+The recommended format for N-body codes that already use pandas. Build a DataFrame whose rows are indexed by `(time, particle_id)` and whose columns are the per-particle quantities at that timestep:
+
+```
+DataFrame contents (what you build in pandas):
+
+                  mass*  radius*    x      y      z      vx     vy     vz
+time   id
+0.0    0           1.0    0.05    1.00   0.00   0.00    0.00   0.50   0.00
+       1           1.0    0.05   -1.00   0.00   0.00    0.00  -0.50   0.00
+       2           0.5    0.03    0.00   1.00   0.00    0.50   0.00   0.00
+0.5    0           1.0    0.05    1.00   0.25   0.00    0.00   0.50   0.00
+       1           1.0    0.05   -1.00  -0.25   0.00    0.00  -0.50   0.00
+       2           0.5    0.03    0.25   1.00   0.00    0.50   0.00   0.00
+1.0    0           ...
+
+* mass and radius are OPTIONAL — omit either or both columns if you don't have them.
+  (vx/vy/vz are also optional; without them, ScatterView falls back to a non-Hermite spline.)
+```
+
+Logically, the file looks like a single snapshot group whose contents are indexed first by time and then by particle id (compare with Layout 3, where each timestep is its own top-level group):
 
 ```
 simulation.h5
-├── positions    (N, T, 3)   <- required
-├── ids          (N,)        <- optional, defaults to 0..N-1
-├── times        (T,)        <- optional, defaults to 0..T-1
-├── velocities   (N, T, 3)  <- optional
-└── masses       (N,) or (N, T)  <- optional
+└── data/                                       <- one group (the key= argument)
+    ├── time = 0.0
+    │   ├── id 0:  mass*, radius*, x, y, z, vx, vy, vz
+    │   ├── id 1:  mass*, radius*, x, y, z, vx, vy, vz
+    │   └── id 2:  mass*, radius*, x, y, z, vx, vy, vz
+    ├── time = 0.5
+    │   ├── id 0:  mass*, radius*, x, y, z, vx, vy, vz
+    │   ├── id 1:  mass*, radius*, x, y, z, vx, vy, vz
+    │   └── id 2:  mass*, radius*, x, y, z, vx, vy, vz
+    └── time = 1.0
+        └── ...
 ```
 
-NaN positions mark timesteps where a particle doesn't exist.
+Hand the whole DataFrame to `df.to_hdf()` in one call — pandas serializes the multi-index and columns into the `data/` group for you. You do not create subgroups or datasets yourself:
+
+```python
+import pandas as pd
+
+# df has columns: x, y, z, and optionally vx, vy, vz, mass, radius, k
+# index levels: (time, particle_id)
+df.index = pd.MultiIndex.from_arrays([times, ids], names=["time", "id"])
+df.to_hdf("simulation.h5", key="data")
+```
+
+**Required columns:** `x`, `y`, `z` (also accepts `r0/r1/r2` or `pos_x/pos_y/pos_z`)
+
+**Optional columns:**
+- `vx`, `vy`, `vz` (or `v0/v1/v2`, `vel_x/vel_y/vel_z`) — velocities for Hermite spline interpolation
+- `mass` (or `m`) — particle masses for mass-weighted center of mass
+- `radius` (or `rad`) — particle radii for size scaling
+- `k` (or `startype`, `kstar`, `stellar_type`) — BSE stellar type code (14 = black hole)
+
+Column names are detected case-insensitively. Particle IDs can be integers or strings (strings are mapped to integer keys internally; the original labels are preserved for GUI display).
+
+Per-particle data is extracted via `df.xs(pid, level=1)`, which reads directly from HDF5 without expanding the full table into memory.
+
+**Particles appearing or disappearing mid-simulation:** two equivalent ways to mark a particle as absent at a given timestep:
+- **Omit the `(time, pid)` row entirely** from the multi-index — cheaper on disk.
+- **Keep the row, but write `NaN` into the position columns** — explicit, easier to inspect.
+
+The loader treats both identically: it reindexes each particle against the global time axis (the union of all times appearing in the index) and any row that is missing or has non-finite positions is recorded as a gap in `valid_intervals`. The spline is then split into separate segments around each gap, so trajectories never interpolate through regions where the particle didn't exist.
+
+#### 2. Single-file arrays
+
+Every quantity is stored in its **own top-level dataset** (an HDF5 dataset is the n-dimensional array on disk; groups are the directory-like containers — Layout 2 has no groups, just datasets sitting directly under the root `/`):
+
+```
+simulation.h5
+├── positions    (N, T, 3)        <- required
+├── ids          (N,)              <- optional in principle, but see note below
+├── times        (T,)              <- optional, defaults to 0..T-1
+├── velocities   (N, T, 3)        <- optional
+├── masses       (N,) or (N, T)   <- optional
+├── radii        (N,)              <- optional, one scalar per particle
+└── startypes    (N,)              <- optional, BSE stellar-type code per particle
+```
+
+**Row alignment is the contract that makes trajectories reconstructable.** The leading `N` axis of every per-particle dataset (`positions`, `velocities`, `masses` when 2D, `radii`, `startypes`) is indexed in the **same order** as `ids`. That is:
+
+```
+positions[i, t, :]  ==  position of particle ids[i] at time times[t]
+velocities[i, t, :] ==  velocity of particle ids[i] at time times[t]
+masses[i] (or masses[i, t]) ==  mass of particle ids[i]
+radii[i]            ==  radius of particle ids[i]
+startypes[i]        ==  BSE stellar-type code of particle ids[i]
+```
+
+Without `ids`, the rows are still aligned across datasets, but particles are anonymous (referred to internally as `0..N-1`) — fine if you don't care about labeling, fatal if you need to cross-reference a specific particle in your downstream analysis. Whatever order you write `ids` in is the order the loader will use; rows are not re-sorted.
+
+NaN positions mark timesteps where a particle doesn't exist (Layout 2 supports disappearing particles natively — the loader masks NaN rows per particle and computes valid intervals from them).
 
 ```python
 import h5py
-import numpy as np
 
 with h5py.File("simulation.h5", "w") as f:
-    f.create_dataset("positions", data=pos)    # (N, T, 3) float64
-    f.create_dataset("ids", data=ids)          # (N,) int
-    f.create_dataset("times", data=times)      # (T,) float64
-    f.create_dataset("velocities", data=vel)   # (N, T, 3) float64
-    f.create_dataset("masses", data=masses)    # (N,) or (N, T) float64
+    f.create_dataset("positions",  data=pos)       # (N, T, 3) float64
+    f.create_dataset("ids",        data=ids)       # (N,) int — defines row order
+    f.create_dataset("times",      data=times)     # (T,) float64
+    f.create_dataset("velocities", data=vel)       # (N, T, 3) float64
+    f.create_dataset("masses",     data=masses)    # (N,) or (N, T) float64
+    f.create_dataset("radii",      data=radii)     # (N,) float64
+    f.create_dataset("startypes",  data=startypes) # (N,) int — BSE stellar type
 ```
 
 #### 3. Snapshot groups
@@ -199,20 +256,28 @@ Each timestep lives in its own group (subdirectory). Any top-level group whose n
 ```
 simulation.h5
 ├── snap_0/
-│   ├── positions   (N, 3)
-│   ├── ids         (N,)
-│   └── (time = 0.0)          <- attribute, or a "times" dataset
+│   ├── positions    (N, 3)
+│   ├── ids          (N,)
+│   ├── velocities   (N, 3)        <- optional
+│   ├── masses       (N,) or scalar <- optional
+│   ├── radii        (N,)           <- optional
+│   ├── startypes    (N,)           <- optional, BSE stellar-type code
+│   └── (time = 0.0)               <- attribute, or a "times" dataset
 ├── snap_1/
-│   ├── positions   (N, 3)
-│   ├── ids         (N,)
-│   └── (time = 0.5)
+│   ├── positions    (N, 3)
+│   ├── ids          (N,)
+│   └── ...
 └── ...
 ```
+
+Within each snapshot group, every per-particle dataset (`positions`, `velocities`, `masses`, `radii`, `startypes`) is row-aligned to that snapshot's own `ids`. Different snapshots can carry different particle sets — the loader uses each snapshot's `ids` to look up the canonical particle index, so particles can appear and disappear over time.
 
 Time for each snapshot is read from three sources, tried in order:
 1. A `times` dataset inside the group — `f["snap_0"]["times"]`
 2. A `time` attribute on the group — `f["snap_0"].attrs["time"]`
 3. The snapshot index (0, 1, 2, ...) as a last resort
+
+`radii` and `startypes` are treated as static per-particle properties even though they live inside each snapshot: the loader collapses them to one scalar per particle by recording the **first value** it encounters as it walks snapshots in time order. Subsequent appearances of the same particle's radius/startype are ignored, so it's fine (and natural) to write the same value into every snapshot.
 
 ```python
 import h5py
@@ -220,9 +285,13 @@ import h5py
 with h5py.File("simulation.h5", "w") as f:
     for i, t in enumerate(timesteps):
         grp = f.create_group(f"snap_{i}")              # no zero-padding needed
-        grp.create_dataset("positions", data=pos_at_t[i])  # (N, 3)
-        grp.create_dataset("ids", data=ids)                 # (N,)
-        grp.attrs["time"] = t                                # scalar
+        grp.create_dataset("positions",  data=pos_at_t[i])   # (N, 3)
+        grp.create_dataset("ids",        data=ids)            # (N,)
+        grp.create_dataset("velocities", data=vel_at_t[i])   # (N, 3)
+        grp.create_dataset("masses",     data=masses)         # (N,) or scalar
+        grp.create_dataset("radii",      data=radii)          # (N,) float64
+        grp.create_dataset("startypes",  data=startypes)      # (N,) int
+        grp.attrs["time"] = t                                  # scalar
 ```
 
 #### Custom dataset names
@@ -238,6 +307,8 @@ data = load("simulation.h5", field_map={
     "times": "t",
     "velocities": "vel",
     "masses": "m",
+    "radii": "rad",
+    "startypes": "kstar",
 })
 ```
 
