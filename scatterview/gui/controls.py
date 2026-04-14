@@ -421,6 +421,15 @@ class ControlPanel:
         self._absolute_cb.toggled.connect(self._engine.set_sizing_mode)
         section.addWidget(self._absolute_cb)
 
+        # Equal sizes toggle
+        self._equal_cb = QtWidgets.QCheckBox("Equal Sizes")
+        self._equal_cb.setToolTip(
+            "Render every body at the same size, ignoring per-particle radii."
+        )
+        self._equal_cb.setChecked(self._engine._equal_sizes)
+        self._equal_cb.toggled.connect(self._engine.set_equal_sizes)
+        section.addWidget(self._equal_cb)
+
         # Depth scaling toggle (uses VisPy's native perspective scaling)
         self._depth_cb = QtWidgets.QCheckBox("Depth Scaling")
         self._depth_cb.setToolTip(

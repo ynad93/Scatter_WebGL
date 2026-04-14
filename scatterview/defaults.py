@@ -16,9 +16,10 @@ TRAIL_ALPHA = 0.6              # peak trail opacity (at the head / newest point)
 TRAIL_LENGTH_FRAC = 0.005      # trail window as fraction of total simulation time
 
 # --- Particle sizing ---
-RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode (screen pixels)
-RELATIVE_SIZE_MAX_PX = 20.0    # largest particle in relative mode (screen pixels)
-DEFAULT_SIZE_PX = 10.0         # uniform size when no radii are provided
+RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode (screen pixels);
+                               # other particles scale up proportionally to cbrt(radius)
+DEFAULT_SIZE_PX = 10.0         # uniform size when no radii are provided, and the
+                               # per-particle pixel size used by the "Equal Sizes" toggle
 DEPTH_SCALING = False          # if True, closer particles appear larger (perspective)
 
 # --- Camera ---

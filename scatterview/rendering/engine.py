@@ -186,6 +186,7 @@ class RenderEngine:
         n = len(data.particle_ids)
         self._colors = self._default_colors(n)
         self._sizing_absolute = False
+        self._equal_sizes = False
         self._radius_scale = 1.0
         self._per_particle_scale = np.ones(n, dtype=np.float32)
         self._depth_scaling = D.DEPTH_SCALING
@@ -559,17 +560,16 @@ class RenderEngine:
     def _compute_relative_base_sizes(self) -> np.ndarray:
         """Map particle radii to screen-pixel sizes.
 
-        Cube root compresses the dynamic range (proportional to volume^(1/3)),
-        then linearly maps [0, max] → [MIN_PX, MAX_PX].
+        Cube root compresses the dynamic range (proportional to volume^(1/3)).
+        The smallest particle is pinned to MIN_PX; larger particles scale up
+        proportionally with no upper cap, so true mass ratios show through.
         """
         n = len(self._data.particle_ids)
         if self._raw_radii is not None:
             compressed = np.cbrt(self._raw_radii)
-            max_c = compressed.max()
-            if max_c > 0:
-                normalized = compressed / max_c
-                rng = D.RELATIVE_SIZE_MAX_PX - D.RELATIVE_SIZE_MIN_PX
-                return (D.RELATIVE_SIZE_MIN_PX + normalized * rng).astype(np.float32)
+            min_c = compressed[compressed > 0].min() if np.any(compressed > 0) else 0.0
+            if min_c > 0:
+                return (compressed / min_c * D.RELATIVE_SIZE_MIN_PX).astype(np.float32)
         return np.full(n, D.DEFAULT_SIZE_PX, dtype=np.float32)
 
     def _compute_absolute_base_sizes(self) -> np.ndarray:
@@ -591,7 +591,12 @@ class RenderEngine:
         return np.full(n, 2.0 * default_r, dtype=np.float32)
 
     def _recompute_sizes(self) -> None:
-        base = self._base_sizes_absolute if self._sizing_absolute else self._base_sizes_relative
+        if self._equal_sizes:
+            n = len(self._base_sizes_relative)
+            uniform = self._base_sizes_absolute.mean() if self._sizing_absolute else D.DEFAULT_SIZE_PX
+            base = np.full(n, uniform, dtype=np.float32)
+        else:
+            base = self._base_sizes_absolute if self._sizing_absolute else self._base_sizes_relative
         self._sizes = base * self._radius_scale * self._per_particle_scale
 
     # ------------------------------------------------------------------
@@ -1153,6 +1158,13 @@ class RenderEngine:
         self._sizing_absolute = absolute
         self._recompute_sizes()
         self._rebuild_particle_visual()
+
+    def set_equal_sizes(self, enabled: bool) -> None:
+        """Toggle uniform sizing: when enabled, every particle renders at the same size."""
+        if enabled == self._equal_sizes:
+            return
+        self._equal_sizes = enabled
+        self._recompute_sizes()
 
     def set_depth_scaling(self, enabled: bool) -> None:
         """Toggle perspective depth scaling on particle markers.
