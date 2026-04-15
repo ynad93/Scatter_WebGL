@@ -456,20 +456,6 @@ python profile_engine.py [datafile] [--frames N] [--warmup N]
 
 Reports per-component timing breakdown, cProfile stats, and trail cache statistics.
 
-## Performance
-
-Benchmarked with 101 particles, 24,393 timesteps:
-
-| Component | Time per frame |
-|-----------|---------------|
-| `evaluate_batch` (spline eval) | 0.20 ms |
-| `update_trails` (window + assembly) | 0.40 ms |
-| `get_particle_attrs` (colors/sizes) | 0.03 ms |
-| **Total CPU** | **0.63 ms** |
-| GPU render (VisPy) | ~5–8 ms |
-
-Trail precomputation: ~1s for 101 particles, 5M refined points (60 MB). Parallelizable via `n_workers` parameter.
-
 ## License
 
 See [LICENSE](LICENSE).

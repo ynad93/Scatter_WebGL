@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from pathlib import Path
 
@@ -190,6 +191,10 @@ class RenderEngine:
         self._radius_scale = 1.0
         self._per_particle_scale = np.ones(n, dtype=np.float32)
         self._depth_scaling = D.DEPTH_SCALING
+        self._subview_depth_scaling = False
+        self._subview_lock_orientation = True
+        self._subview_lock_last_az: float | None = None
+        self._subview_lock_last_el: float | None = None
 
         if data.radii is not None:
             self._raw_radii = np.array(
@@ -255,8 +260,9 @@ class RenderEngine:
         self._subview_trail_line = None
         self._subview_star_visual = None
         self._subview_layout = None
+        self._subview_size_frac = 0.3
+        self._subview_pip_margin = 10
         self._subview_radius_scale = 1.0
-        self._subview_trail_alpha = D.TRAIL_ALPHA
 
         # Visuals
         self._particle_visual = None
@@ -285,9 +291,9 @@ class RenderEngine:
         self._trail_prev_time = -np.inf
 
         # Trail alpha gradient: maps time fraction (0=oldest, 1=newest) to
-        # opacity via a linear curve.  Trails fade from transparent at
-        # the tail to opaque at the head.
-        self._alpha_lut = np.linspace(0, 1, 1024, dtype=np.float32)
+        # opacity via a quadratic curve (t**2).  The tail fades off
+        # aggressively so only the most recent motion reads strongly.
+        self._alpha_lut = np.linspace(0, 1, 1024, dtype=np.float32) ** 2
 
         self._build_visuals()
 
@@ -299,6 +305,7 @@ class RenderEngine:
         self._canvas.events.mouse_wheel.connect(self._on_mouse_wheel)
         self._canvas.events.key_press.connect(self._on_key_press)
         self._canvas.events.key_release.connect(self._on_key_release)
+        self._canvas.events.resize.connect(self._on_canvas_resize)
 
         # Keyboard pan/rotate: track which keys are held for smooth continuous movement
         self._pan_keys_held: set[str] = set()
@@ -346,69 +353,80 @@ class RenderEngine:
         return any(m.name.lower() == 'control' for m in event.modifiers)
 
     def _on_mouse_wheel(self, event) -> None:
-        """Zoom toward the mouse cursor position.
+        """Zoom the view under the cursor (main or sub-view).
 
-        Shifts the camera center toward the world-space point under the
-        cursor as it zooms in (like Google Maps).  The cursor offset
-        from screen center is converted to world units using the camera
-        distance and field of view, then the center is nudged by that
-        offset proportional to the zoom amount.
+        Dispatches to the sub-view when the cursor is inside its rect,
+        otherwise to the main view.  Each view toggles its own
+        controller's ``free_zoom`` so the two settings are independent.
 
         Holding Ctrl multiplies zoom speed by 5x.
 
         Args:
             event: VisPy mouse wheel event with `delta` and `pos` attributes.
         """
-        if self._camera_controller is not None and not self._camera_controller.free_zoom:
-            self._camera_controller.free_zoom = True
-
-        camera = self._view.camera
-
         scroll = event.delta[1]
         if scroll == 0:
             return
 
+        if self._cursor_in_subview(event.pos):
+            view = self._subview
+            controller = self._subview_camera_controller
+        else:
+            view = self._view
+            controller = self._camera_controller
+
+        if controller is not None and not controller.free_zoom:
+            controller.free_zoom = True
+
+        self._zoom_view(view, event, scroll)
+        event.handled = True
+
+    def _cursor_in_subview(self, pos) -> bool:
+        """Return True if ``pos`` is inside the sub-view's on-canvas rect."""
+        if not self._subview_enabled or self._subview is None or pos is None:
+            return False
+        sx, sy = self._subview.pos
+        sw, sh = self._subview.size
+        x, y = pos[0], pos[1]
+        return sx <= x < sx + sw and sy <= y < sy + sh
+
+    def _zoom_view(self, view, event, scroll) -> None:
+        camera = view.camera
         speed = self._zoom_speed * (5.0 if self._has_ctrl(event) else 1.0)
         # 1.1^(-scroll*speed): scroll up → zoom_factor < 1 → closer
         zoom_factor = 1.1 ** (-scroll * speed)
 
-        # Shift center toward cursor: convert the cursor's pixel offset
-        # from screen center into world-space displacement at the focal
-        # plane (the plane through camera.center).
+        # Shift center toward cursor (view-local coords, not canvas coords).
         mouse_pos = event.pos
-        canvas_size = self._canvas.size
-        if mouse_pos is not None:
-            # Cursor offset from screen center, in pixels
-            cursor_offset_x = mouse_pos[0] - canvas_size[0] / 2
-            cursor_offset_y = mouse_pos[1] - canvas_size[1] / 2
+        view_size = view.size
+        if mouse_pos is not None and view_size[0] and view_size[1]:
+            vx, vy = view.pos
+            local_x = mouse_pos[0] - vx
+            local_y = mouse_pos[1] - vy
+            cursor_offset_x = local_x - view_size[0] / 2
+            cursor_offset_y = local_y - view_size[1] / 2
 
-            # Convert pixels to world units: at the focal plane, the
-            # visible half-height is distance * tan(fov/2).  Pixel scale
-            # is (visible height) / (screen height).
             fov_rad = math.radians(camera.fov / 2)
-            world_per_pixel = 2.0 * camera.distance * math.tan(fov_rad) / canvas_size[1]
+            world_per_pixel = 2.0 * camera.distance * math.tan(fov_rad) / view_size[1]
 
-            # World-space offset in camera-relative coordinates
             dx_screen = cursor_offset_x * world_per_pixel
             dy_screen = -cursor_offset_y * world_per_pixel  # screen Y is flipped
 
-            # Rotate screen offset into world coordinates
-            self._cache_camera_trig()
-            right, _ = self._camera_axes()
-            up = np.array([0.0, 0.0, 1.0])
+            # Rotate screen offset into world coordinates using *this*
+            # camera's azimuth/elevation (not the main view's cached trig).
+            az = math.radians(camera.azimuth)
+            el = math.radians(camera.elevation)
+            sin_az, cos_az = math.sin(az), math.cos(az)
+            sin_el, cos_el = math.sin(el), math.cos(el)
+            right = np.array([cos_az, sin_az, 0.0])
+            up = np.array([-sin_az * sin_el, cos_az * sin_el, cos_el])
 
             center = np.array(camera.center, dtype=np.float64)
-            world_offset = right * dx_screen + up * dy_screen
-
-            # Shift center toward cursor proportional to zoom amount:
-            # zoom_factor < 1 (zooming in) → positive shift toward cursor
-            # zoom_factor > 1 (zooming out) → negative shift away
-            center += world_offset * (1.0 - zoom_factor)
+            center += (right * dx_screen + up * dy_screen) * (1.0 - zoom_factor)
             camera.center = tuple(center)
 
         camera.distance *= zoom_factor
         camera.view_changed()
-        event.handled = True
 
     _PAN_KEYS = {'W', 'Up', 'S', 'Down', 'A', 'Left', 'D', 'Right'}
 
@@ -702,6 +720,11 @@ class RenderEngine:
             return "scene"
         return "visual" if self._depth_scaling else "fixed"
 
+    def _resolve_subview_scaling_mode(self):
+        if self._sizing_absolute:
+            return "scene"
+        return "visual" if self._subview_depth_scaling else False
+
     # ------------------------------------------------------------------
     # Visual construction
     # ------------------------------------------------------------------
@@ -941,22 +964,16 @@ class RenderEngine:
                 antialias=True, connect="strip",
             )
 
-        # Sub-view: pass the same trail arrays with sub-view appearance
+        # Sub-view: share the main view's trail colors directly.
         if self._subview_enabled and self._subview is not None:
-            if self._subview_trail_alpha != self._trail_alpha:
-                sub_colors = combined_colors.copy()
-                alpha_ratio = self._subview_trail_alpha / max(self._trail_alpha, 1e-6)
-                sub_colors[:, 3] *= alpha_ratio
-            else:
-                sub_colors = combined_colors
             if self._subview_trail_line is not None:
                 self._subview_trail_line.set_data(
-                    pos=combined_pos, color=sub_colors,
+                    pos=combined_pos, color=combined_colors,
                 )
                 self._subview_trail_line.visible = True
             else:
                 self._subview_trail_line = scene.Line(
-                    pos=combined_pos, color=sub_colors,
+                    pos=combined_pos, color=combined_colors,
                     parent=self._subview.scene, width=1,
                     antialias=True, connect="strip",
                 )
@@ -1039,6 +1056,8 @@ class RenderEngine:
             self._camera_controller.update(self._current_sim_time, positions, mask)
         if self._subview_camera_controller is not None and self._subview_enabled:
             self._subview_camera_controller.update(self._current_sim_time, positions, mask)
+            if self._subview_lock_orientation and self._subview is not None:
+                self._sync_subview_orientation()
 
         if self._particle_visual is not None:
             self._particle_visual.set_data(pos=active_pos, **attrs)
@@ -1158,6 +1177,8 @@ class RenderEngine:
         self._sizing_absolute = absolute
         self._recompute_sizes()
         self._rebuild_particle_visual()
+        if self._subview_markers is not None:
+            self._subview_markers.scaling = self._resolve_subview_scaling_mode()
 
     def set_equal_sizes(self, enabled: bool) -> None:
         """Toggle uniform sizing: when enabled, every particle renders at the same size."""
@@ -1176,6 +1197,61 @@ class RenderEngine:
             return
         self._depth_scaling = enabled
         self._rebuild_particle_visual()
+
+    def set_subview_depth_scaling(self, enabled: bool) -> None:
+        """Toggle perspective depth scaling on sub-view markers.
+
+        Absolute sizing always uses scene-space scaling in the sub-view,
+        so the depth toggle is a no-op while Absolute Sizes is on.
+        """
+        self._subview_depth_scaling = enabled
+        if self._subview_markers is not None:
+            self._subview_markers.scaling = self._resolve_subview_scaling_mode()
+
+    def set_subview_lock_orientation(self, enabled: bool) -> None:
+        """Bi-directionally link main and sub-view azimuth/elevation."""
+        self._subview_lock_orientation = enabled
+        # Re-seed the cache so the first post-toggle frame treats both
+        # cameras as already in sync (avoids a spurious snap).
+        self._subview_lock_last_az = None
+        self._subview_lock_last_el = None
+
+    def _sync_subview_orientation(self) -> None:
+        """Mirror rotations between the main and sub-view cameras.
+
+        Whichever camera moved since the last sync wins; the other
+        is updated to match.  Handles user drags on either view as
+        well as auto-rotate on either controller.
+        """
+        main_cam = self._view.camera
+        sub_cam = self._subview.camera
+        main_az, main_el = main_cam.azimuth, main_cam.elevation
+        sub_az, sub_el = sub_cam.azimuth, sub_cam.elevation
+
+        last_az = self._subview_lock_last_az
+        last_el = self._subview_lock_last_el
+        if last_az is None or last_el is None:
+            # First sync: adopt the main view's orientation as the truth.
+            target_az, target_el = main_az, main_el
+        else:
+            main_moved = (main_az != last_az) or (main_el != last_el)
+            sub_moved = (sub_az != last_az) or (sub_el != last_el)
+            if main_moved:
+                target_az, target_el = main_az, main_el
+            elif sub_moved:
+                target_az, target_el = sub_az, sub_el
+            else:
+                target_az, target_el = main_az, main_el
+
+        if (main_az, main_el) != (target_az, target_el):
+            main_cam.azimuth = target_az
+            main_cam.elevation = target_el
+        if (sub_az, sub_el) != (target_az, target_el):
+            sub_cam.azimuth = target_az
+            sub_cam.elevation = target_el
+
+        self._subview_lock_last_az = target_az
+        self._subview_lock_last_el = target_el
 
     def set_black_hole(self, pid: int, is_bh: bool = True) -> None:
         """Mark or unmark a particle as a black hole for special rendering.
@@ -1375,6 +1451,34 @@ class RenderEngine:
     # Sub-view
     # ------------------------------------------------------------------
 
+    def _recompute_pip_geometry(self) -> None:
+        """Recompute PiP sub-view pos/size from current canvas size.
+
+        No-op when the sub-view is disabled or in Split mode.  Called on
+        canvas resize and before offscreen renders at a different size,
+        so the PiP corner stays anchored and proportional.
+        """
+        if (self._subview is None
+                or self._subview_layout is None
+                or self._subview_layout.startswith("Split")):
+            return
+        w, h = self._canvas.size
+        sw = int(w * self._subview_size_frac)
+        sh = int(h * self._subview_size_frac)
+        margin = self._subview_pip_margin
+        pip_corners = {
+            "PiP Bottom-Right": (w - sw - margin, h - sh - margin),
+            "PiP Bottom-Left": (margin, h - sh - margin),
+            "PiP Top-Right": (w - sw - margin, margin),
+            "PiP Top-Left": (margin, margin),
+        }
+        sx, sy = pip_corners.get(self._subview_layout, pip_corners["PiP Bottom-Right"])
+        self._subview.pos = (sx, sy)
+        self._subview.size = (sw, sh)
+
+    def _on_canvas_resize(self, event) -> None:
+        self._recompute_pip_geometry()
+
     def enable_subview(self, layout: str = "PiP Bottom-Right", size_frac: float = 0.3) -> None:
         """Create a sub-view on the same canvas.
 
@@ -1394,21 +1498,8 @@ class RenderEngine:
         if self._subview is not None:
             return
 
-        w, h = self._canvas.size
         self._subview_layout = layout
-
-        # PiP needs explicit position; split uses the grid layout
-        sx, sy = 0, 0
-        if not layout.startswith("Split"):
-            sw, sh = int(w * size_frac), int(h * size_frac)
-            margin = 10
-            pip_corners = {
-                "PiP Bottom-Right": (w - sw - margin, h - sh - margin),
-                "PiP Bottom-Left": (margin, h - sh - margin),
-                "PiP Top-Right": (w - sw - margin, margin),
-                "PiP Top-Left": (margin, margin),
-            }
-            sx, sy = pip_corners.get(layout, pip_corners["PiP Bottom-Right"])
+        self._subview_size_frac = size_frac
 
         # Create sub-view: grid cell for split, overlay for PiP
         if layout.startswith("Split"):
@@ -1418,11 +1509,10 @@ class RenderEngine:
                 self._subview = self._grid.add_view(row=1, col=0)
         else:
             self._subview = self._canvas.central_widget.add_view()
-            self._subview.pos = (sx, sy)
-            self._subview.size = (sw, sh)
+            self._recompute_pip_geometry()
 
         self._subview.camera = scene.cameras.TurntableCamera(
-            fov=D.SUBVIEW_FOV, distance=10.0,
+            fov=D.CAMERA_FOV, distance=10.0,
         )
         self._subview.border_color = (1.0, 1.0, 1.0, 0.6)
 
@@ -1438,7 +1528,8 @@ class RenderEngine:
         attrs = self._get_particle_attrs(mask)
 
         self._subview_markers = scene.Markers(
-            spherical=True, light_color=D.LIGHT_COLOR,
+            spherical=True, scaling=self._resolve_subview_scaling_mode(),
+            light_color=D.LIGHT_COLOR,
             light_position=D.LIGHT_POSITION, light_ambient=D.LIGHT_AMBIENT,
             parent=self._subview.scene,
         )
@@ -1504,6 +1595,52 @@ class RenderEngine:
         self._timer.start()
         app.run()
 
+    @contextlib.contextmanager
+    def _canvas_resized_to(self, size: tuple[int, int] | None):
+        """Temporarily spoof the canvas's reported size for offscreen renders.
+
+        Works around vispy's ``canvas.render(size=...)`` only mapping
+        ``canvas.size`` onto a fraction of the larger FBO (content lands in the
+        lower-left quadrant).  Inside the context, the backend reports the
+        requested size as both logical and physical size and the central widget
+        is resized so child views (including the PiP sub-view) lay out against
+        the render resolution.  The real Qt widget is untouched.
+        """
+        if size is None or tuple(size) == tuple(self._canvas.size):
+            yield
+            return
+
+        backend = self._canvas._backend
+        orig_physical = backend._physical_size
+        orig_cw_size = self._canvas._central_widget.size
+
+        backend._vispy_get_size = lambda: tuple(size)
+        backend._physical_size = tuple(size)
+        self._canvas._central_widget.size = tuple(size)
+        self._recompute_pip_geometry()
+        # Force each camera to recompute its projection for the render aspect
+        # ratio.  The viewbox resize event does this automatically, but we
+        # trigger it explicitly so the first rendered frame is already framed
+        # for the render size rather than the GUI aspect.
+        self._view.camera.view_changed()
+        if self._subview is not None and self._subview.camera is not None:
+            self._subview.camera.view_changed()
+        try:
+            yield
+        finally:
+            del backend._vispy_get_size
+            backend._physical_size = orig_physical
+            self._canvas._central_widget.size = orig_cw_size
+            self._recompute_pip_geometry()
+            self._view.camera.view_changed()
+            if self._subview is not None and self._subview.camera is not None:
+                self._subview.camera.view_changed()
+
+    def _render_at(self, size: tuple[int, int] | None):
+        """Render the canvas at an arbitrary size (see ``_canvas_resized_to``)."""
+        with self._canvas_resized_to(size):
+            return self._canvas.render(size=size)
+
     def screenshot(self, filepath: str | Path, size: tuple[int, int] | None = None) -> None:
         """Save the current frame as a PNG image.
 
@@ -1512,7 +1649,7 @@ class RenderEngine:
             size: Render resolution as (width, height). Uses canvas size if None.
         """
         from vispy import io
-        img = self._canvas.render(size=size)
+        img = self._render_at(size)
         io.write_png(str(filepath), img)
 
     def render_video(
@@ -1520,8 +1657,14 @@ class RenderEngine:
         fps: int = D.VIDEO_FPS, size: tuple[int, int] | None = None,
         t_start: float | None = None, t_end: float | None = None,
         progress_callback: callable | None = None,
+        codec: str = "libx264",
+        codec_options: dict | None = None,
     ) -> None:
         """Render the simulation to a video file.
+
+        Rendering runs on the calling thread (it owns the GL context);
+        encoding and muxing run on a worker thread fed by a 1-frame queue,
+        so GPU readback overlaps with CPU (or GPU) encoding.
 
         Args:
             filepath: Output file path (.mp4 or .gif).
@@ -1532,49 +1675,111 @@ class RenderEngine:
             t_end: Simulation end time. Uses data end if None.
             progress_callback: Called as callback(current_frame, total_frames).
                 If it raises InterruptedError, rendering is cancelled.
+            codec: ffmpeg codec name, e.g. "libx264", "h264_nvenc", "hevc_nvenc".
+            codec_options: ffmpeg stream options dict (preset, crf/cq, rc, ...).
         """
         import av
+        import queue
+        import threading
 
         t0 = t_start if t_start is not None else self._t_min
         t1 = t_end if t_end is not None else self._t_max
         n_frames = int(duration * fps)
         frame_sim_times = np.linspace(t0, t1, n_frames)
         filepath = Path(filepath)
-        render_size = size or self._canvas.size
+        render_size = tuple(size) if size is not None else tuple(self._canvas.size)
 
         container = av.open(str(filepath), mode="w")
-        stream = None
 
+        frame_q: queue.Queue = queue.Queue(maxsize=1)
+        worker_error: list[BaseException] = []
+
+        def _make_stream(first_img):
+            h, w = first_img.shape[:2]
+            requested = codec
+            try:
+                s = container.add_stream(requested, rate=fps)
+            except (av.FFmpegError, ValueError) as exc:
+                if requested != "libx264":
+                    print(f"[render_video] codec {requested!r} init failed "
+                          f"({exc}); falling back to libx264")
+                    s = container.add_stream("libx264", rate=fps)
+                    s.options = {"preset": "veryfast", "crf": "20"}
+                else:
+                    raise
+            else:
+                if codec_options:
+                    s.options = dict(codec_options)
+            s.width, s.height = w, h
+            # Encode directly in RGB (planar GBR) instead of going through
+            # YUV.  libx264 supports ``gbrp`` in the High 4:4:4 Predictive
+            # profile and skips the lossy RGB→YUV colour-matrix step entirely,
+            # so output colours match what the GUI draws pixel-for-pixel.
+            # NVENC codecs don't support gbrp — fall back to full-range YUV 4:4:4.
+            if s.codec.name == "libx264":
+                s.pix_fmt = "gbrp"
+            else:
+                s.pix_fmt = "yuv444p"
+                cc = s.codec_context
+                cc.color_range = av.video.reformatter.ColorRange.JPEG
+                cc.colorspace = av.video.reformatter.Colorspace.ITU709
+            return s
+
+        def _encoder_worker():
+            stream = None
+            try:
+                while True:
+                    img = frame_q.get()
+                    if img is None:
+                        break
+                    if stream is None:
+                        stream = _make_stream(img)
+                    vf = av.VideoFrame.from_ndarray(img[..., :3], format="rgb24")
+                    for packet in stream.encode(vf):
+                        container.mux(packet)
+                if stream is not None:
+                    for packet in stream.encode():
+                        container.mux(packet)
+            except BaseException as exc:  # propagate to main thread
+                worker_error.append(exc)
+                # Drain any further frames so producer doesn't block.
+                while True:
+                    try:
+                        if frame_q.get_nowait() is None:
+                            break
+                    except queue.Empty:
+                        break
+
+        worker = threading.Thread(target=_encoder_worker, daemon=True)
+        worker.start()
+
+        native = self._canvas.native
+        native.setUpdatesEnabled(False)
         try:
-            for i, t in enumerate(frame_sim_times):
-                self._current_sim_time = t
-                self._anim_time = (t - self._t_min) / self._time_range
-                self._update_frame()
+            with self._canvas_resized_to(render_size):
+                for i, t in enumerate(frame_sim_times):
+                    if worker_error:
+                        break
+                    self._current_sim_time = t
+                    self._anim_time = (t - self._t_min) / self._time_range
+                    self._update_frame()
 
-                img = self._canvas.render(size=render_size)
+                    img = self._canvas.render(size=render_size)
+                    frame_q.put(img)
 
-                # Create stream from actual rendered dimensions (first frame)
-                if stream is None:
-                    h, w = img.shape[:2]
-                    stream = container.add_stream("libx264", rate=fps)
-                    stream.width = w
-                    stream.height = h
-                    stream.pix_fmt = "yuv420p"
-
-                frame = av.VideoFrame.from_ndarray(img, format="rgba")
-                for packet in stream.encode(frame):
-                    container.mux(packet)
-
-                if progress_callback is not None:
-                    progress_callback(i + 1, n_frames)
-                elif (i + 1) % (n_frames // 10 or 1) == 0:
-                    print(f"Rendering: {(i + 1) / n_frames * 100:.0f}%")
-
-            # Flush encoder
-            for packet in stream.encode():
-                container.mux(packet)
+                    if progress_callback is not None:
+                        progress_callback(i + 1, n_frames)
+                    elif (i + 1) % (n_frames // 10 or 1) == 0:
+                        print(f"Rendering: {(i + 1) / n_frames * 100:.0f}%")
         finally:
+            # Signal the worker to flush and exit, then wait for it.
+            frame_q.put(None)
+            worker.join()
             container.close()
+            native.setUpdatesEnabled(True)
+
+        if worker_error:
+            raise worker_error[0]
 
         if progress_callback is None:
             print(f"Video saved to {filepath}")

@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .. import defaults as _D
+
 
 def render_video_headless(
     engine,
     filepath: str | Path,
-    duration: float = 10.0,
-    fps: int = 30,
-    size: tuple[int, int] = (2560, 1440),
+    duration: float = _D.VIDEO_DURATION,
+    fps: int = _D.VIDEO_FPS,
+    size: tuple[int, int] = (_D.VIDEO_WIDTH, _D.VIDEO_HEIGHT),
+    codec: str = "libx264",
+    codec_options: dict | None = None,
 ) -> None:
     """Render video without GUI (headless batch mode).
 
@@ -20,15 +24,20 @@ def render_video_headless(
         duration: Duration in seconds.
         fps: Frames per second.
         size: Render resolution (width, height).
+        codec: ffmpeg codec name (e.g. "libx264", "h264_nvenc").
+        codec_options: ffmpeg stream options dict.
     """
-    engine.render_video(filepath, duration=duration, fps=fps, size=size)
+    engine.render_video(
+        filepath, duration=duration, fps=fps, size=size,
+        codec=codec, codec_options=codec_options,
+    )
 
 
 def screenshot_headless(
     engine,
     filepath: str | Path,
     sim_time: float | None = None,
-    size: tuple[int, int] = (2560, 1440),
+    size: tuple[int, int] = (_D.VIDEO_WIDTH, _D.VIDEO_HEIGHT),
 ) -> None:
     """Take a screenshot without GUI.
 

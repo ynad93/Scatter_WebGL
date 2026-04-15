@@ -1,4 +1,4 @@
-name: moviemaking
+name: scatterview
 channels:
   - conda-forge
 dependencies:
