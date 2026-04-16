@@ -1352,6 +1352,41 @@ class RenderEngine:
         self._advance_sim_time()
         self._update_frame()
         self._render_passes()
+        self._record_fps()
+
+    # --- FPS diagnostic ----------------------------------------------
+    # Rolling average of actual delivered frame times.  Updates the
+    # top-level window title once per second so the GUI shows live FPS
+    # regardless of whether the wrapping QMainWindow overrode the
+    # canvas's own title.
+    _FPS_UPDATE_INTERVAL = 1.0  # seconds
+    def _record_fps(self) -> None:
+        import time as _time
+        now = _time.perf_counter()
+        if not hasattr(self, "_fps_frame_count"):
+            self._fps_frame_count = 0
+            self._fps_window_start = now
+            self._fps_title_base = None
+            return
+        self._fps_frame_count += 1
+        elapsed = now - self._fps_window_start
+        if elapsed < self._FPS_UPDATE_INTERVAL:
+            return
+        fps = self._fps_frame_count / elapsed
+        ms = 1000.0 * elapsed / max(self._fps_frame_count, 1)
+        self._fps_frame_count = 0
+        self._fps_window_start = now
+        # Push into the top-level Qt window title so ControlPanel's
+        # QMainWindow wrapping doesn't hide it.
+        try:
+            win = self._canvas_raw.window()
+            if self._fps_title_base is None:
+                self._fps_title_base = win.windowTitle() or "ScatterView"
+            win.setWindowTitle(
+                f"{self._fps_title_base}  —  {fps:4.1f} fps / {ms:4.1f} ms"
+            )
+        except Exception:
+            pass
 
     def _render_passes(self) -> None:
         """Issue main-view and optional sub-view render passes.
