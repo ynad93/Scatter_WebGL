@@ -391,15 +391,17 @@ class RenderEngine:
                         self._is_bh[idx] = True
 
         # --- Window & pygfx stack ---
-        # update_mode="continuous" drives draws up to max_fps from the
-        # canvas's own scheduler; we derive simulation dt from the
-        # wall-clock inside the draw callback so playback speed stays
-        # decoupled from render rate.  Keyboard pan/rotate and sim
-        # advancement also happen inside the callback.
-        # max_fps=120 lifts the throttle so 120 Hz / 144 Hz monitors see
-        # smoother motion; vsync still caps at the monitor refresh.
+        # update_mode="continuous" drives draws up to max_fps via the
+        # canvas's internal scheduler; wall-clock dt is derived inside
+        # the draw callback so playback stays independent of render rate.
+        #
+        # vsync=False: the WSLg/Wayland/X compositor does its own vsync,
+        # so enabling wgpu's vsync *on top* stacks a second present queue
+        # and visibly delays input-to-photon response.  Disabling wgpu's
+        # vsync drops that extra buffer; the compositor still prevents
+        # tearing.  max_fps caps CPU/GPU work at the display refresh rate.
         self._canvas_raw = QRenderCanvas(
-            size=size, title=title, update_mode="continuous", max_fps=120, vsync=True,
+            size=size, title=title, update_mode="continuous", max_fps=120, vsync=False,
         )
         self._canvas = _CanvasAdapter(self._canvas_raw)
         self._renderer = gfx.WgpuRenderer(self._canvas_raw)
