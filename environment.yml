@@ -1,4 +1,4 @@
-name: moviemaking
+name: scatterview
 channels:
   - conda-forge
 dependencies:
@@ -8,9 +8,16 @@ dependencies:
   - numba
   - pandas
   - pytables
+  - h5py
   - pyqt6
+  - pillow
   - pip
   - pip:
-    - vispy
+    - pygfx>=0.7
+    - wgpu>=0.18
+    - rendercanvas
     - av
-    - imageio
+    # On WSL2 or headless Linux, set WGPU_BACKEND_TYPE=Vulkan so the
+    # lavapipe / Mesa driver is picked over the D3D12-via-OpenGL shim
+    # (which lacks float32-filterable).  scatterview/__init__.py does
+    # this automatically on Linux unless the env var is already set.

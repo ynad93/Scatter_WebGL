@@ -6,6 +6,13 @@ auto-rotate, event tracking, target tracking, and manual control.
 Framing controls which particles drive the camera zoom via a single
 count parameter (n_framed): the N closest particles to the reference
 point are kept.  When N >= the active count, all particles are framed.
+
+The camera is driven through a turntable-style wrapper exposing
+``fov``, ``azimuth``, ``elevation``, ``center``, ``distance``, and a
+``view_changed()`` method.  The wrapper is either VisPy's stock
+``TurntableCamera`` (historic) or the pygfx-backed wrapper defined in
+``scatterview.rendering.engine``; either one works because this module
+only touches that public surface.
 """
 
 from __future__ import annotations
@@ -280,9 +287,8 @@ class CameraController:
             self._smoothed_framing_radius = framing_radius
             self._radius_ring[:] = framing_radius
             self._radius_ring_sum = framing_radius * len(self._radius_ring)
-            self._camera._center = (float(center[0]), float(center[1]), float(center[2]))
-            self._camera._distance = self._ideal_distance(framing_radius)
-            self._camera.view_changed()
+            self._camera.center = (float(center[0]), float(center[1]), float(center[2]))
+            self._camera.distance = self._ideal_distance(framing_radius)
 
         # Base mode computes center and framing radius
         if self._mode == CameraMode.TARGET_COMOVING:
@@ -501,12 +507,12 @@ class CameraController:
         """
         cam = self._camera
         new_center = (float(center[0]), float(center[1]), float(center[2]))
-        center_changed = new_center != cam._center
+        cur_center = tuple(cam.center)
+        center_changed = new_center != cur_center
 
         if self._free_zoom:
             if center_changed:
-                cam._center = new_center
-                cam.view_changed()
+                cam.center = new_center
             return
 
         # Update the running sum: subtract the sample being overwritten,
@@ -521,17 +527,14 @@ class CameraController:
         # Camera distance tracks the rolling average directly
         self._smoothed_framing_radius = self._radius_ring_sum / len(ring)
         new_distance = self._ideal_distance(self._smoothed_framing_radius)
-        cur_distance = cam._distance
+        cur_distance = cam.distance
         distance_changed = (cur_distance is None
                             or abs(new_distance - cur_distance) > 1e-4 * cur_distance)
 
         if center_changed:
-            cam._center = new_center
+            cam.center = new_center
         if distance_changed:
-            cam._distance = new_distance
-
-        if center_changed or distance_changed:
-            cam.view_changed()
+            cam.distance = new_distance
 
     def _find_target(self, positions: np.ndarray) -> np.ndarray | None:
         """Return the target particle's position, or None if not active.

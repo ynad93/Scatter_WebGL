@@ -255,22 +255,22 @@ def profile_runtime(engine, cam, data, n_frames: int, n_warmup: int):
         engine._update_frame()
         anim_time += anim_step
 
-    engine._canvas.render(size=(1280, 720))
+    engine._render_offscreen((1280, 720))
 
-    # Apply timing wrappers
+    # Apply timing wrappers.  Under pygfx, GPU uploads happen inside
+    # _upload_particle_frame and _update_trails (via geometry.update_range),
+    # so we wrap those entry points instead of the old VisPy visual.set_data.
     collector = TimingCollector()
     originals = {}
     originals["evaluate_batch"] = _wrap(engine._interp, "evaluate_batch", "evaluate_batch", collector)
     originals["_get_particle_attrs"] = _wrap(engine, "_get_particle_attrs", "get_particle_attrs", collector)
-    if engine._particle_visual is not None:
-        originals["particle_set_data"] = _wrap(engine._particle_visual, "set_data", "particle_set_data", collector)
+    originals["_upload_particle_frame"] = _wrap(
+        engine, "_upload_particle_frame", "particle_upload", collector,
+    )
     originals["_update_trails"] = _wrap(engine, "_update_trails", "update_trails", collector)
-    if engine._trail_line is not None:
-        originals["trail_line_set_data"] = _wrap(engine._trail_line, "set_data", "trail_line_set_data", collector)
     if engine._camera_controller is not None:
         originals["camera_update"] = _wrap(engine._camera_controller, "update", "camera_update", collector)
-    originals["canvas_update"] = _wrap(engine._canvas, "update", "canvas_update", collector)
-    originals["canvas_render"] = _wrap(engine._canvas, "render", "canvas_render", collector)
+    originals["render_offscreen"] = _wrap(engine, "_render_offscreen", "canvas_render", collector)
     if engine._stars_enabled and engine._star_visual is not None:
         originals["_update_stars"] = _wrap(engine, "_update_stars", "update_stars", collector)
     originals["_update_light"] = _wrap(engine, "_update_light_direction", "update_light", collector)
@@ -290,7 +290,7 @@ def profile_runtime(engine, cam, data, n_frames: int, n_warmup: int):
         frame_t0 = time.perf_counter_ns()
 
         engine._update_frame()
-        engine._canvas.render(size=(1280, 720))
+        engine._render_offscreen((1280, 720))
 
         frame_t1 = time.perf_counter_ns()
         collector.end_frame(frame_t1 - frame_t0)
@@ -322,14 +322,12 @@ def profile_runtime(engine, cam, data, n_frames: int, n_warmup: int):
     labels_order = [
         ("evaluate_batch",     "evaluate_batch"),
         ("get_particle_attrs", "get_particle_attrs"),
-        ("particle_set_data",  "particle_set_data"),
+        ("particle_upload",    "particle_upload"),
         ("update_trails",      "update_trails"),
-        ("trail_line_set_data","  trail_line_set_data"),
         ("camera_update",      "camera_update"),
         ("update_light",       "update_light"),
         ("update_stars",       "update_stars"),
-        ("canvas_update",      "canvas_update"),
-        ("canvas_render",      "canvas_render*"),
+        ("canvas_render",      "render_offscreen*"),
     ]
 
     header = f"{'Component':<24} {'Mean':>8} {'Median':>8} {'P95':>8} {'Max':>8} {'%':>7}"

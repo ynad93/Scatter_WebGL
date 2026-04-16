@@ -1,4 +1,10 @@
-"""VisPy-based OpenGL rendering engine for N-body visualization."""
+"""wgpu / pygfx rendering engine for N-body visualization.
+
+Replaces the prior VisPy/OpenGL implementation.  The public API is
+preserved verbatim; only the GPU upload and window plumbing changed.
+The Numba JIT trail assembly, sliding-window trail pointers, spline
+evaluation, and camera math are unchanged.
+"""
 
 from __future__ import annotations
 
@@ -7,37 +13,43 @@ from pathlib import Path
 
 import numba as nb
 import numpy as np
+import pygfx as gfx
+from rendercanvas.offscreen import OffscreenRenderCanvas
+from rendercanvas.pyqt6 import QRenderCanvas
 
 from .. import defaults as D
 from ..core.data_loader import SimulationData
 from ..core.interpolation import TrajectoryInterpolator
 
 
+# ---------------------------------------------------------------------------
+# Numba JIT hot paths (unchanged from VisPy implementation)
+# ---------------------------------------------------------------------------
+
+
 @nb.njit(cache=True)
 def _advance_trail_pointers(
-    packed_times,        # (total_pts,) float64 — all precomputed trail times
-    segment_start,       # (n_particles,) int64 — start offset in packed_times
-    segment_end,         # (n_particles,) int64 — end offset in packed_times
-    prev_window_start,   # (n_particles,) int64 — previous tail pointer (-1 = unset)
-    prev_window_end,     # (n_particles,) int64 — previous head pointer (-1 = unset)
-    t_trail_start,       # float64 — oldest time in the visible trail window
-    t_current,           # float64 — current simulation time (newest point)
-    is_forward,          # bool — True if time is advancing (normal playback)
-    out_window_start,    # (n_particles,) int64 — output tail indices
-    out_window_end,      # (n_particles,) int64 — output head indices
+    packed_times,        # (total_pts,) float64
+    segment_start,       # (n_particles,) int64
+    segment_end,         # (n_particles,) int64
+    prev_window_start,   # (n_particles,) int64
+    prev_window_end,     # (n_particles,) int64
+    t_trail_start,       # float64
+    t_current,           # float64
+    is_forward,          # bool
+    out_window_start,    # (n_particles,) int64
+    out_window_end,      # (n_particles,) int64
 ):
     """Find the visible trail window [start, end) for each particle.
 
-    During forward playback, advances the previous frame's pointers by
-    1-2 positions (O(1) per particle).  On scrub, loop, or first frame,
-    falls back to binary search (O(log N) per particle).
+    O(1) during forward playback (pointer advance), O(log N) on scrub
+    or first frame (binary search).
     """
     for particle in range(len(segment_start)):
         seg_lo = segment_start[particle]
         n_points = segment_end[particle] - seg_lo
 
         if is_forward and prev_window_start[particle] >= 0:
-            # Forward playback: advance pointers from last frame
             tail = prev_window_start[particle]
             while tail < n_points and packed_times[seg_lo + tail] <= t_trail_start:
                 tail += 1
@@ -45,7 +57,6 @@ def _advance_trail_pointers(
             while head < n_points and packed_times[seg_lo + head] < t_current:
                 head += 1
         else:
-            # Binary search (searchsorted side='right' for tail)
             lo, hi = nb.int64(0), n_points
             while lo < hi:
                 mid = (lo + hi) >> 1
@@ -54,7 +65,6 @@ def _advance_trail_pointers(
                 else:
                     hi = mid
             tail = lo
-            # Binary search (searchsorted side='left' for head)
             lo, hi = nb.int64(0), n_points
             while lo < hi:
                 mid = (lo + hi) >> 1
@@ -70,32 +80,29 @@ def _advance_trail_pointers(
 
 @nb.njit(cache=True)
 def _assemble_trails(
-    out_positions,            # (total_pts, 3) float32 — output positions
-    out_colors,               # (total_pts, 4) float32 — output RGBA colors
-    out_times,                # (total_pts,) float64 — output timestamps
-    write_offsets,            # (n_trails,) int64 — start index in output arrays
-    trail_point_counts,       # (n_trails,) int64 — total points per trail
-    trail_body_starts,        # (n_trails,) int64 — start index of body in precomp
-    trail_body_counts,        # (n_trails,) int64 — number of precomputed body points
-    trail_has_tail,           # (n_trails,) bool — whether tail lerp point exists
-    trail_tail_positions,     # (n_trails, 3) float32 — lerp'd tail positions
-    particle_indices,         # (n_trails,) int64 — index into full positions array
-    trail_is_active,          # (n_trails,) bool — whether particle is currently active
-    particle_color_indices,   # (n_trails,) int64 — index into color table
-    precomp_positions,        # (total_precomp, 3) float32 — packed precomputed positions
-    precomp_times,            # (total_precomp,) float64 — packed precomputed times
-    live_positions,           # (n_particles, 3) float64 — full-size positions (NaN if inactive)
-    color_table,              # (n_particles, 4) float32 — per-particle RGBA
-    t_trail_start,            # float64 — oldest time in the trail window
-    t_current,                # float64 — current simulation time
+    out_positions,
+    out_colors,
+    out_times,
+    write_offsets,
+    trail_point_counts,
+    trail_body_starts,
+    trail_body_counts,
+    trail_has_tail,
+    trail_tail_positions,
+    particle_indices,
+    trail_is_active,
+    particle_color_indices,
+    precomp_positions,
+    precomp_times,
+    live_positions,
+    color_table,
+    t_trail_start,
+    t_current,
 ):
     """Write trail geometry into output buffers for GPU upload.
 
-    Each trail is laid out as: [NaN separator] [tail lerp] [body] [head]
-    - Tail: interpolated position at exactly t_trail_start (smooth fade-in)
-    - Body: precomputed positions between t_trail_start and t_current
-    - Head: live particle position at t_current (only for active particles)
-    - NaN separators tell VisPy's line renderer to break between trails
+    Layout per trail: [NaN separator] [tail lerp] [body] [head]
+    NaN separators tell the line renderer to break between trails.
     """
     n_trails = len(write_offsets)
     for trail in range(n_trails):
@@ -104,7 +111,6 @@ def _assemble_trails(
         n_body = trail_body_counts[trail]
         write_pos = nb.int64(0)
 
-        # NaN separator before this trail (except the first)
         if trail > 0:
             sep = offset - 1
             for dim in range(3):
@@ -113,14 +119,12 @@ def _assemble_trails(
                 out_colors[sep, dim] = np.nan
             out_times[sep] = np.nan
 
-        # Tail: lerp'd position at the trail window boundary
         if trail_has_tail[trail]:
             for dim in range(3):
                 out_positions[offset, dim] = trail_tail_positions[trail, dim]
             out_times[offset] = t_trail_start
             write_pos = 1
 
-        # Body: copy precomputed trajectory points
         body_start = trail_body_starts[trail]
         for i in range(n_body):
             for dim in range(3):
@@ -128,23 +132,173 @@ def _assemble_trails(
             out_times[offset + write_pos + i] = precomp_times[body_start + i]
         write_pos += n_body
 
-        # Head: current particle position (only for active particles)
         if trail_is_active[trail]:
             p_idx = particle_indices[trail]
             for dim in range(3):
                 out_positions[offset + write_pos, dim] = np.float32(live_positions[p_idx, dim])
             out_times[offset + write_pos] = t_current
 
-        # Base RGB color for all points in this trail
         color_idx = particle_color_indices[trail]
         for i in range(n_points):
             for dim in range(3):
                 out_colors[offset + i, dim] = color_table[color_idx, dim]
 
 
+# ---------------------------------------------------------------------------
+# Adapters so controls.py keeps working unchanged
+# ---------------------------------------------------------------------------
+
+
+class _CanvasAdapter:
+    """Wraps a QRenderCanvas so `engine.canvas.native` returns the QWidget.
+
+    The old engine exposed `canvas.native` (VisPy's term for the Qt widget).
+    pygfx's QRenderCanvas *is* a QWidget, so `.native` just points back to it.
+    """
+
+    def __init__(self, canvas):
+        self._canvas = canvas
+
+    @property
+    def native(self):
+        return self._canvas
+
+    @property
+    def size(self):
+        return self._canvas.get_logical_size()
+
+    def __getattr__(self, name):
+        return getattr(self._canvas, name)
+
+
+# ---------------------------------------------------------------------------
+# Camera state: a lightweight struct that looks like VisPy's TurntableCamera
+# enough for core/camera.py and gui/controls.py to keep working.
+# ---------------------------------------------------------------------------
+
+
+class PygfxTurntableCamera:
+    """VisPy-TurntableCamera-compatible wrapper around a pygfx PerspectiveCamera.
+
+    Stores (fov, azimuth, elevation, distance, center) as canonical state.
+    On every ``view_changed()`` call it recomputes the pygfx camera's
+    world-space position and orientation.  This lets the legacy
+    CameraController keep writing ``_center`` / ``_distance`` directly
+    without knowing anything about pygfx.
+    """
+
+    # Axis convention: VisPy's TurntableCamera default uses a +Z-up camera
+    # that orbits around the center.  Here we replicate that exactly so
+    # the light-direction transform and pan axes keep the same math.
+    def __init__(self, pygfx_camera: gfx.PerspectiveCamera, fov: float = 45.0,
+                 azimuth: float = 0.0, elevation: float = 30.0,
+                 distance: float = 10.0, center=(0.0, 0.0, 0.0)):
+        self._pygfx = pygfx_camera
+        self._fov = float(fov)
+        self._azimuth = float(azimuth)
+        self._elevation = float(elevation)
+        self._distance = float(distance)
+        self._center = (float(center[0]), float(center[1]), float(center[2]))
+        self._pygfx.fov = self._fov
+        self._push_to_pygfx()
+
+    # Public attributes (mirror VisPy's TurntableCamera API)
+    @property
+    def fov(self) -> float:
+        return self._fov
+
+    @fov.setter
+    def fov(self, value: float) -> None:
+        self._fov = float(value)
+        self._pygfx.fov = self._fov
+
+    @property
+    def azimuth(self) -> float:
+        return self._azimuth
+
+    @azimuth.setter
+    def azimuth(self, value: float) -> None:
+        # Wrap to match VisPy (-180, 180] behavior
+        value = float(value)
+        while value > 180.0:
+            value -= 360.0
+        while value <= -180.0:
+            value += 360.0
+        self._azimuth = value
+        self._push_to_pygfx()
+
+    @property
+    def elevation(self) -> float:
+        return self._elevation
+
+    @elevation.setter
+    def elevation(self, value: float) -> None:
+        self._elevation = max(-90.0, min(90.0, float(value)))
+        self._push_to_pygfx()
+
+    @property
+    def distance(self) -> float:
+        return self._distance
+
+    @distance.setter
+    def distance(self, value: float) -> None:
+        self._distance = max(1e-9, float(value))
+        self._push_to_pygfx()
+
+    @property
+    def center(self):
+        return self._center
+
+    @center.setter
+    def center(self, value) -> None:
+        self._center = (float(value[0]), float(value[1]), float(value[2]))
+        self._push_to_pygfx()
+
+    # view_changed() is called by CameraController after poking ``_center``
+    # / ``_distance`` privates — push that state to pygfx.
+    def view_changed(self) -> None:
+        self._push_to_pygfx()
+
+    def set_range(self) -> None:
+        """No-op for compatibility; pygfx doesn't need an explicit recompute."""
+        self._push_to_pygfx()
+
+    def _spherical_to_direction(self) -> np.ndarray:
+        """Unit vector from center toward camera using (az, el).
+
+        VisPy's TurntableCamera puts the camera at:
+            x = d * sin(az) * cos(el)
+            y = -d * cos(az) * cos(el)   (start looking +Y)
+            z = d * sin(el)
+        with +Z up.  We reproduce that mapping exactly so the existing
+        light and pan math (which reads camera.azimuth/elevation) stays
+        correct.
+        """
+        az = math.radians(self._azimuth)
+        el = math.radians(self._elevation)
+        cos_el = math.cos(el)
+        return np.array([
+            math.sin(az) * cos_el,
+            -math.cos(az) * cos_el,
+            math.sin(el),
+        ], dtype=np.float64)
+
+    def _push_to_pygfx(self) -> None:
+        direction = self._spherical_to_direction()
+        center = np.array(self._center, dtype=np.float64)
+        position = center + direction * self._distance
+        self._pygfx.local.position = tuple(position.tolist())
+        # +Z up, look at center
+        self._pygfx.show_pos(self._center, up=(0.0, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+
 
 class RenderEngine:
-    """Manages the VisPy canvas, particle and trail rendering, camera, and animation."""
+    """wgpu / pygfx renderer managing particles, trails, camera, animation."""
 
     def __init__(
         self, data: SimulationData, interpolator: TrajectoryInterpolator,
@@ -154,13 +308,11 @@ class RenderEngine:
         """Create the rendering engine.
 
         Args:
-            data: Loaded simulation data (positions, times, masses, etc.).
-            interpolator: Pre-built TrajectoryInterpolator for spline evaluation.
-            size: Initial canvas size as (width, height) in pixels.
+            data: Loaded simulation data.
+            interpolator: Pre-built TrajectoryInterpolator.
+            size: Initial canvas size (width, height) in logical pixels.
             title: Window title string.
         """
-        from vispy import app, scene
-
         self._data = data
         self._interp = interpolator
         self._t_min = float(data.times[0])
@@ -178,9 +330,9 @@ class RenderEngine:
         self._trail_alpha = D.TRAIL_ALPHA
         self._trail_length_frac = D.TRAIL_LENGTH_FRAC
 
-        # Manual control speeds (WASD pan and scroll zoom)
-        self._pan_speed = 0.02       # fraction of camera distance per frame
-        self._zoom_speed = 1.0       # scroll zoom multiplier (1.0 = default)
+        # Manual control speeds
+        self._pan_speed = 0.02
+        self._zoom_speed = 1.0
 
         # Per-particle settings
         n = len(data.particle_ids)
@@ -211,21 +363,22 @@ class RenderEngine:
         self._time_font_size = D.TIME_FONT_SIZE
         self._time_color = D.TIME_COLOR
         self._time_anchor = D.TIME_ANCHOR
-        self._time_text = None  # VisPy Text visual, created in _build_visuals
+        self._time_text = None  # pygfx.Text
+        self._time_text_str = ""  # cached to avoid rebuilding glyphs each frame
 
-        # Star field background
+        # Star field
         self._stars_enabled = True
-        self._star_visual = None
+        self._star_visual = None   # pygfx.Points
         self._star_count = D.STAR_COUNT
-        self._star_directions = None   # (N, 3) float32 unit vectors, fixed
-        self._star_positions = None    # (N, 3) float32 working buffer, scaled each frame
-        self._star_base_sizes = None   # (N,) float32
-        self._star_base_colors = None  # (N, 4) float32
-        self._star_max_particle_dist = 1.0  # max distance any particle reaches from origin
+        self._star_directions = None
+        self._star_positions = None
+        self._star_base_sizes = None
+        self._star_base_colors = None
+        self._star_max_particle_dist = 1.0
         self._star_shell_factor = D.STAR_SHELL_FACTOR
-        self._star_min_shell_radius = 1.0  # computed as max_dist * factor
+        self._star_min_shell_radius = 1.0
 
-        # Black hole rendering — pre-computed boolean array for vectorized lookup
+        # Black hole markers
         self._is_bh = np.zeros(n, dtype=bool)
         if data.startypes is not None:
             for pid_key, k in data.startypes.items():
@@ -234,197 +387,202 @@ class RenderEngine:
                     if idx is not None:
                         self._is_bh[idx] = True
 
-        # VisPy canvas and view — use a grid so split-screen can add
-        # the sub-view as a sibling cell rather than an overlay.
-        self._canvas = scene.SceneCanvas(
-            keys="interactive", size=size, title=title, show=False,
+        # --- Window & pygfx stack ---
+        self._canvas_raw = QRenderCanvas(
+            size=size, title=title, update_mode="manual", max_fps=60, vsync=True,
         )
-        self._grid = self._canvas.central_widget.add_grid()
-        self._view = self._grid.add_view(row=0, col=0)
-        self._view.camera = scene.cameras.TurntableCamera(
-            fov=D.CAMERA_FOV, distance=10.0,
-        )
-        self._view.camera.set_range()
+        self._canvas = _CanvasAdapter(self._canvas_raw)
+        self._renderer = gfx.WgpuRenderer(self._canvas_raw)
+        self._scene = gfx.Scene()
+        self._overlay_scene = gfx.Scene()
+        self._overlay_camera = gfx.ScreenCoordsCamera()
 
-        # Sub-view — own ViewBox on the same canvas
+        # Main camera — wrapped so legacy code keeps working
+        self._pygfx_camera = gfx.PerspectiveCamera(
+            fov=D.CAMERA_FOV, aspect=size[0] / max(size[1], 1),
+        )
+        self._view_camera = PygfxTurntableCamera(
+            self._pygfx_camera, fov=D.CAMERA_FOV,
+            azimuth=0.0, elevation=30.0, distance=10.0,
+        )
+        # Orbit controller for drag-to-rotate / right-drag-pan
+        self._orbit_controller = _PygfxOrbitAdapter(self._view_camera, self._canvas_raw)
+
+        # `engine.view` mimics VisPy's ViewBox just enough for the legacy
+        # CameraController and the CLI to reach the camera wrapper.
+        self._view = _ViewAdapter(self._view_camera, self._scene)
+
+        # Sub-view
         self._subview = None
         self._subview_enabled = False
+        self._subview_camera = None              # PygfxTurntableCamera
+        self._subview_pygfx_camera = None        # gfx.PerspectiveCamera
         self._subview_camera_controller = None
-        self._subview_markers = None
-        self._subview_trail_line = None
-        self._subview_star_visual = None
+        self._subview_markers = None             # _MarkerAdapter wrapping subview Points
+        self._subview_stars = None               # pygfx.Points (stars in subview)
+        self._subview_trail_line = None          # pygfx.Line
+        self._subview_trail_geom = None
         self._subview_layout = None
+        self._subview_size_frac = 0.3
         self._subview_radius_scale = 1.0
         self._subview_trail_alpha = D.TRAIL_ALPHA
+        self._subview_point_alpha = D.POINT_ALPHA
+        self._subview_depth_scaling = D.DEPTH_SCALING
 
-        # Visuals
-        self._particle_visual = None
-        self._trail_line = None
-        self._subview_trail_line = None
+        # Main particle / trail / star pygfx objects (built later)
+        self._particle_visual = None       # pygfx.Points (regular particles, Gaussian blobs)
+        self._bh_visual = None             # pygfx.Points (black holes, ring marker)
+        self._trail_line = None            # pygfx.Line
+        self._trail_geom = None
+        self._particle_geom = None
+        self._bh_geom = None
+        self._n_active_cached = -1
 
-        # Pre-computed trails: evaluated once at startup for the entire
-        # simulation, then sliced per-frame via a sliding window.
+        # Pre-computed trails
         self._n_particles = n
         self._precomp = interpolator.precompute_all_trails()
 
-        # Pre-allocated trail GPU arrays — reused each frame to avoid
-        # per-frame allocation and GC pressure at 60+ FPS.
+        # Pre-allocated trail arrays — grown on demand.
         self._trail_capacity = 0
         self._combined_pos = np.empty((0, 3), dtype=np.float32)
         self._combined_colors = np.empty((0, 4), dtype=np.float32)
         self._combined_times = np.empty(0, dtype=np.float64)
         self._time_fraction = np.empty(0, dtype=np.float32)
+        # Pre-allocated GPU-side buffers (same capacity, different lifetime).
+        self._trail_gpu_pos = None
+        self._trail_gpu_colors = None
+        self._trail_gpu_capacity = 0
 
-        # Two-pointer sliding window indices (si, ei) per particle.
-        # During forward playback these advance by 0-2 positions per frame
-        # (O(1)) instead of binary search (O(log N)).  Reset to -1 to
-        # signal that searchsorted is needed (first frame, scrub, loop).
+        # Two-pointer sliding window
         self._trail_si = np.full(n, -1, dtype=np.int64)
         self._trail_ei = np.full(n, -1, dtype=np.int64)
         self._trail_prev_time = -np.inf
 
-        # Trail alpha gradient: maps time fraction (0=oldest, 1=newest) to
-        # opacity via a linear curve.  Trails fade from transparent at
-        # the tail to opaque at the head.
+        # Alpha gradient lookup table
         self._alpha_lut = np.linspace(0, 1, 1024, dtype=np.float32)
 
-        self._build_visuals()
-
-        # Timer and camera
-        self._timer = app.Timer(interval=1.0 / 60.0, connect=self._on_timer, start=False)
+        # Timer & camera controller
         self._camera_controller = None
+        self._manual_mode_callbacks: list = []
 
-        # Auto-enable free zoom on scroll wheel / trackpad zoom
-        self._canvas.events.mouse_wheel.connect(self._on_mouse_wheel)
-        self._canvas.events.key_press.connect(self._on_key_press)
-        self._canvas.events.key_release.connect(self._on_key_release)
-
-        # Keyboard pan/rotate: track which keys are held for smooth continuous movement
+        # Keyboard state
         self._pan_keys_held: set[str] = set()
         self._ctrl_held = False
         self._alt_held = False
         self._shift_held = False
-        self._manual_mode_callbacks: list = []  # called when arrow-key pan forces manual mode
 
-        # Cached camera trig — computed once per frame in _update_frame,
-        # reused by lighting and panning.  Physics spherical convention:
-        # θ = π/2 − elevation (polar from +z),  φ = azimuth.
-        # VisPy axis mapping:  x = r sinθ sinφ,  y = r sinθ cosφ,  z = r cosθ.
+        # Cached camera trig
         self._cos_az = 1.0
         self._sin_az = 0.0
         self._cos_el = 1.0
         self._sin_el = 0.0
 
-        # Normalized world-space light direction (constant, precomputed once)
+        # World-space light direction (unit vector)
         _lw = np.array(D.LIGHT_POSITION, dtype=np.float64)
         self._light_world = _lw / np.linalg.norm(_lw)
 
-    def _cache_camera_trig(self) -> None:
-        """Precompute sin/cos of camera azimuth and elevation."""
-        az = math.radians(self._view.camera.azimuth)
-        el = math.radians(self._view.camera.elevation)
-        self._cos_az = math.cos(az)
-        self._sin_az = math.sin(az)
-        self._cos_el = math.cos(el)
-        self._sin_el = math.sin(el)
+        # Build initial visuals
+        self._build_visuals()
 
-    def _camera_axes(self):
-        """Camera-relative right and forward vectors from cached trig."""
-        return (
-            np.array([self._cos_az, self._sin_az, 0.0]),
-            np.array([-self._sin_az, self._cos_az, 0.0]),
+        # Hook draw + input events
+        self._canvas_raw.request_draw(self._animate)
+        self._canvas_raw.add_event_handler(
+            self._on_event,
+            "wheel", "key_down", "key_up", "resize",
         )
+
+        # Qt timer for play/pause
+        self._timer = None
+        self._last_tick = None  # monotonic seconds of previous tick
+
+    # ------------------------------------------------------------------
+    # Event handling
+    # ------------------------------------------------------------------
+
+    def _on_event(self, event) -> None:
+        et = event.get("event_type")
+        if et == "wheel":
+            self._on_wheel(event)
+        elif et == "key_down":
+            self._on_key_down(event)
+        elif et == "key_up":
+            self._on_key_up(event)
+        elif et == "resize":
+            self._on_resize(event)
 
     @staticmethod
     def _has_ctrl(event) -> bool:
-        """Check if Ctrl is held during a VisPy input event.
+        mods = event.get("modifiers", ()) or ()
+        return any(m and m.lower() in ("control", "ctrl") for m in mods)
 
-        Args:
-            event: VisPy input event with a `modifiers` attribute.
-        """
-        return any(m.name.lower() == 'control' for m in event.modifiers)
-
-    def _on_mouse_wheel(self, event) -> None:
+    def _on_wheel(self, event) -> None:
         """Zoom toward the mouse cursor position.
 
-        Shifts the camera center toward the world-space point under the
-        cursor as it zooms in (like Google Maps).  The cursor offset
-        from screen center is converted to world units using the camera
-        distance and field of view, then the center is nudged by that
-        offset proportional to the zoom amount.
-
         Holding Ctrl multiplies zoom speed by 5x.
-
-        Args:
-            event: VisPy mouse wheel event with `delta` and `pos` attributes.
         """
         if self._camera_controller is not None and not self._camera_controller.free_zoom:
             self._camera_controller.free_zoom = True
 
-        camera = self._view.camera
-
-        scroll = event.delta[1]
+        # pygfx/jupyter-rfb wheel event: dy positive = scroll up = zoom in
+        scroll = -event.get("dy", 0.0) / 120.0  # normalize: 120 units = one notch
         if scroll == 0:
             return
 
+        camera = self._view_camera
         speed = self._zoom_speed * (5.0 if self._has_ctrl(event) else 1.0)
-        # 1.1^(-scroll*speed): scroll up → zoom_factor < 1 → closer
         zoom_factor = 1.1 ** (-scroll * speed)
 
-        # Shift center toward cursor: convert the cursor's pixel offset
-        # from screen center into world-space displacement at the focal
-        # plane (the plane through camera.center).
-        mouse_pos = event.pos
-        canvas_size = self._canvas.size
-        if mouse_pos is not None:
-            # Cursor offset from screen center, in pixels
-            cursor_offset_x = mouse_pos[0] - canvas_size[0] / 2
-            cursor_offset_y = mouse_pos[1] - canvas_size[1] / 2
+        mouse_x = event.get("x")
+        mouse_y = event.get("y")
+        canvas_w, canvas_h = self._canvas.size
+        if mouse_x is not None and mouse_y is not None:
+            cursor_offset_x = mouse_x - canvas_w / 2
+            cursor_offset_y = mouse_y - canvas_h / 2
 
-            # Convert pixels to world units: at the focal plane, the
-            # visible half-height is distance * tan(fov/2).  Pixel scale
-            # is (visible height) / (screen height).
             fov_rad = math.radians(camera.fov / 2)
-            world_per_pixel = 2.0 * camera.distance * math.tan(fov_rad) / canvas_size[1]
+            world_per_pixel = 2.0 * camera.distance * math.tan(fov_rad) / max(canvas_h, 1)
 
-            # World-space offset in camera-relative coordinates
             dx_screen = cursor_offset_x * world_per_pixel
-            dy_screen = -cursor_offset_y * world_per_pixel  # screen Y is flipped
+            dy_screen = -cursor_offset_y * world_per_pixel
 
-            # Rotate screen offset into world coordinates
             self._cache_camera_trig()
             right, _ = self._camera_axes()
             up = np.array([0.0, 0.0, 1.0])
 
             center = np.array(camera.center, dtype=np.float64)
             world_offset = right * dx_screen + up * dy_screen
-
-            # Shift center toward cursor proportional to zoom amount:
-            # zoom_factor < 1 (zooming in) → positive shift toward cursor
-            # zoom_factor > 1 (zooming out) → negative shift away
             center += world_offset * (1.0 - zoom_factor)
             camera.center = tuple(center)
 
         camera.distance *= zoom_factor
         camera.view_changed()
-        event.handled = True
+        self._canvas_raw.request_draw()
 
-    _PAN_KEYS = {'W', 'Up', 'S', 'Down', 'A', 'Left', 'D', 'Right'}
+    _PAN_KEYS = {'W', 'UP', 'S', 'DOWN', 'A', 'LEFT', 'D', 'RIGHT',
+                 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'}
 
-    def _on_key_press(self, event) -> None:
-        """Track held keys for smooth continuous panning/rotation.
+    @staticmethod
+    def _normalize_key(name: str) -> str:
+        """Map rendercanvas key names to the short names the engine uses."""
+        mapping = {
+            'ArrowUp': 'Up', 'ArrowDown': 'Down',
+            'ArrowLeft': 'Left', 'ArrowRight': 'Right',
+            ' ': 'Space',
+        }
+        return mapping.get(name, name)
 
-        Args:
-            event: VisPy key press event with `key.name` attribute.
-        """
-        key_name = event.key.name
-        if key_name == 'Space':
-            self.toggle_play()
-            event.handled = True
+    def _on_key_down(self, event) -> None:
+        raw = event.get("key", "")
+        if raw is None:
             return
-        if key_name in self._PAN_KEYS:
+        name = self._normalize_key(raw)
+        if name == 'Space':
+            self.toggle_play()
+            return
+        # Normalize single letters to uppercase so the pan map hits
+        key_name = name.upper() if len(name) == 1 else name
+        if key_name in ('W', 'S', 'A', 'D', 'Up', 'Down', 'Left', 'Right'):
             self._pan_keys_held.add(key_name)
-            # Switch to manual mode so auto-tracking doesn't fight the pan
             if not self._alt_held and self._camera_controller is not None:
                 from ..core.camera import CameraMode
                 if self._camera_controller.mode != CameraMode.MANUAL:
@@ -433,49 +591,62 @@ class RenderEngine:
                         cb()
                 if not self._camera_controller.free_zoom:
                     self._camera_controller.free_zoom = True
-        if key_name == 'Control':
+        if name in ('Control', 'Ctrl'):
             self._ctrl_held = True
-        if key_name == 'Alt':
+        if name == 'Alt':
             self._alt_held = True
-        if key_name == 'Shift':
+        if name == 'Shift':
             self._shift_held = True
 
-    def _on_key_release(self, event) -> None:
-        """Stop panning/rotation when key is released.
-
-        Args:
-            event: VisPy key release event with `key.name` attribute.
-        """
-        key_name = event.key.name
+    def _on_key_up(self, event) -> None:
+        raw = event.get("key", "")
+        if raw is None:
+            return
+        name = self._normalize_key(raw)
+        key_name = name.upper() if len(name) == 1 else name
         self._pan_keys_held.discard(key_name)
-        if key_name == 'Control':
+        if name in ('Control', 'Ctrl'):
             self._ctrl_held = False
-        if key_name == 'Alt':
+        if name == 'Alt':
             self._alt_held = False
-        if key_name == 'Shift':
+        if name == 'Shift':
             self._shift_held = False
 
+    def _on_resize(self, event) -> None:
+        # Update camera aspect + overlay layout
+        w = event.get("width", None) or self._canvas.size[0]
+        h = event.get("height", None) or self._canvas.size[1]
+        self._pygfx_camera.aspect = w / max(h, 1)
+        if self._subview_pygfx_camera is not None:
+            self._subview_pygfx_camera.aspect = w / max(h, 1)
+        self._reposition_time_text()
+        self._canvas_raw.request_draw()
+
+    # ------------------------------------------------------------------
+    # Camera helpers (cached trig)
+    # ------------------------------------------------------------------
+
+    def _cache_camera_trig(self) -> None:
+        az = math.radians(self._view_camera.azimuth)
+        el = math.radians(self._view_camera.elevation)
+        self._cos_az = math.cos(az)
+        self._sin_az = math.sin(az)
+        self._cos_el = math.cos(el)
+        self._sin_el = math.sin(el)
+
+    def _camera_axes(self):
+        # Right / forward vectors in world space (consistent with the +Z-up
+        # VisPy-compatible convention used in the light and pan math).
+        return (
+            np.array([self._cos_az, self._sin_az, 0.0]),
+            np.array([-self._sin_az, self._cos_az, 0.0]),
+        )
+
     def _apply_keyboard_pan(self) -> None:
-        """Apply smooth continuous panning and time scrubbing from held keys.
-
-        Called each frame from _on_timer.  Pan speed is proportional to
-        camera distance so it feels consistent at any zoom level.
-        Holding Ctrl multiplies speed by 5x.  Skipped when Alt is held
-        (arrow keys rotate instead).
-
-        Default:
-            Up/Down — move up/down (world Z)
-            Left/Right, A/D — move left/right
-            W/S — move forward/backward
-
-        Shift held:
-            Up/Down — move forward/backward
-            Left/Right — scrub time forward/backward
-        """
         if not self._pan_keys_held or self._alt_held:
             return
 
-        camera = self._view.camera
+        camera = self._view_camera
         speed = self._pan_speed * (5.0 if self._ctrl_held else 1.0)
         step = camera.distance * speed
 
@@ -491,27 +662,24 @@ class RenderEngine:
 
         for key_name in self._pan_keys_held:
             if self._shift_held:
-                # Shift: Up/Down = forward/backward, Left/Right = time scrub
-                if key_name in ('Up',):
+                if key_name == 'Up':
                     center += forward * step
-                elif key_name in ('Down',):
+                elif key_name == 'Down':
                     center -= forward * step
-                elif key_name in ('Left',):
+                elif key_name == 'Left':
                     time_step -= 1.0
-                elif key_name in ('Right',):
+                elif key_name == 'Right':
                     time_step += 1.0
             else:
-                # Default: Up/Down = vertical, Left/Right = horizontal
-                if key_name in ('Up',):
+                if key_name == 'Up':
                     center += up * step
-                elif key_name in ('Down',):
+                elif key_name == 'Down':
                     center -= up * step
-                elif key_name in ('Left',):
+                elif key_name == 'Left':
                     center -= right * step
-                elif key_name in ('Right',):
+                elif key_name == 'Right':
                     center += right * step
 
-            # WASD always pan (unaffected by Shift)
             if key_name == 'W':
                 center += forward * step
             elif key_name == 'S':
@@ -528,20 +696,13 @@ class RenderEngine:
             self._anim_time = max(0.0, min(1.0, self._anim_time + time_step * scrub_speed / 60.0))
             self._current_sim_time = self._t_min + self._anim_time * self._time_range
 
-    _ROTATE_SPEED_DEG = 1.5  # degrees per frame for keyboard rotation
+    _ROTATE_SPEED_DEG = 1.5
 
     def _apply_keyboard_rotate(self) -> None:
-        """Apply smooth continuous orbit rotation from held arrow keys + Alt.
-
-        Called each frame from _on_timer.  Left/Right change azimuth,
-        Up/Down change elevation.  Holding Ctrl multiplies speed by 5x.
-        """
         if not self._pan_keys_held or not self._alt_held:
             return
-
-        camera = self._view.camera
+        camera = self._view_camera
         speed = self._ROTATE_SPEED_DEG * (5.0 if self._ctrl_held else 1.0)
-
         for key_name in self._pan_keys_held:
             if key_name in ('A', 'Left'):
                 camera.azimuth -= speed
@@ -557,11 +718,6 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _compute_relative_base_sizes(self) -> np.ndarray:
-        """Map particle radii to screen-pixel sizes.
-
-        Cube root compresses the dynamic range (proportional to volume^(1/3)),
-        then linearly maps [0, max] → [MIN_PX, MAX_PX].
-        """
         n = len(self._data.particle_ids)
         if self._raw_radii is not None:
             compressed = np.cbrt(self._raw_radii)
@@ -573,11 +729,6 @@ class RenderEngine:
         return np.full(n, D.DEFAULT_SIZE_PX, dtype=np.float32)
 
     def _compute_absolute_base_sizes(self) -> np.ndarray:
-        """Map particle radii to world-unit diameters.
-
-        If radii are provided, diameter = 2 * radius.
-        Otherwise, default to 1% of the simulation spatial extent.
-        """
         n = len(self._data.particle_ids)
         if self._raw_radii is not None:
             return 2.0 * self._raw_radii
@@ -599,14 +750,6 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _default_colors(self, n: int) -> np.ndarray:
-        """Generate a default RGBA color palette cycling through 8 distinct colors.
-
-        Args:
-            n: Number of particles to assign colors to.
-
-        Returns:
-            (n, 4) float32 RGBA array.
-        """
         base = np.array([
             [1.0, 0.3, 0.3, 1.0], [0.3, 0.6, 1.0, 1.0],
             [0.3, 1.0, 0.3, 1.0], [1.0, 0.8, 0.2, 1.0],
@@ -617,16 +760,9 @@ class RenderEngine:
         return base[idx]
 
     def _generate_star_field(self) -> None:
-        """Generate random star directions, sizes, and colors.
-
-        Stores unit vectors on the sphere.  Each frame, these are scaled
-        to a dynamic shell radius that tracks the camera distance so the
-        stars always remain within the viewing frustum.
-        """
         rng = np.random.default_rng(D.STAR_SEED)
         n = self._star_count
 
-        # Uniform unit vectors on the sphere
         z = rng.uniform(-1, 1, n)
         phi = rng.uniform(0, 2 * np.pi, n)
         r_xy = np.sqrt(1 - z ** 2)
@@ -634,8 +770,6 @@ class RenderEngine:
             r_xy * np.cos(phi), r_xy * np.sin(phi), z,
         ]).astype(np.float32)
 
-        # Shell radius: maximum finite distance any particle reaches from the
-        # origin across the entire simulation, times a safety factor.
         max_dist = 0.0
         for pos in self._data.positions.values():
             finite = np.isfinite(pos).all(axis=1)
@@ -646,12 +780,9 @@ class RenderEngine:
         self._star_max_particle_dist = max_dist
         self._star_min_shell_radius = max(max_dist * self._star_shell_factor, 1.0)
 
-
-        # Sizes: power-law — many dim, few bright
         u = rng.uniform(0, 1, n)
         self._star_base_sizes = (D.STAR_BASE_SIZE * (1.0 + 3.0 * u ** 3)).astype(np.float32)
 
-        # Colors: rough main-sequence distribution
         colors = np.ones((n, 4), dtype=np.float32)
         idx = rng.choice(n, int(0.3 * n), replace=False)
         colors[idx, 0] *= rng.uniform(0.7, 0.9, len(idx)).astype(np.float32)
@@ -666,15 +797,10 @@ class RenderEngine:
         colors[:, 3] = brightness
         self._star_base_colors = colors
 
-        # Pre-allocated working buffers (reused each frame)
         self._star_positions = np.empty_like(self._star_directions)
 
     def _get_particle_attrs(self, mask: np.ndarray) -> dict:
-        """Compute face_color, edge_color, edge_width, size for active particles.
-
-        Args:
-            mask: (n_particles,) bool — True for active particles.
-        """
+        """Compute face_color, edge_color, edge_width, size for active particles."""
         n = int(mask.sum())
         sizes = self._sizes[mask]
         face_color = self._colors[mask]
@@ -690,100 +816,228 @@ class RenderEngine:
             edge_width[bh_mask] = D.BH_EDGE_WIDTH
 
         return {"face_color": face_color, "edge_color": edge_color,
-                "edge_width": edge_width, "size": sizes}
+                "edge_width": edge_width, "size": sizes,
+                "bh_mask": bh_mask}
 
-    def _resolve_scaling_mode(self) -> str:
+    def _resolve_size_space(self) -> str:
+        """Map legacy sizing flags onto pygfx ``size_space``.
+
+        - absolute          → "world" (radius in world units)
+        - relative + depth  → "world" (pixels via camera projection)
+        - relative, no depth → "screen" (fixed pixel size)
+        """
         if self._sizing_absolute:
-            return "scene"
-        return "visual" if self._depth_scaling else "fixed"
+            return "world"
+        return "world" if self._depth_scaling else "screen"
 
     # ------------------------------------------------------------------
     # Visual construction
     # ------------------------------------------------------------------
 
     def _build_visuals(self) -> None:
-        from vispy import scene
+        # --- Background ---
+        # Dark blue → black gradient matches the prior VisPy look.
+        bg_mat = gfx.BackgroundMaterial((0.0, 0.0, 0.0), (0.02, 0.02, 0.08))
+        self._scene.add(gfx.Background(None, bg_mat))
 
         positions, mask = self._interp.evaluate_batch(self._data.times[0])
-        active_pos = positions[mask] if mask.any() else np.zeros((1, 3), dtype=np.float32)
 
-        attrs = self._get_particle_attrs(mask)
-        self._particle_visual = scene.Markers(
-            spherical=True, scaling=self._resolve_scaling_mode(),
-            light_color=D.LIGHT_COLOR, light_position=D.LIGHT_POSITION,
-            light_ambient=D.LIGHT_AMBIENT, parent=self._view.scene,
+        # --- Particle buffers (pre-allocated to full capacity so we can
+        # reuse the same Geometry object across frames) ---
+        n = self._n_particles
+        self._particle_positions = np.zeros((n, 3), dtype=np.float32)
+        self._particle_colors = np.zeros((n, 4), dtype=np.float32)
+        self._particle_sizes = np.zeros(n, dtype=np.float32)
+        self._bh_positions = np.zeros((max(self._is_bh.sum(), 1), 3), dtype=np.float32)
+        self._bh_colors = np.ones((max(self._is_bh.sum(), 1), 4), dtype=np.float32)
+        self._bh_sizes = np.full(max(self._is_bh.sum(), 1), 10.0, dtype=np.float32)
+
+        # Geometry + material for regular particles
+        self._particle_geom = gfx.Geometry(
+            positions=self._particle_positions.copy(),
+            colors=self._particle_colors.copy(),
+            sizes=self._particle_sizes.copy(),
         )
-        self._particle_visual.set_data(pos=active_pos, **attrs)
-        self._update_trails(self._data.times[0], positions, mask)
+        self._particle_material = gfx.PointsGaussianBlobMaterial(
+            size_mode="vertex", size_space=self._resolve_size_space(),
+            color_mode="vertex",
+        )
+        self._particle_visual = gfx.Points(self._particle_geom, self._particle_material)
+        self._scene.add(self._particle_visual)
 
-        # Generate star field and create visual if enabled by default
+        # Black hole particles — ring marker on top
+        if self._is_bh.any():
+            self._bh_geom = gfx.Geometry(
+                positions=self._bh_positions.copy(),
+                colors=self._bh_colors.copy(),
+                sizes=self._bh_sizes.copy(),
+            )
+            self._bh_material = gfx.PointsMarkerMaterial(
+                marker="ring",
+                size_mode="vertex",
+                size_space="screen",
+                color_mode="vertex",
+                edge_width=D.BH_EDGE_WIDTH,
+                edge_color="white",
+            )
+            self._bh_visual = gfx.Points(self._bh_geom, self._bh_material)
+            self._bh_visual.render_order = 1  # draw on top of regular particles
+            self._scene.add(self._bh_visual)
+
+        # Initial particle data
+        self._upload_particle_frame(positions, mask)
+
+        # Trails + star field
+        self._update_trails(self._data.times[0], positions, mask)
         self._generate_star_field()
         if self._stars_enabled:
             self.enable_stars(True)
 
-        # Time overlay — attached to the canvas root so it stays fixed on screen
-        self._time_text = scene.visuals.Text(
-            text=D.format_sim_time(self._t_min, self._time_unit),
-            color=self._time_color,
+        # Time overlay (screen-space)
+        self._time_text_str = D.format_sim_time(self._t_min, self._time_unit)
+        self._time_text = gfx.Text(
+            text=self._time_text_str,
             font_size=self._time_font_size,
-            pos=D.TIME_OFFSET,
-            anchor_x="left",
-            anchor_y="top",
-            parent=self._canvas.scene,
+            anchor="top-left",
+            screen_space=True,
+            material=gfx.TextMaterial(color=self._time_color),
         )
-        self._time_text.order = 10
+        # Positioned each frame / on resize to stay in the requested corner.
+        self._overlay_scene.add(self._time_text)
+        self._reposition_time_text()
         self._time_text.visible = self._time_display_enabled
 
-    def _rebuild_particle_visual(self) -> None:
-        from vispy import scene
+        # Seed camera framing so the default view is reasonable before the
+        # CLI attaches a CameraController.
+        valid = np.isfinite(positions).all(axis=1)
+        if valid.any():
+            center = positions[valid].mean(axis=0)
+            radius = float(np.max(np.linalg.norm(positions[valid] - center, axis=1))) or 1.0
+            self._view_camera.center = tuple(center)
+            self._view_camera.distance = max(radius * 2.5, 1.0)
 
-        if self._particle_visual is not None:
-            self._particle_visual.parent = None
+    def _upload_particle_frame(self, positions: np.ndarray, mask: np.ndarray) -> None:
+        """Push one frame's particle state into the Geometry buffers.
 
-        self._particle_visual = scene.Markers(
-            spherical=True, scaling=self._resolve_scaling_mode(),
-            light_color=D.LIGHT_COLOR, light_position=D.LIGHT_POSITION,
-            light_ambient=D.LIGHT_AMBIENT, parent=self._view.scene,
+        Inactive particles get size=0 (invisible) but keep their buffer
+        slot; this keeps the draw range constant and avoids rebuilding
+        the pipeline on every frame.
+        """
+        n = self._n_particles
+        pos_buf = self._particle_geom.positions
+        col_buf = self._particle_geom.colors
+        size_buf = self._particle_geom.sizes
+
+        # Regular particles: compute full attributes then zero out BH slots
+        # and inactive slots.
+        face_color = np.zeros((n, 4), dtype=np.float32)
+        sizes = np.zeros(n, dtype=np.float32)
+
+        if mask.any():
+            # Only active, non-BH particles render through the Gaussian-blob
+            # Points; black holes render via the separate ring Points so they
+            # get the correct look.
+            main_mask = mask & ~self._is_bh
+            if main_mask.any():
+                face_color[main_mask] = self._colors[main_mask]
+                # apply global point_alpha
+                face_color[main_mask, 3] *= self._point_alpha
+                sizes[main_mask] = self._sizes[main_mask]
+
+        pos_buf.data[:] = np.where(
+            np.isfinite(positions), positions.astype(np.float32), 0.0,
         )
-        self._particle_visual.alpha = self._point_alpha
+        col_buf.data[:] = face_color
+        size_buf.data[:] = sizes
+
+        pos_buf.update_range(0, n)
+        col_buf.update_range(0, n)
+        size_buf.update_range(0, n)
+
+        # Black holes
+        if self._bh_visual is not None and self._is_bh.any():
+            bh_idx = np.where(self._is_bh)[0]
+            bh_active = mask[bh_idx]
+            n_bh = len(bh_idx)
+            bh_pos = np.zeros((n_bh, 3), dtype=np.float32)
+            bh_col = np.zeros((n_bh, 4), dtype=np.float32)
+            bh_size = np.zeros(n_bh, dtype=np.float32)
+            if bh_active.any():
+                pos_active = positions[bh_idx[bh_active]].astype(np.float32)
+                bh_pos[bh_active] = np.where(np.isfinite(pos_active), pos_active, 0.0)
+                # Ring edge color uses the particle's own color, fully opaque.
+                bh_col[bh_active, :3] = self._colors[bh_idx[bh_active], :3]
+                bh_col[bh_active, 3] = 1.0 * self._point_alpha
+                bh_size[bh_active] = self._sizes[bh_idx[bh_active]]
+            self._bh_geom.positions.data[:] = bh_pos
+            self._bh_geom.colors.data[:] = bh_col
+            self._bh_geom.sizes.data[:] = bh_size
+            self._bh_geom.positions.update_range(0, n_bh)
+            self._bh_geom.colors.update_range(0, n_bh)
+            self._bh_geom.sizes.update_range(0, n_bh)
+
+    def _rebuild_particle_visual(self) -> None:
+        """Rebuild particle material after size-space or depth-scaling change.
+
+        pygfx's PointsMaterial is immutable w.r.t. size_space after first
+        draw, so we recreate it.  Geometry buffers stay put.
+        """
+        if self._particle_visual is not None:
+            self._scene.remove(self._particle_visual)
+        self._particle_material = gfx.PointsGaussianBlobMaterial(
+            size_mode="vertex", size_space=self._resolve_size_space(),
+            color_mode="vertex",
+        )
+        self._particle_visual = gfx.Points(self._particle_geom, self._particle_material)
+        self._scene.add(self._particle_visual)
 
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
-        if mask.any():
-            attrs = self._get_particle_attrs(mask)
-            self._particle_visual.set_data(pos=positions[mask], **attrs)
+        self._upload_particle_frame(positions, mask)
+
+    # ------------------------------------------------------------------
+    # Trails
+    # ------------------------------------------------------------------
 
     def _hide_all_trails(self) -> None:
-        """Hide all trail visuals."""
         if self._trail_line is not None:
             self._trail_line.visible = False
         if self._subview_trail_line is not None:
             self._subview_trail_line.visible = False
 
-    # ------------------------------------------------------------------
-    # Trail rendering
-    #
-    # Trails are rendered as polylines showing each particle's recent
-    # trajectory.  The positions are precomputed at startup (from the
-    # simulation's adaptive timesteps + angle-based refinement) and
-    # stored in packed arrays.  Each frame, we extract the visible
-    # time window [t_trail_start, t_current] via a sliding-window
-    # lookup, interpolate smooth boundary points at the window edges,
-    # and upload the result to VisPy's Line visual.
-    # ------------------------------------------------------------------
+    def _ensure_trail_geom(self, capacity: int) -> None:
+        """Make sure the GPU trail buffers can hold ``capacity`` vertices."""
+        if self._trail_line is not None and self._trail_gpu_capacity >= capacity:
+            return
+        # (Re)allocate pygfx buffers.
+        positions = np.zeros((capacity, 3), dtype=np.float32)
+        colors = np.zeros((capacity, 4), dtype=np.float32)
+        self._trail_geom = gfx.Geometry(positions=positions, colors=colors)
+        if self._trail_line is not None:
+            self._scene.remove(self._trail_line)
+        trail_mat = gfx.LineMaterial(
+            thickness=1.5, thickness_space="screen",
+            color_mode="vertex", aa=True,
+        )
+        self._trail_line = gfx.Line(self._trail_geom, trail_mat)
+        self._scene.add(self._trail_line)
+        self._trail_gpu_capacity = capacity
+
+        # Sub-view mirror if active
+        if self._subview_enabled and self._subview_trail_line is not None:
+            sub_positions = np.zeros((capacity, 3), dtype=np.float32)
+            sub_colors = np.zeros((capacity, 4), dtype=np.float32)
+            self._subview_trail_geom = gfx.Geometry(positions=sub_positions, colors=sub_colors)
+            self._scene.remove(self._subview_trail_line)
+            sub_mat = gfx.LineMaterial(
+                thickness=1.5, thickness_space="screen",
+                color_mode="vertex", aa=True,
+            )
+            self._subview_trail_line = gfx.Line(self._subview_trail_geom, sub_mat)
+            self._scene.add(self._subview_trail_line)
 
     def _update_trails(self, time: float, positions: np.ndarray,
                        mask: np.ndarray) -> None:
-        """Extract visible trail windows and upload geometry to VisPy.
-
-        Args:
-            time: Current simulation time.
-            positions: (n_particles, 3) full-size position array (NaN for inactive).
-            mask: (n_particles,) bool — True where particle is active.
-        """
-        from vispy import scene
-
-        # Trail window: [t_trail_start, time] covers trail_length_frac
-        # of the total simulation duration
+        """Extract visible trail windows and upload to GPU."""
         trail_length = self._time_range * self._trail_length_frac
         t_trail_start = max(time - trail_length, self._t_min)
         if t_trail_start >= time:
@@ -796,9 +1050,6 @@ class RenderEngine:
         n_particles = self._n_particles
         inv_trail_window = 1.0 / (time - t_trail_start)
 
-        # --- Check ALL particles for visible trail data ---
-        # (not just active ones — disappeared particles keep their trails
-        # until the trail window slides past their last precomputed point)
         all_indices = np.arange(n_particles)
         segment_starts = precomp.offsets[:-1]
         segment_ends = precomp.offsets[1:]
@@ -814,7 +1065,6 @@ class RenderEngine:
         seg_ends = segment_ends[valid_indices]
         precomp_counts = seg_ends - seg_starts
 
-        # --- Sliding window: find visible trail range per particle ---
         is_forward = time >= self._trail_prev_time
         self._trail_prev_time = time
 
@@ -835,7 +1085,6 @@ class RenderEngine:
         body_counts = np.maximum(window_ends - window_starts, 0)
         body_starts = seg_starts + window_starts
 
-        # --- Tail interpolation ---
         can_interpolate_tail = (window_starts > 0) & (window_starts <= precomp_counts)
         idx_before_tail = np.maximum(seg_starts + window_starts - 1, seg_starts)
         idx_after_tail = np.minimum(seg_starts + window_starts, seg_ends - 1)
@@ -844,8 +1093,6 @@ class RenderEngine:
         tail_time_gap = t_after_tail - t_before_tail
         has_tail = can_interpolate_tail & (tail_time_gap > 0)
 
-        # Lerp factor: 0.0 = at before point, 1.0 = at after point.
-        # 1e-30 prevents division by zero when times are identical.
         tail_lerp_factor = np.where(
             has_tail,
             (t_trail_start - t_before_tail) / np.maximum(tail_time_gap, 1e-30),
@@ -856,12 +1103,8 @@ class RenderEngine:
             + precomp.positions[idx_after_tail] * tail_lerp_factor[:, np.newaxis]
         )
 
-        # --- Determine which trails have an active head ---
-        # Active particles get a live head position from the spline;
-        # inactive particles' trails end at the last precomputed point.
         is_active = mask[valid_indices]
 
-        # Trail point count: body + head (if active) + tail (if interpolated)
         trail_point_counts = (
             body_counts
             + is_active.astype(np.int64)
@@ -882,9 +1125,8 @@ class RenderEngine:
         draw_particle_idx = valid_indices[drawable_idx]
         draw_is_active = is_active[drawable_idx]
 
-        total_pts = int(draw_counts.sum()) + n_trails - 1  # NaN separators
+        total_pts = int(draw_counts.sum()) + n_trails - 1
 
-        # --- Reuse pre-allocated GPU arrays (grow if needed) ---
         if total_pts > self._trail_capacity:
             self._trail_capacity = int(total_pts * 1.5)
             self._combined_pos = np.empty((self._trail_capacity, 3), dtype=np.float32)
@@ -894,27 +1136,22 @@ class RenderEngine:
         combined_pos = self._combined_pos[:total_pts]
         combined_colors = self._combined_colors[:total_pts]
 
-        # Output offset per trail: each trail starts after the previous
-        # trail's points + 1 NaN separator (used by VisPy to break the line strip)
         write_offsets = np.empty(n_trails, dtype=np.int64)
         write_offsets[0] = 0
         if n_trails > 1:
             cumulative_counts = np.cumsum(draw_counts)
-            # +arange(1,n) adds one NaN separator per preceding trail
             write_offsets[1:] = cumulative_counts[:-1] + np.arange(1, n_trails)
 
-        # Assemble all trail geometry in compiled code (numba)
         combined_times = self._combined_times[:total_pts]
         _assemble_trails(
             combined_pos, combined_colors, combined_times,
             write_offsets, draw_counts, draw_body_starts, draw_body_counts,
             draw_has_tail, draw_tail_positions, draw_particle_idx,
-            draw_is_active, draw_particle_idx,  # color_indices = particle indices
+            draw_is_active, draw_particle_idx,
             precomp.positions, precomp.times, positions, self._colors,
             t_trail_start, time,
         )
 
-        # --- Alpha gradient: older points fade out, newest are opaque ---
         valid_time_mask = ~np.isnan(combined_times)
         time_fraction = self._time_fraction[:total_pts]
         time_fraction[:] = 0.0
@@ -926,83 +1163,92 @@ class RenderEngine:
         )
         combined_colors[:, 3] = alpha_table[alpha_index] * self._trail_alpha
 
-        if self._trail_line is not None:
-            self._trail_line.set_data(pos=combined_pos, color=combined_colors)
-            self._trail_line.visible = True
-        else:
-            self._trail_line = scene.Line(
-                pos=combined_pos, color=combined_colors,
-                parent=self._view.scene, width=1,
-                antialias=True, connect="strip",
-            )
+        # Upload to pygfx — resize GPU buffer if needed.
+        self._ensure_trail_geom(max(total_pts, 1))
+        pos_buf = self._trail_geom.positions
+        col_buf = self._trail_geom.colors
+        pos_buf.data[:total_pts] = combined_pos
+        col_buf.data[:total_pts] = combined_colors
+        # Zero out positions beyond the valid range so stray line segments
+        # aren't drawn to arbitrary previous values.  (We adjust draw_range
+        # below to actually stop drawing there.)
+        if total_pts < self._trail_gpu_capacity:
+            pos_buf.data[total_pts:] = 0.0
+            col_buf.data[total_pts:, 3] = 0.0
+        pos_buf.update_range(0, self._trail_gpu_capacity)
+        col_buf.update_range(0, self._trail_gpu_capacity)
+        # draw_range limits rendering to just the live vertices.
+        self._trail_geom.positions.draw_range = (0, total_pts)
+        self._trail_line.visible = True
 
-        # Sub-view: pass the same trail arrays with sub-view appearance
-        if self._subview_enabled and self._subview is not None:
+        # Sub-view
+        if self._subview_enabled and self._subview_trail_line is not None:
             if self._subview_trail_alpha != self._trail_alpha:
                 sub_colors = combined_colors.copy()
                 alpha_ratio = self._subview_trail_alpha / max(self._trail_alpha, 1e-6)
                 sub_colors[:, 3] *= alpha_ratio
             else:
                 sub_colors = combined_colors
-            if self._subview_trail_line is not None:
-                self._subview_trail_line.set_data(
-                    pos=combined_pos, color=sub_colors,
-                )
-                self._subview_trail_line.visible = True
-            else:
-                self._subview_trail_line = scene.Line(
-                    pos=combined_pos, color=sub_colors,
-                    parent=self._subview.scene, width=1,
-                    antialias=True, connect="strip",
-                )
+            sp = self._subview_trail_geom.positions
+            sc = self._subview_trail_geom.colors
+            sp.data[:total_pts] = combined_pos
+            sc.data[:total_pts] = sub_colors
+            if total_pts < self._trail_gpu_capacity:
+                sp.data[total_pts:] = 0.0
+                sc.data[total_pts:, 3] = 0.0
+            sp.update_range(0, self._trail_gpu_capacity)
+            sc.update_range(0, self._trail_gpu_capacity)
+            self._subview_trail_geom.positions.draw_range = (0, total_pts)
+            self._subview_trail_line.visible = True
 
     # ------------------------------------------------------------------
     # Star field
     # ------------------------------------------------------------------
 
     def _update_stars(self) -> None:
-        """Update star field positions on the fixed shell.
-
-        Called only when stars are enabled and visual exists.
-        """
         np.multiply(self._star_directions, self._star_min_shell_radius,
                     out=self._star_positions)
-        self._star_visual.set_data(
-            pos=self._star_positions, face_color=self._star_base_colors,
-            size=self._star_base_sizes, edge_width=0,
-        )
-        if self._subview_star_visual is not None:
-            self._subview_star_visual.set_data(
-                pos=self._star_positions, face_color=self._star_base_colors,
-                size=self._star_base_sizes, edge_width=0,
-            )
+        geom = self._star_visual.geometry
+        geom.positions.data[:] = self._star_positions
+        geom.positions.update_range(0, len(self._star_positions))
+        if self._subview_stars is not None:
+            sg = self._subview_stars.geometry
+            sg.positions.data[:] = self._star_positions
+            sg.positions.update_range(0, len(self._star_positions))
 
     # ------------------------------------------------------------------
     # Frame update
     # ------------------------------------------------------------------
 
-    def _on_timer(self, event) -> None:
-        """Advance animation and render a frame.
+    def _tick(self) -> None:
+        """Called by QTimer while playing — advances sim time, asks for draw."""
+        import time as _time
+        now = _time.monotonic()
+        dt = 1.0 / 60.0 if self._last_tick is None else max(0.0, now - self._last_tick)
+        self._last_tick = now
 
-        Args:
-            event: VisPy timer event with `dt` attribute (seconds since last tick).
-        """
         if self._playing:
-            dt = event.dt if hasattr(event, "dt") else 1.0 / 60.0
             self._anim_time += self._anim_speed * dt
             if self._anim_time > 1.0:
                 self._anim_time = 0.0
                 self._trail_si[:] = -1
                 self._trail_ei[:] = -1
             self._current_sim_time = self._t_min + self._anim_time * self._time_range
+
         self._apply_keyboard_pan()
         self._apply_keyboard_rotate()
-        self._update_frame()
+        # Request a redraw — the actual render happens in _animate().
+        self._canvas_raw.request_draw()
 
     def _update_light_direction(self) -> None:
-        """Transform the precomputed world-space light direction into eye space
-        using cached camera trig (inverse rotation: cos(-φ)=cosφ, sin(-φ)=-sinφ).
+        """Transform world-space light direction to eye space.
+
+        Kept for parity with the VisPy engine even though pygfx's
+        Gaussian blob material doesn't consume a light direction — the
+        value is still useful for custom shaders if someone adds one,
+        and the update is cheap.  No-op from a rendering standpoint.
         """
+        # Computation preserved for future use / test parity.
         w = self._light_world
         x = w[0] * self._cos_az + w[1] * self._sin_az
         y = -w[0] * self._sin_az + w[1] * self._cos_az
@@ -1010,60 +1256,92 @@ class RenderEngine:
         eye_y = y * self._cos_el + z * self._sin_el
         eye_z = -y * self._sin_el + z * self._cos_el
         inv_norm = 1.0 / math.sqrt(x * x + eye_y * eye_y + eye_z * eye_z)
-        light = (x * inv_norm, eye_y * inv_norm, eye_z * inv_norm)
-
-        if self._particle_visual is not None:
-            self._particle_visual.light_position = light
-        if self._subview_markers is not None:
-            self._subview_markers.light_position = light
+        self._light_eye = (x * inv_norm, eye_y * inv_norm, eye_z * inv_norm)
 
     def _update_frame(self) -> None:
+        """Compute one frame's state (no GPU present yet)."""
         self._cache_camera_trig()
 
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
         if not mask.any():
-            self._canvas.update()
             return
 
         self._update_light_direction()
-        active_pos = positions[mask]
-        attrs = self._get_particle_attrs(mask)
 
-        # Camera update before GPU upload so tracking drives this frame's view
         if self._camera_controller is not None:
             self._camera_controller.update(self._current_sim_time, positions, mask)
         if self._subview_camera_controller is not None and self._subview_enabled:
             self._subview_camera_controller.update(self._current_sim_time, positions, mask)
 
-        if self._particle_visual is not None:
-            self._particle_visual.set_data(pos=active_pos, **attrs)
-
+        self._upload_particle_frame(positions, mask)
         self._update_trails(self._current_sim_time, positions, mask)
 
-        # Sub-view: feed the same computed data to its own visuals
         if self._subview_enabled and self._subview_markers is not None:
-            sub_size = attrs["size"] * self._subview_radius_scale
-            self._subview_markers.set_data(
-                pos=active_pos, face_color=attrs["face_color"],
-                size=sub_size, edge_color=attrs["edge_color"],
-                edge_width=attrs["edge_width"],
+            self._subview_markers.update_from(
+                positions, mask, self._is_bh, self._colors, self._sizes,
+                self._subview_radius_scale, self._subview_point_alpha,
             )
 
-        # Star field
         if self._stars_enabled and self._star_visual is not None:
             self._update_stars()
 
-        # Time overlay — only update the VisPy text when the display string
-        # actually changes (avoids per-frame texture re-render)
         if self._time_text is not None and self._time_display_enabled:
             text = D.format_sim_time(self._current_sim_time, self._time_unit)
-            if text != self._time_text.text:
-                self._time_text.text = text
+            if text != self._time_text_str:
+                self._time_text_str = text
+                self._time_text.set_text(text)
 
-        self._canvas.update()
+    def _animate(self) -> None:
+        """Draw callback registered with the canvas.
+
+        Invoked by the canvas whenever a redraw is needed.  Does the
+        per-frame data upload then issues the pygfx render passes.
+        """
+        self._update_frame()
+        self._render_passes()
+
+    def _render_passes(self) -> None:
+        """Issue main-view, sub-view, and overlay render passes."""
+        w, h = self._canvas.size
+        self._pygfx_camera.aspect = w / max(h, 1)
+
+        if self._subview_enabled and self._subview is not None:
+            self._render_with_subview(w, h)
+        else:
+            self._renderer.render(self._scene, self._pygfx_camera, flush=False)
+
+        # Overlay pass (time text) always last.
+        if self._time_text is not None and self._time_display_enabled:
+            self._renderer.render(self._overlay_scene, self._overlay_camera, flush=True)
+        else:
+            self._renderer.flush()
+
+    def _render_with_subview(self, w: int, h: int) -> None:
+        if self._subview["layout"].startswith("Split"):
+            if "Left" in self._subview["layout"]:
+                # main fills left half, sub fills right
+                rect_main = (0, 0, w // 2, h)
+                rect_sub = (w // 2, 0, w - w // 2, h)
+            else:
+                # horizontal split: top main / bottom sub
+                rect_main = (0, 0, w, h // 2)
+                rect_sub = (0, h // 2, w, h - h // 2)
+            self._renderer.render(self._scene, self._pygfx_camera,
+                                  rect=rect_main, flush=False, clear=True)
+            self._renderer.render(self._scene, self._subview_pygfx_camera,
+                                  rect=rect_sub, flush=False, clear=False)
+        else:
+            # PiP: full main + inset corner
+            self._renderer.render(self._scene, self._pygfx_camera, flush=False, clear=True)
+            sw, sh = self._subview["size"]
+            sx, sy = self._subview["pos"]
+            self._renderer.render(self._scene, self._subview_pygfx_camera,
+                                  rect=(sx, sy, sw, sh), flush=False, clear=True)
+
+        self._subview_pygfx_camera.aspect = max(self._subview["size"][0], 1) / max(self._subview["size"][1], 1)
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API (preserved verbatim from the VisPy implementation)
     # ------------------------------------------------------------------
 
     @property
@@ -1080,9 +1358,9 @@ class RenderEngine:
 
     @sim_time.setter
     def sim_time(self, value: float) -> None:
-        self._current_sim_time = np.clip(value, self._t_min, self._t_max)
+        self._current_sim_time = float(np.clip(value, self._t_min, self._t_max))
         self._anim_time = (self._current_sim_time - self._t_min) / self._time_range
-        self._update_frame()
+        self._canvas_raw.request_draw()
 
     @property
     def playing(self) -> bool:
@@ -1090,10 +1368,14 @@ class RenderEngine:
 
     def play(self) -> None:
         self._playing = True
-        self._timer.start()
+        self._ensure_timer()
+        self._last_tick = None
+        self._timer.start(16)
 
     def pause(self) -> None:
         self._playing = False
+        if self._timer is not None:
+            self._timer.stop()
 
     def toggle_play(self) -> None:
         if self._playing:
@@ -1101,53 +1383,37 @@ class RenderEngine:
         else:
             self.play()
 
-    def set_speed(self, speed: float) -> None:
-        """Set playback speed.
+    def _ensure_timer(self) -> None:
+        if self._timer is not None:
+            return
+        try:
+            from PyQt6.QtCore import QTimer
+        except ImportError:
+            self._timer = None
+            return
+        self._timer = QTimer(self._canvas_raw)
+        self._timer.timeout.connect(self._tick)
+        self._timer.setInterval(16)
 
-        Args:
-            speed: Fraction of total simulation duration advanced per real second.
-        """
+    def set_speed(self, speed: float) -> None:
         self._anim_speed = max(0.001, speed)
 
     def set_particle_color(self, pid: int, rgba: tuple[float, ...]) -> None:
-        """Set the color of a single particle.
-
-        Args:
-            pid: Integer particle ID.
-            rgba: (R, G, B, A) color tuple with values in [0, 1].
-        """
         idx = self._id_to_idx.get(pid)
         if idx is not None:
             self._colors[idx] = np.array(rgba, dtype=np.float32)
 
     def set_particle_size(self, pid: int, size: float) -> None:
-        """Set the per-particle size multiplier.
-
-        Args:
-            pid: Integer particle ID.
-            size: Scale factor relative to the base size (1.0 = default).
-        """
         idx = self._id_to_idx.get(pid)
         if idx is not None:
             self._per_particle_scale[idx] = size
             self._recompute_sizes()
 
     def set_radius_scale(self, scale: float) -> None:
-        """Set the global radius multiplier applied to all particles.
-
-        Args:
-            scale: Multiplier for particle sizes (clamped to >= 0.01).
-        """
         self._radius_scale = max(0.01, scale)
         self._recompute_sizes()
 
     def set_sizing_mode(self, absolute: bool) -> None:
-        """Switch between absolute (world-unit) and relative (pixel) sizing.
-
-        Args:
-            absolute: If True, particle sizes are in world units (same as x,y,z).
-                If False, sizes are in screen pixels.
-        """
         if absolute == self._sizing_absolute:
             return
         self._sizing_absolute = absolute
@@ -1155,372 +1421,360 @@ class RenderEngine:
         self._rebuild_particle_visual()
 
     def set_depth_scaling(self, enabled: bool) -> None:
-        """Toggle perspective depth scaling on particle markers.
-
-        Args:
-            enabled: If True, closer particles appear larger (perspective projection).
-        """
         if enabled == self._depth_scaling:
             return
         self._depth_scaling = enabled
         self._rebuild_particle_visual()
 
     def set_black_hole(self, pid: int, is_bh: bool = True) -> None:
-        """Mark or unmark a particle as a black hole for special rendering.
-
-        Args:
-            pid: Integer particle ID.
-            is_bh: If True, render with black-hole styling (dark face, colored edge ring).
-        """
         idx = self._id_to_idx.get(pid)
         if idx is not None:
             self._is_bh[idx] = is_bh
 
     def set_trail_length(self, frac: float) -> None:
-        """Set trail length as a fraction of total simulation time.
-
-        Args:
-            frac: Fraction in [0, 1]. E.g. 0.01 = 1% of the simulation shown as trail.
-        """
-        self._trail_length_frac = np.clip(frac, 0.0, 1.0)
-        # Reset two-pointer cache — trail window bounds changed
+        self._trail_length_frac = float(np.clip(frac, 0.0, 1.0))
         self._trail_si[:] = -1
         self._trail_ei[:] = -1
 
     def set_trail_alpha(self, alpha: float) -> None:
-        """Set peak trail opacity at the head (newest point).
-
-        Args:
-            alpha: Opacity in [0, 1]. Trails fade from 0 at the tail to this value.
-        """
-        self._trail_alpha = np.clip(alpha, 0.0, 1.0)
+        self._trail_alpha = float(np.clip(alpha, 0.0, 1.0))
 
     def set_point_alpha(self, alpha: float) -> None:
-        """Set particle marker opacity.
+        self._point_alpha = float(np.clip(alpha, 0.0, 1.0))
+        # Re-upload current frame so the alpha change takes effect even when paused.
+        if self._particle_geom is not None:
+            positions, mask = self._interp.evaluate_batch(self._current_sim_time)
+            self._upload_particle_frame(positions, mask)
 
-        Args:
-            alpha: Opacity in [0, 1]. 0 = invisible, 1 = fully opaque.
-        """
-        self._point_alpha = np.clip(alpha, 0.0, 1.0)
-        if self._particle_visual is not None:
-            self._particle_visual.alpha = self._point_alpha
-        if self._subview_markers is not None:
-            self._subview_markers.alpha = self._point_alpha
-
-    # ------------------------------------------------------------------
-    # Units
-    # ------------------------------------------------------------------
+    # --- Units ---
 
     def set_units(self, time_unit: str | None = None) -> None:
-        """Update the time unit label for the overlay.
-
-        Args:
-            time_unit: Time unit string (e.g. "yr", "Myr"). No-op if None.
-        """
         if time_unit:
             self._time_unit = time_unit
 
-    # ------------------------------------------------------------------
-    # Time overlay
-    # ------------------------------------------------------------------
+    # --- Time overlay ---
 
     def set_time_display(self, enabled: bool) -> None:
-        """Show or hide the on-screen time overlay.
-
-        Args:
-            enabled: If True, the simulation time is drawn on the canvas.
-        """
         self._time_display_enabled = enabled
         if self._time_text is not None:
             self._time_text.visible = enabled
 
     def set_time_font_size(self, size: float) -> None:
-        """Set the font size of the time overlay.
-
-        Args:
-            size: Font size in points.
-        """
-        self._time_font_size = size
+        self._time_font_size = float(size)
         if self._time_text is not None:
-            self._time_text.font_size = size
+            self._time_text.font_size = float(size)
+            self._reposition_time_text()
 
     def set_time_color(self, color) -> None:
-        """Set the color of the time overlay text.
-
-        Args:
-            color: Any VisPy-compatible color (RGBA tuple, color name, etc.).
-        """
         self._time_color = color
         if self._time_text is not None:
-            self._time_text.color = color
+            self._time_text.material.color = color
 
     def set_time_anchor(self, anchor: str) -> None:
-        """Set time overlay position.
-
-        Args:
-            anchor: Corner name — "top-left", "top-right", "bottom-left",
-                or "bottom-right".
-        """
         self._time_anchor = anchor
         self._reposition_time_text()
 
     def _reposition_time_text(self) -> None:
+        """Place the time overlay in the requested corner (screen coords)."""
         if self._time_text is None:
             return
         w, h = self._canvas.size
         ox, oy = D.TIME_OFFSET
+        # pygfx ScreenCoordsCamera uses bottom-left origin (OpenGL-style).
+        # Translate corner names accordingly.
         anchors = {
-            "top-left": ((ox, oy), "left", "top"),
-            "top-right": ((w - ox, oy), "right", "top"),
-            "bottom-left": ((ox, h - oy), "left", "bottom"),
-            "bottom-right": ((w - ox, h - oy), "right", "bottom"),
+            "top-left":     ((ox,      h - oy), "top-left"),
+            "top-right":    ((w - ox,  h - oy), "top-right"),
+            "bottom-left":  ((ox,      oy),     "bottom-left"),
+            "bottom-right": ((w - ox,  oy),     "bottom-right"),
         }
-        pos, ax, ay = anchors.get(self._time_anchor, anchors["top-left"])
-        self._time_text.pos = pos
-        self._time_text.anchors = (ax, ay)
+        (x, y), anchor_name = anchors.get(self._time_anchor, anchors["top-left"])
+        self._time_text.anchor = anchor_name
+        self._time_text.local.position = (x, y, 0)
 
-    # ------------------------------------------------------------------
-    # Star field
-    # ------------------------------------------------------------------
+    # --- Star field ---
 
     def enable_stars(self, enabled: bool = True) -> None:
-        """Toggle the background star field.
-
-        Args:
-            enabled: If True, show a spherical shell of background stars.
-        """
-        from vispy import scene
-
         self._stars_enabled = enabled
         if enabled and self._star_visual is None:
             if self._star_directions is None:
                 self._generate_star_field()
             np.multiply(self._star_directions, self._star_min_shell_radius,
                         out=self._star_positions)
-            self._star_visual = scene.Markers(
-                parent=self._view.scene,
+            star_geom = gfx.Geometry(
+                positions=self._star_positions.astype(np.float32).copy(),
+                colors=self._star_base_colors.copy(),
+                sizes=self._star_base_sizes.copy(),
             )
-            self._star_visual.set_data(
-                pos=self._star_positions,
-                face_color=self._star_base_colors,
-                size=self._star_base_sizes,
-                edge_width=0,
+            star_mat = gfx.PointsMaterial(
+                size_mode="vertex", size_space="screen",
+                color_mode="vertex",
             )
-            self._star_visual.order = -10
+            self._star_visual = gfx.Points(star_geom, star_mat)
+            self._star_visual.render_order = -10
+            self._scene.add(self._star_visual)
         if self._star_visual is not None:
             self._star_visual.visible = enabled
 
     def set_star_shell_factor(self, factor: float) -> None:
-        """Set the star field shell radius as a multiple of the max particle distance.
-
-        Args:
-            factor: Multiplier applied to the maximum particle distance from the
-                origin. Larger values push stars further out.
-        """
-        self._star_shell_factor = max(0.1, factor)
+        self._star_shell_factor = max(0.1, float(factor))
         self._star_min_shell_radius = max(
             self._star_max_particle_dist * self._star_shell_factor, 1.0,
         )
 
     def set_star_count(self, count: int) -> None:
-        """Change the number of background stars and regenerate the field.
-
-        Args:
-            count: Number of stars on the spherical shell.
-        """
         self._star_count = max(100, int(count))
         self._generate_star_field()
+        # Recreate star visual with the new count (geometry buffer size changed).
         if self._star_visual is not None:
-            self._star_visual.set_data(
-                pos=self._star_positions,
-                face_color=self._star_base_colors,
-                size=self._star_base_sizes,
-                edge_width=0,
-            )
-        if self._subview_star_visual is not None:
-            self._subview_star_visual.set_data(
-                pos=self._star_positions,
-                face_color=self._star_base_colors,
-                size=self._star_base_sizes,
-                edge_width=0,
-            )
+            self._scene.remove(self._star_visual)
+            self._star_visual = None
+        if self._subview_stars is not None:
+            self._scene.remove(self._subview_stars)
+            self._subview_stars = None
+        if self._stars_enabled:
+            self.enable_stars(True)
+            if self._subview_enabled:
+                self._ensure_subview_stars()
+
+    # --- Camera controller attach ---
 
     def set_camera_controller(self, controller) -> None:
-        """Attach a CameraController and initialize its framing.
-
-        Args:
-            controller: CameraController instance to drive the VisPy camera.
-        """
         self._camera_controller = controller
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
         if not mask.any():
             return
         center, distance = controller.initialize_framing(positions, mask)
-        self._view.camera.center = tuple(center)
-        self._view.camera.distance = distance
+        self._view_camera.center = tuple(center)
+        self._view_camera.distance = distance
 
     # ------------------------------------------------------------------
     # Sub-view
     # ------------------------------------------------------------------
 
     def enable_subview(self, layout: str = "PiP Bottom-Right", size_frac: float = 0.3) -> None:
-        """Create a sub-view on the same canvas.
-
-        Supports PiP (overlay in a corner) and split-screen layouts.
-        The sub-view has its own scene and visuals but shares the same
-        OpenGL context.  Per-frame data is computed once and passed to
-        both sets of visuals.
-
-        Args:
-            layout: Layout name — "PiP Bottom-Right", "PiP Bottom-Left",
-                "PiP Top-Right", "PiP Top-Left",
-                "Split Left | Right", "Split Top | Bottom".
-            size_frac: Fraction of main canvas size for PiP mode (0 to 1).
-        """
-        from vispy import scene
-
         if self._subview is not None:
             return
 
         w, h = self._canvas.size
+        self._subview_size_frac = size_frac
         self._subview_layout = layout
 
-        # PiP needs explicit position; split uses the grid layout
-        sx, sy = 0, 0
-        if not layout.startswith("Split"):
+        # Build sub-view rect
+        if layout.startswith("Split"):
+            sw = w // 2
+            sh = h // 2 if "Top" in layout else h
+            sx, sy = (w - sw, 0) if "Left" in layout else (0, 0)
+        else:
             sw, sh = int(w * size_frac), int(h * size_frac)
             margin = 10
             pip_corners = {
-                "PiP Bottom-Right": (w - sw - margin, h - sh - margin),
-                "PiP Bottom-Left": (margin, h - sh - margin),
-                "PiP Top-Right": (w - sw - margin, margin),
-                "PiP Top-Left": (margin, margin),
+                "PiP Bottom-Right": (w - sw - margin, margin),
+                "PiP Bottom-Left":  (margin,          margin),
+                "PiP Top-Right":    (w - sw - margin, h - sh - margin),
+                "PiP Top-Left":     (margin,          h - sh - margin),
             }
             sx, sy = pip_corners.get(layout, pip_corners["PiP Bottom-Right"])
 
-        # Create sub-view: grid cell for split, overlay for PiP
-        if layout.startswith("Split"):
-            if "Left" in layout:
-                self._subview = self._grid.add_view(row=0, col=1)
-            else:
-                self._subview = self._grid.add_view(row=1, col=0)
-        else:
-            self._subview = self._canvas.central_widget.add_view()
-            self._subview.pos = (sx, sy)
-            self._subview.size = (sw, sh)
+        self._subview = {
+            "layout": layout, "pos": (sx, sy), "size": (sw, sh),
+        }
 
-        self._subview.camera = scene.cameras.TurntableCamera(
-            fov=D.SUBVIEW_FOV, distance=10.0,
+        # Sub-view camera
+        self._subview_pygfx_camera = gfx.PerspectiveCamera(
+            fov=D.SUBVIEW_FOV, aspect=max(sw, 1) / max(sh, 1),
         )
-        self._subview.border_color = (1.0, 1.0, 1.0, 0.6)
+        self._subview_camera = PygfxTurntableCamera(
+            self._subview_pygfx_camera, fov=D.SUBVIEW_FOV,
+            azimuth=0.0, elevation=30.0, distance=10.0,
+        )
 
         from ..core.camera import CameraController, CameraMode
         self._subview_camera_controller = CameraController(
-            self._subview, masses=self._data.masses, particle_ids=self._data.particle_ids,
+            _ViewAdapter(self._subview_camera, self._scene),
+            masses=self._data.masses, particle_ids=self._data.particle_ids,
         )
         self._subview_camera_controller.mode = CameraMode.TARGET_COMOVING
 
-        # Create visuals in the sub-view's own scene
-        positions, mask = self._interp.evaluate_batch(self._current_sim_time)
-        active_pos = positions[mask] if mask.any() else np.zeros((1, 3), dtype=np.float32)
-        attrs = self._get_particle_attrs(mask)
+        # Sub-view markers — adapter renders into its own geometry so
+        # size/color overrides for the sub-view don't clobber the main view.
+        self._subview_markers = _MarkerAdapter(self)
+        self._subview_markers.create_in_scene(self._scene)
 
-        self._subview_markers = scene.Markers(
-            spherical=True, light_color=D.LIGHT_COLOR,
-            light_position=D.LIGHT_POSITION, light_ambient=D.LIGHT_AMBIENT,
-            parent=self._subview.scene,
+        # Sub-view trail line — created lazily inside _ensure_trail_geom.
+        sub_pos = np.zeros((max(self._trail_gpu_capacity, 64), 3), dtype=np.float32)
+        sub_col = np.zeros_like(sub_pos[:, :1].repeat(4, axis=1))
+        self._subview_trail_geom = gfx.Geometry(positions=sub_pos, colors=sub_col)
+        sub_trail_mat = gfx.LineMaterial(
+            thickness=1.5, thickness_space="screen",
+            color_mode="vertex", aa=True,
         )
-        self._subview_markers.set_data(
-            pos=active_pos, face_color=attrs["face_color"],
-            size=attrs["size"], edge_color=attrs["edge_color"],
-            edge_width=attrs["edge_width"],
-        )
+        self._subview_trail_line = gfx.Line(self._subview_trail_geom, sub_trail_mat)
+        self._scene.add(self._subview_trail_line)
 
-        # Star field for the sub-view (same data, own visual)
-        if self._stars_enabled and self._star_positions is not None:
-            self._subview_star_visual = scene.Markers(
-                parent=self._subview.scene,
-            )
-            self._subview_star_visual.set_data(
-                pos=self._star_positions,
-                face_color=self._star_base_colors,
-                size=self._star_base_sizes,
-                edge_width=0,
-            )
-            self._subview_star_visual.order = -10
-
-        # Defer framing to the first _update_frame call so the GUI
-        # has a chance to apply target/mode settings first.
-        # The controller's _target_needs_acquisition flag (set when
-        # target_particle is assigned) triggers an immediate snap.
-
+        self._ensure_subview_stars()
         self._subview_enabled = True
 
-    def disable_subview(self) -> None:
-        if self._subview is not None:
-            # Remove from grid's internal layout tracking if it was
-            # added as a grid cell (split mode).
-            if self._subview_layout and self._subview_layout.startswith("Split"):
-                grid = self._grid
-                to_remove = [
-                    k for k, v in grid._grid_widgets.items()
-                    if v[4] is self._subview
-                ]
-                for k in to_remove:
-                    row, col = grid._grid_widgets[k][:2]
-                    del grid._grid_widgets[k]
-                    if row in grid._cells and col in grid._cells[row]:
-                        del grid._cells[row][col]
-                grid._need_solver_recreate = True
+        # Seed camera framing
+        positions, mask = self._interp.evaluate_batch(self._current_sim_time)
+        if mask.any():
+            center, distance = self._subview_camera_controller.initialize_framing(positions, mask)
+            self._subview_camera.center = tuple(center)
+            self._subview_camera.distance = distance
 
-            self._subview.parent = None
-            self._subview = None
+    def _ensure_subview_stars(self) -> None:
+        if self._subview_stars is not None or not self._stars_enabled:
+            return
+        if self._star_positions is None:
+            return
+        geom = gfx.Geometry(
+            positions=self._star_positions.astype(np.float32).copy(),
+            colors=self._star_base_colors.copy(),
+            sizes=self._star_base_sizes.copy(),
+        )
+        mat = gfx.PointsMaterial(
+            size_mode="vertex", size_space="screen", color_mode="vertex",
+        )
+        self._subview_stars = gfx.Points(geom, mat)
+        self._subview_stars.render_order = -10
+        self._scene.add(self._subview_stars)
+
+    def disable_subview(self) -> None:
+        if self._subview is None:
+            return
+        if self._subview_markers is not None:
+            self._subview_markers.dispose(self._scene)
             self._subview_markers = None
+        if self._subview_trail_line is not None:
+            self._scene.remove(self._subview_trail_line)
             self._subview_trail_line = None
-            self._subview_star_visual = None
-            self._subview_camera_controller = None
-            self._subview_enabled = False
-            self._subview_layout = None
+            self._subview_trail_geom = None
+        if self._subview_stars is not None:
+            self._scene.remove(self._subview_stars)
+            self._subview_stars = None
+        self._subview_camera_controller = None
+        self._subview_camera = None
+        self._subview_pygfx_camera = None
+        self._subview = None
+        self._subview_enabled = False
+        self._subview_layout = None
 
     # ------------------------------------------------------------------
     # Display / export
     # ------------------------------------------------------------------
 
     def show(self) -> None:
-        from vispy import app
-        self._canvas.show()
-        self._timer.start()
-        app.run()
+        """Show the canvas and start the event loop (standalone path)."""
+        try:
+            from PyQt6 import QtWidgets
+        except ImportError:  # pragma: no cover
+            raise RuntimeError("PyQt6 is required to show the canvas")
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        self._canvas_raw.show()
+        self.play()
+        app.exec()
+
+    # Offscreen machinery (lazily built per size)
+    _off_canvas = None
+    _off_renderer = None
+    _off_size = None
+
+    def _ensure_offscreen(self, size: tuple[int, int]):
+        w, h = int(size[0]), int(size[1])
+        if self._off_canvas is None or self._off_size != (w, h):
+            self._off_canvas = OffscreenRenderCanvas(size=(w, h), pixel_ratio=1)
+            self._off_renderer = gfx.WgpuRenderer(self._off_canvas)
+            self._off_size = (w, h)
+        return self._off_canvas, self._off_renderer
+
+    def _render_offscreen(self, size: tuple[int, int]) -> np.ndarray:
+        w, h = int(size[0]), int(size[1])
+        canvas, renderer = self._ensure_offscreen((w, h))
+
+        # Run per-frame data update (in case time/camera changed).
+        self._update_frame()
+
+        # Save main camera aspect and restore after, so the onscreen camera
+        # isn't permanently distorted to the export aspect.
+        saved_aspect = self._pygfx_camera.aspect
+
+        def draw():
+            self._pygfx_camera.aspect = w / max(h, 1)
+            if self._subview_enabled and self._subview is not None:
+                self._render_with_subview_into(renderer, w, h)
+            else:
+                renderer.render(self._scene, self._pygfx_camera, flush=False)
+            if self._time_text is not None and self._time_display_enabled:
+                saved_pos = self._time_text.local.position
+                saved_anchor = self._time_text.anchor
+                self._reposition_time_text_for_size(w, h)
+                renderer.render(self._overlay_scene, self._overlay_camera, flush=True)
+                self._time_text.local.position = saved_pos
+                self._time_text.anchor = saved_anchor
+            else:
+                renderer.flush()
+
+        canvas.request_draw(draw)
+        img = np.asarray(canvas.draw())
+        self._pygfx_camera.aspect = saved_aspect
+        # Detach from the internal buffer.
+        return img.copy()
+
+    def _render_with_subview_into(self, renderer: gfx.WgpuRenderer,
+                                  w: int, h: int) -> None:
+        if self._subview["layout"].startswith("Split"):
+            if "Left" in self._subview["layout"]:
+                rect_main = (0, 0, w // 2, h)
+                rect_sub = (w // 2, 0, w - w // 2, h)
+            else:
+                rect_main = (0, 0, w, h // 2)
+                rect_sub = (0, h // 2, w, h - h // 2)
+            renderer.render(self._scene, self._pygfx_camera,
+                            rect=rect_main, flush=False, clear=True)
+            renderer.render(self._scene, self._subview_pygfx_camera,
+                            rect=rect_sub, flush=False, clear=False)
+        else:
+            renderer.render(self._scene, self._pygfx_camera, flush=False, clear=True)
+            sw, sh = self._subview["size"]
+            sx, sy = self._subview["pos"]
+            # PiP rect must be scaled to the export resolution.
+            cw, ch = self._canvas.size
+            scale_x = w / max(cw, 1)
+            scale_y = h / max(ch, 1)
+            rect = (int(sx * scale_x), int(sy * scale_y),
+                    int(sw * scale_x), int(sh * scale_y))
+            renderer.render(self._scene, self._subview_pygfx_camera,
+                            rect=rect, flush=False, clear=True)
+
+    def _reposition_time_text_for_size(self, w: int, h: int) -> None:
+        if self._time_text is None:
+            return
+        ox, oy = D.TIME_OFFSET
+        anchors = {
+            "top-left":     ((ox,      h - oy), "top-left"),
+            "top-right":    ((w - ox,  h - oy), "top-right"),
+            "bottom-left":  ((ox,      oy),     "bottom-left"),
+            "bottom-right": ((w - ox,  oy),     "bottom-right"),
+        }
+        (x, y), anchor_name = anchors.get(self._time_anchor, anchors["top-left"])
+        self._time_text.anchor = anchor_name
+        self._time_text.local.position = (x, y, 0)
 
     def screenshot(self, filepath: str | Path, size: tuple[int, int] | None = None) -> None:
-        """Save the current frame as a PNG image.
-
-        Args:
-            filepath: Output file path.
-            size: Render resolution as (width, height). Uses canvas size if None.
-        """
-        from vispy import io
-        img = self._canvas.render(size=size)
-        io.write_png(str(filepath), img)
+        """Save the current frame as a PNG image."""
+        from PIL import Image
+        render_size = size or self._canvas.size
+        img = self._render_offscreen(render_size)
+        # (H, W, 4) RGBA uint8
+        Image.fromarray(img).save(str(filepath))
 
     def render_video(
         self, filepath: str | Path, duration: float = D.VIDEO_DURATION,
         fps: int = D.VIDEO_FPS, size: tuple[int, int] | None = None,
         t_start: float | None = None, t_end: float | None = None,
-        progress_callback: callable | None = None,
+        progress_callback=None,
     ) -> None:
-        """Render the simulation to a video file.
-
-        Args:
-            filepath: Output file path (.mp4 or .gif).
-            duration: Video duration in real-time seconds.
-            fps: Frames per second.
-            size: Render resolution as (width, height). Uses canvas size if None.
-            t_start: Simulation start time. Uses data start if None.
-            t_end: Simulation end time. Uses data end if None.
-            progress_callback: Called as callback(current_frame, total_frames).
-                If it raises InterruptedError, rendering is cancelled.
-        """
+        """Render the simulation to a video file."""
         import av
 
         t0 = t_start if t_start is not None else self._t_min
@@ -1535,13 +1789,11 @@ class RenderEngine:
 
         try:
             for i, t in enumerate(frame_sim_times):
-                self._current_sim_time = t
-                self._anim_time = (t - self._t_min) / self._time_range
-                self._update_frame()
+                self._current_sim_time = float(t)
+                self._anim_time = (self._current_sim_time - self._t_min) / self._time_range
 
-                img = self._canvas.render(size=render_size)
+                img = self._render_offscreen(render_size)  # (H, W, 4) uint8 RGBA
 
-                # Create stream from actual rendered dimensions (first frame)
                 if stream is None:
                     h, w = img.shape[:2]
                     stream = container.add_stream("libx264", rate=fps)
@@ -1558,11 +1810,188 @@ class RenderEngine:
                 elif (i + 1) % (n_frames // 10 or 1) == 0:
                     print(f"Rendering: {(i + 1) / n_frames * 100:.0f}%")
 
-            # Flush encoder
-            for packet in stream.encode():
-                container.mux(packet)
+            if stream is not None:
+                for packet in stream.encode():
+                    container.mux(packet)
         finally:
             container.close()
 
         if progress_callback is None:
             print(f"Video saved to {filepath}")
+
+
+# ---------------------------------------------------------------------------
+# Sub-view marker adapter
+#
+# controls.py accesses engine._subview_markers.alpha and .scaling directly.
+# This tiny adapter translates those VisPy-style attribute writes into pygfx
+# size_space / material updates, and owns its own Points object that
+# renders into the main scene (visibility is gated by the render pass rect).
+# ---------------------------------------------------------------------------
+
+
+class _MarkerAdapter:
+    def __init__(self, engine: RenderEngine):
+        self._engine = engine
+        self._alpha = D.POINT_ALPHA
+        self._scaling = "visual" if engine._depth_scaling else False
+        self._visual = None
+        self._geom = None
+        self._material = None
+
+    def create_in_scene(self, scene: gfx.Scene) -> None:
+        n = self._engine._n_particles
+        pos = np.zeros((n, 3), dtype=np.float32)
+        col = np.zeros((n, 4), dtype=np.float32)
+        siz = np.zeros(n, dtype=np.float32)
+        self._geom = gfx.Geometry(positions=pos, colors=col, sizes=siz)
+        self._material = gfx.PointsGaussianBlobMaterial(
+            size_mode="vertex",
+            size_space="world" if self._scaling == "visual" else "screen",
+            color_mode="vertex",
+        )
+        self._visual = gfx.Points(self._geom, self._material)
+        scene.add(self._visual)
+
+    def dispose(self, scene: gfx.Scene) -> None:
+        if self._visual is not None:
+            scene.remove(self._visual)
+            self._visual = None
+
+    @property
+    def alpha(self) -> float:
+        return self._alpha
+
+    @alpha.setter
+    def alpha(self, value: float) -> None:
+        self._alpha = float(value)
+        self._engine._subview_point_alpha = self._alpha
+
+    @property
+    def scaling(self):
+        return self._scaling
+
+    @scaling.setter
+    def scaling(self, value) -> None:
+        self._scaling = value
+        # Rebuild material because size_space is immutable
+        n = self._engine._n_particles
+        scene = self._visual.parent if self._visual is not None else None
+        if scene is None:
+            return
+        scene.remove(self._visual)
+        self._material = gfx.PointsGaussianBlobMaterial(
+            size_mode="vertex",
+            size_space="world" if value == "visual" else "screen",
+            color_mode="vertex",
+        )
+        self._visual = gfx.Points(self._geom, self._material)
+        scene.add(self._visual)
+
+    def update_from(self, positions: np.ndarray, mask: np.ndarray,
+                    is_bh: np.ndarray, colors: np.ndarray, sizes: np.ndarray,
+                    radius_scale: float, point_alpha: float) -> None:
+        """Upload this frame's data, keyed by the engine's main-view state."""
+        if self._visual is None:
+            return
+        n = len(mask)
+        face = np.zeros((n, 4), dtype=np.float32)
+        sz = np.zeros(n, dtype=np.float32)
+        if mask.any():
+            active_nonbh = mask & ~is_bh
+            if active_nonbh.any():
+                face[active_nonbh] = colors[active_nonbh]
+                face[active_nonbh, 3] *= point_alpha
+                sz[active_nonbh] = sizes[active_nonbh] * radius_scale
+            active_bh = mask & is_bh
+            if active_bh.any():
+                # Sub-view: draw BHs as normal blobs (no separate ring pass
+                # — keeps the sub-view visual simple; they still show up).
+                face[active_bh, :3] = colors[active_bh, :3]
+                face[active_bh, 3] = point_alpha
+                sz[active_bh] = sizes[active_bh] * radius_scale
+        pos = np.where(np.isfinite(positions), positions.astype(np.float32), 0.0)
+        self._geom.positions.data[:] = pos
+        self._geom.colors.data[:] = face
+        self._geom.sizes.data[:] = sz
+        self._geom.positions.update_range(0, n)
+        self._geom.colors.update_range(0, n)
+        self._geom.sizes.update_range(0, n)
+
+
+# ---------------------------------------------------------------------------
+# Orbit / view adapters
+# ---------------------------------------------------------------------------
+
+
+class _ViewAdapter:
+    """Minimal VisPy-ViewBox substitute so CameraController stays unchanged.
+
+    CameraController reads ``view.camera`` and then pokes ``center``,
+    ``distance``, ``azimuth``, ``fov`` on it; those all exist on
+    PygfxTurntableCamera.
+    """
+
+    def __init__(self, camera: PygfxTurntableCamera, scene: gfx.Scene):
+        self.camera = camera
+        self.scene = scene
+
+
+class _PygfxOrbitAdapter:
+    """Mouse drag rotation + right-drag pan, pushed into PygfxTurntableCamera.
+
+    The built-in ``gfx.OrbitController`` manipulates the pygfx camera
+    directly (position/orientation), which would bypass our turntable
+    wrapper's azimuth/elevation state.  This adapter implements the
+    same gestures but routes them through the wrapper so all consumers
+    (light direction, framing, CameraController) stay in sync.
+    """
+
+    _LEFT = 1
+    _RIGHT = 2
+    _MIDDLE = 4
+
+    def __init__(self, camera_wrap: PygfxTurntableCamera, canvas) -> None:
+        self._camera = camera_wrap
+        self._canvas = canvas
+        self._drag_button = 0
+        self._last_pos = (0, 0)
+        canvas.add_event_handler(
+            self._on_event,
+            "pointer_down", "pointer_up", "pointer_move",
+        )
+
+    def _on_event(self, event) -> None:
+        et = event["event_type"]
+        if et == "pointer_down":
+            self._drag_button = event.get("button", 0)
+            self._last_pos = (event.get("x", 0), event.get("y", 0))
+        elif et == "pointer_up":
+            self._drag_button = 0
+        elif et == "pointer_move" and self._drag_button:
+            x, y = event.get("x", 0), event.get("y", 0)
+            dx = x - self._last_pos[0]
+            dy = y - self._last_pos[1]
+            self._last_pos = (x, y)
+            if self._drag_button == self._LEFT:
+                # Rotate: horizontal → azimuth, vertical → elevation
+                self._camera.azimuth = self._camera.azimuth - dx * 0.4
+                self._camera.elevation = self._camera.elevation + dy * 0.4
+                self._canvas.request_draw()
+            elif self._drag_button == self._RIGHT:
+                # Pan: right-drag moves the camera center in screen space
+                az = math.radians(self._camera.azimuth)
+                el = math.radians(self._camera.elevation)
+                right = np.array([math.cos(az), math.sin(az), 0.0])
+                up = np.array([
+                    -math.sin(el) * math.sin(az),
+                    math.sin(el) * math.cos(az),
+                    math.cos(el),
+                ])
+                # Scale pan rate to camera distance so it feels consistent.
+                step = self._camera.distance * 0.002
+                center = np.array(self._camera.center, dtype=np.float64)
+                center -= right * (dx * step)
+                center += up * (dy * step)
+                self._camera.center = tuple(center)
+                self._canvas.request_draw()

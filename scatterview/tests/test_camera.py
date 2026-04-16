@@ -56,7 +56,7 @@ def _make_synthetic_data(
 
 
 class _FakeCamera:
-    """Minimal mock for VisPy TurntableCamera."""
+    """Minimal mock matching CameraController's turntable-camera interface."""
     def __init__(self):
         self.fov = 45
         self.center = (0, 0, 0)
@@ -65,7 +65,7 @@ class _FakeCamera:
 
 
 class _FakeView:
-    """Minimal mock for VisPy ViewBox."""
+    """Minimal mock matching what CameraController expects (view.camera)."""
     def __init__(self):
         self.camera = _FakeCamera()
 
