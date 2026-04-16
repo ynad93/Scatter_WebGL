@@ -20,6 +20,7 @@ from rendercanvas.pyqt6 import QRenderCanvas
 from .. import defaults as D
 from ..core.data_loader import SimulationData
 from ..core.interpolation import TrajectoryInterpolator
+from .sphere_material import SphereImpostorMaterial
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +401,10 @@ class RenderEngine:
         self._canvas = _CanvasAdapter(self._canvas_raw)
         self._renderer = gfx.WgpuRenderer(self._canvas_raw)
         self._scene = gfx.Scene()
-        self._overlay_scene = gfx.Scene()
-        self._overlay_camera = gfx.ScreenCoordsCamera()
+
+        # Overlay scene kept for future non-text overlays; time text now
+        # uses a QLabel (see _build_time_overlay_label) to avoid pygfx's
+        # float32-filterable requirement on some GPU adapters.
 
         # Main camera — wrapped so legacy code keeps working
         self._pygfx_camera = gfx.PerspectiveCamera(
@@ -628,8 +631,7 @@ class RenderEngine:
         self._pygfx_camera.aspect = w / max(h, 1)
         if self._subview_pygfx_camera is not None:
             self._subview_pygfx_camera.aspect = w / max(h, 1)
-        self._reposition_time_text()
-        self._canvas_raw.request_draw()
+        self._reposition_time_text()  # keep QLabel anchored
 
     # ------------------------------------------------------------------
     # Camera helpers (cached trig)
@@ -879,9 +881,10 @@ class RenderEngine:
             colors=self._particle_colors.copy(),
             sizes=self._particle_sizes.copy(),
         )
-        self._particle_material = gfx.PointsGaussianBlobMaterial(
+        self._particle_material = SphereImpostorMaterial(
             size_mode="vertex", size_space=self._resolve_size_space(),
             color_mode="vertex",
+            ambient=D.LIGHT_AMBIENT,
         )
         self._particle_visual = gfx.Points(self._particle_geom, self._particle_material)
         self._scene.add(self._particle_visual)
@@ -914,19 +917,16 @@ class RenderEngine:
         if self._stars_enabled:
             self.enable_stars(True)
 
-        # Time overlay (screen-space)
+        # Time overlay.  pygfx's Text material samples float32 textures
+        # (requires the float32-filterable WGPU feature which our GPU
+        # adapter may not expose).  To keep text rendering fast and
+        # portable, we use a Qt QLabel overlaid on the canvas for
+        # onscreen display, and PIL text composite for offscreen export.
+        # `self._time_text` is a QLabel; `self._time_text_str` caches the
+        # current string to avoid per-frame rewrites.
         self._time_text_str = D.format_sim_time(self._t_min, self._time_unit)
-        self._time_text = gfx.Text(
-            text=self._time_text_str,
-            font_size=self._time_font_size,
-            anchor="top-left",
-            screen_space=True,
-            material=gfx.TextMaterial(color=self._time_color),
-        )
-        # Positioned each frame / on resize to stay in the requested corner.
-        self._overlay_scene.add(self._time_text)
+        self._time_text = self._build_time_overlay_label(self._time_text_str)
         self._reposition_time_text()
-        self._time_text.visible = self._time_display_enabled
 
         # Seed camera framing so the default view is reasonable before the
         # CLI attaches a CameraController.
@@ -1005,9 +1005,10 @@ class RenderEngine:
         """
         if self._particle_visual is not None:
             self._scene.remove(self._particle_visual)
-        self._particle_material = gfx.PointsGaussianBlobMaterial(
+        self._particle_material = SphereImpostorMaterial(
             size_mode="vertex", size_space=self._resolve_size_space(),
             color_mode="vertex",
+            ambient=D.LIGHT_AMBIENT,
         )
         self._particle_visual = gfx.Points(self._particle_geom, self._particle_material)
         self._scene.add(self._particle_visual)
@@ -1269,14 +1270,14 @@ class RenderEngine:
         self._apply_keyboard_rotate()
 
     def _update_light_direction(self) -> None:
-        """Transform world-space light direction to eye space.
+        """Transform world-space light direction to eye space and push it
+        to the sphere-impostor material uniforms.
 
-        Kept for parity with the VisPy engine even though pygfx's
-        Gaussian blob material doesn't consume a light direction — the
-        value is still useful for custom shaders if someone adds one,
-        and the update is cheap.  No-op from a rendering standpoint.
+        The light stays fixed in world space (e.g. upper-left of the
+        scene), so as the camera orbits we transform the world direction
+        into view space each frame so the highlight appears to shift
+        with the geometry instead of following the camera.
         """
-        # Computation preserved for future use / test parity.
         w = self._light_world
         x = w[0] * self._cos_az + w[1] * self._sin_az
         y = -w[0] * self._sin_az + w[1] * self._cos_az
@@ -1285,6 +1286,11 @@ class RenderEngine:
         eye_z = -y * self._sin_el + z * self._cos_el
         inv_norm = 1.0 / math.sqrt(x * x + eye_y * eye_y + eye_z * eye_z)
         self._light_eye = (x * inv_norm, eye_y * inv_norm, eye_z * inv_norm)
+
+        if self._particle_material is not None:
+            self._particle_material.light_dir = self._light_eye
+        if self._subview_markers is not None and self._subview_markers._material is not None:
+            self._subview_markers._material.light_dir = self._light_eye
 
     def _update_frame(self) -> None:
         """Compute one frame's state (no GPU present yet)."""
@@ -1319,7 +1325,10 @@ class RenderEngine:
             text = D.format_sim_time(self._current_sim_time, self._time_unit)
             if text != self._time_text_str:
                 self._time_text_str = text
-                self._time_text.set_text(text)
+                self._time_text.setText(text)
+                # Width may change when the formatted string length changes
+                # (e.g. scientific notation), so keep the corner anchored.
+                self._reposition_time_text()
 
     def _animate(self) -> None:
         """Draw callback registered with the canvas.
@@ -1333,20 +1342,19 @@ class RenderEngine:
         self._render_passes()
 
     def _render_passes(self) -> None:
-        """Issue main-view, sub-view, and overlay render passes."""
+        """Issue main-view and optional sub-view render passes.
+
+        The time overlay is a QLabel child of the canvas widget, so Qt
+        draws it for us on top of the rendered surface — no extra pygfx
+        pass needed.
+        """
         w, h = self._canvas.size
         self._pygfx_camera.aspect = w / max(h, 1)
 
         if self._subview_enabled and self._subview is not None:
             self._render_with_subview(w, h)
         else:
-            self._renderer.render(self._scene, self._pygfx_camera, flush=False)
-
-        # Overlay pass (time text) always last.
-        if self._time_text is not None and self._time_display_enabled:
-            self._renderer.render(self._overlay_scene, self._overlay_camera, flush=True)
-        else:
-            self._renderer.flush()
+            self._renderer.render(self._scene, self._pygfx_camera, flush=True)
 
     def _render_with_subview(self, w: int, h: int) -> None:
         if self._subview["layout"].startswith("Split"):
@@ -1361,14 +1369,14 @@ class RenderEngine:
             self._renderer.render(self._scene, self._pygfx_camera,
                                   rect=rect_main, flush=False, clear=True)
             self._renderer.render(self._scene, self._subview_pygfx_camera,
-                                  rect=rect_sub, flush=False, clear=False)
+                                  rect=rect_sub, flush=True, clear=False)
         else:
             # PiP: full main + inset corner
             self._renderer.render(self._scene, self._pygfx_camera, flush=False, clear=True)
             sw, sh = self._subview["size"]
             sx, sy = self._subview["pos"]
             self._renderer.render(self._scene, self._subview_pygfx_camera,
-                                  rect=(sx, sy, sw, sh), flush=False, clear=True)
+                                  rect=(sx, sy, sw, sh), flush=True, clear=True)
 
         self._subview_pygfx_camera.aspect = max(self._subview["size"][0], 1) / max(self._subview["size"][1], 1)
 
@@ -1534,40 +1542,60 @@ class RenderEngine:
     def set_time_display(self, enabled: bool) -> None:
         self._time_display_enabled = enabled
         if self._time_text is not None:
-            self._time_text.visible = enabled
+            self._time_text.setVisible(enabled)
 
     def set_time_font_size(self, size: float) -> None:
         self._time_font_size = float(size)
         if self._time_text is not None:
-            self._time_text.font_size = float(size)
+            self._time_text.setStyleSheet(self._time_label_stylesheet())
             self._reposition_time_text()
 
     def set_time_color(self, color) -> None:
         self._time_color = color
         if self._time_text is not None:
-            self._time_text.material.color = color
+            self._time_text.setStyleSheet(self._time_label_stylesheet())
 
     def set_time_anchor(self, anchor: str) -> None:
         self._time_anchor = anchor
         self._reposition_time_text()
 
+    def _build_time_overlay_label(self, text: str):
+        """Create a QLabel child of the canvas for the time overlay."""
+        from PyQt6 import QtWidgets, QtCore, QtGui
+        label = QtWidgets.QLabel(text, parent=self._canvas_raw)
+        label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        label.setStyleSheet(self._time_label_stylesheet())
+        label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground)
+        label.adjustSize()
+        label.raise_()
+        return label
+
+    def _time_label_stylesheet(self) -> str:
+        r, g, b, a = self._time_color
+        return (
+            f"color: rgba({int(r * 255)}, {int(g * 255)}, {int(b * 255)}, "
+            f"{int(a * 255)}); background: transparent; "
+            f"font-size: {int(self._time_font_size)}pt; font-weight: 600;"
+        )
+
     def _reposition_time_text(self) -> None:
-        """Place the time overlay in the requested corner (screen coords)."""
+        """Place the time overlay QLabel in the requested corner."""
         if self._time_text is None:
             return
+        self._time_text.adjustSize()
         w, h = self._canvas.size
+        lw = self._time_text.width()
+        lh = self._time_text.height()
         ox, oy = D.TIME_OFFSET
-        # pygfx ScreenCoordsCamera uses bottom-left origin (OpenGL-style).
-        # Translate corner names accordingly.
-        anchors = {
-            "top-left":     ((ox,      h - oy), "top-left"),
-            "top-right":    ((w - ox,  h - oy), "top-right"),
-            "bottom-left":  ((ox,      oy),     "bottom-left"),
-            "bottom-right": ((w - ox,  oy),     "bottom-right"),
+        corners = {
+            "top-left":     (ox,           oy),
+            "top-right":    (w - lw - ox,  oy),
+            "bottom-left":  (ox,           h - lh - oy),
+            "bottom-right": (w - lw - ox,  h - lh - oy),
         }
-        (x, y), anchor_name = anchors.get(self._time_anchor, anchors["top-left"])
-        self._time_text.anchor = anchor_name
-        self._time_text.local.position = (x, y, 0)
+        x, y = corners.get(self._time_anchor, corners["top-left"])
+        self._time_text.move(x, y)
+        self._time_text.setVisible(self._time_display_enabled)
 
     # --- Star field ---
 
@@ -1771,8 +1799,6 @@ class RenderEngine:
         # Run per-frame data update (in case time/camera changed).
         self._update_frame()
 
-        # Save main camera aspect and restore after, so the onscreen camera
-        # isn't permanently distorted to the export aspect.
         saved_aspect = self._pygfx_camera.aspect
 
         def draw():
@@ -1780,22 +1806,60 @@ class RenderEngine:
             if self._subview_enabled and self._subview is not None:
                 self._render_with_subview_into(renderer, w, h)
             else:
-                renderer.render(self._scene, self._pygfx_camera, flush=False)
-            if self._time_text is not None and self._time_display_enabled:
-                saved_pos = self._time_text.local.position
-                saved_anchor = self._time_text.anchor
-                self._reposition_time_text_for_size(w, h)
-                renderer.render(self._overlay_scene, self._overlay_camera, flush=True)
-                self._time_text.local.position = saved_pos
-                self._time_text.anchor = saved_anchor
-            else:
-                renderer.flush()
+                renderer.render(self._scene, self._pygfx_camera, flush=True)
 
         canvas.request_draw(draw)
-        img = np.asarray(canvas.draw())
+        img = np.asarray(canvas.draw()).copy()
         self._pygfx_camera.aspect = saved_aspect
-        # Detach from the internal buffer.
-        return img.copy()
+
+        # Composite the Qt-rendered time overlay as PIL text.  QLabel
+        # only paints over the live canvas; for offscreen export we
+        # draw the same string onto the numpy buffer ourselves.
+        if self._time_display_enabled and self._time_text_str:
+            img = self._composite_time_overlay(img, w, h)
+        return img
+
+    def _composite_time_overlay(self, img: np.ndarray, w: int, h: int) -> np.ndarray:
+        """Draw the current time text onto an RGBA offscreen frame."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        pil = Image.fromarray(img)
+        draw = ImageDraw.Draw(pil)
+
+        # Resolve a font at the current engine font size.  Fall back to
+        # PIL's default (tiny bitmap) if DejaVu isn't available.
+        font_px = int(round(self._time_font_size * 1.33))  # pt -> px
+        font = None
+        for path in (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        ):
+            try:
+                font = ImageFont.truetype(path, font_px)
+                break
+            except (OSError, IOError):
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        # Measure for corner anchoring
+        bbox = draw.textbbox((0, 0), self._time_text_str, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        ox, oy = D.TIME_OFFSET
+        corners = {
+            "top-left":     (ox,          oy),
+            "top-right":    (w - tw - ox, oy),
+            "bottom-left":  (ox,          h - th - oy * 2),
+            "bottom-right": (w - tw - ox, h - th - oy * 2),
+        }
+        x, y = corners.get(self._time_anchor, corners["top-left"])
+
+        r, g, b, a = self._time_color
+        rgba = (int(r * 255), int(g * 255), int(b * 255), int(a * 255))
+        draw.text((x - bbox[0], y - bbox[1]), self._time_text_str, font=font, fill=rgba)
+        return np.asarray(pil)
 
     def _render_with_subview_into(self, renderer: gfx.WgpuRenderer,
                                   w: int, h: int) -> None:
@@ -1822,20 +1886,6 @@ class RenderEngine:
                     int(sw * scale_x), int(sh * scale_y))
             renderer.render(self._scene, self._subview_pygfx_camera,
                             rect=rect, flush=False, clear=True)
-
-    def _reposition_time_text_for_size(self, w: int, h: int) -> None:
-        if self._time_text is None:
-            return
-        ox, oy = D.TIME_OFFSET
-        anchors = {
-            "top-left":     ((ox,      h - oy), "top-left"),
-            "top-right":    ((w - ox,  h - oy), "top-right"),
-            "bottom-left":  ((ox,      oy),     "bottom-left"),
-            "bottom-right": ((w - ox,  oy),     "bottom-right"),
-        }
-        (x, y), anchor_name = anchors.get(self._time_anchor, anchors["top-left"])
-        self._time_text.anchor = anchor_name
-        self._time_text.local.position = (x, y, 0)
 
     def screenshot(self, filepath: str | Path, size: tuple[int, int] | None = None) -> None:
         """Save the current frame as a PNG image."""
@@ -1946,10 +1996,11 @@ class _MarkerAdapter:
         col = np.zeros((n, 4), dtype=np.float32)
         siz = np.zeros(n, dtype=np.float32)
         self._geom = gfx.Geometry(positions=pos, colors=col, sizes=siz)
-        self._material = gfx.PointsGaussianBlobMaterial(
+        self._material = SphereImpostorMaterial(
             size_mode="vertex",
             size_space="world" if self._scaling == "visual" else "screen",
             color_mode="vertex",
+            ambient=D.LIGHT_AMBIENT,
         )
         self._visual = gfx.Points(self._geom, self._material)
         scene.add(self._visual)
@@ -1981,10 +2032,11 @@ class _MarkerAdapter:
         if scene is None:
             return
         scene.remove(self._visual)
-        self._material = gfx.PointsGaussianBlobMaterial(
+        self._material = SphereImpostorMaterial(
             size_mode="vertex",
             size_space="world" if value == "visual" else "screen",
             color_mode="vertex",
+            ambient=D.LIGHT_AMBIENT,
         )
         self._visual = gfx.Points(self._geom, self._material)
         scene.add(self._visual)
