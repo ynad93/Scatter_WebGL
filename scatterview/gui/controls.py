@@ -1455,8 +1455,6 @@ class ControlPanel:
     def show(self) -> None:
         """Show the main window and start Qt event loop."""
         self._window.show()
-        if self._engine._timer is not None:
-            self._engine._timer.start()
         self._app.exec()
 
     @property
