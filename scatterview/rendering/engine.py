@@ -389,8 +389,13 @@ class RenderEngine:
                         self._is_bh[idx] = True
 
         # --- Window & pygfx stack ---
+        # update_mode="continuous" drives draws up to max_fps from the
+        # canvas's own scheduler; we derive simulation dt from the
+        # wall-clock inside the draw callback so playback speed stays
+        # decoupled from render rate.  Keyboard pan/rotate and sim
+        # advancement also happen inside the callback.
         self._canvas_raw = QRenderCanvas(
-            size=size, title=title, update_mode="manual", max_fps=60, vsync=True,
+            size=size, title=title, update_mode="continuous", max_fps=60, vsync=True,
         )
         self._canvas = _CanvasAdapter(self._canvas_raw)
         self._renderer = gfx.WgpuRenderer(self._canvas_raw)
@@ -496,9 +501,8 @@ class RenderEngine:
             "wheel", "key_down", "key_up", "resize",
         )
 
-        # Qt timer for play/pause
-        self._timer = None
-        self._last_tick = None  # monotonic seconds of previous tick
+        # Wall-clock reference for per-frame dt advancement inside _animate.
+        self._last_tick = None
 
     # ------------------------------------------------------------------
     # Event handling
@@ -1237,11 +1241,20 @@ class RenderEngine:
     # Frame update
     # ------------------------------------------------------------------
 
-    def _tick(self) -> None:
-        """Called by QTimer while playing — advances sim time, asks for draw."""
+    def _advance_sim_time(self) -> None:
+        """Advance ``_current_sim_time`` by one wall-clock step.
+
+        Called at the top of each draw callback.  Playback speed is
+        wall-clock-driven (fraction of sim duration per real second),
+        so the render rate only affects smoothness, not pace.  Holds
+        at the same time while paused.
+        """
         import time as _time
         now = _time.monotonic()
-        dt = 1.0 / 60.0 if self._last_tick is None else max(0.0, now - self._last_tick)
+        if self._last_tick is None:
+            dt = 0.0
+        else:
+            dt = max(0.0, now - self._last_tick)
         self._last_tick = now
 
         if self._playing:
@@ -1254,8 +1267,6 @@ class RenderEngine:
 
         self._apply_keyboard_pan()
         self._apply_keyboard_rotate()
-        # Request a redraw — the actual render happens in _animate().
-        self._canvas_raw.request_draw()
 
     def _update_light_direction(self) -> None:
         """Transform world-space light direction to eye space.
@@ -1313,9 +1324,11 @@ class RenderEngine:
     def _animate(self) -> None:
         """Draw callback registered with the canvas.
 
-        Invoked by the canvas whenever a redraw is needed.  Does the
-        per-frame data upload then issues the pygfx render passes.
+        Invoked by the canvas's scheduler on every present tick.  Handles
+        wall-clock-driven simulation-time advancement, keyboard-held
+        pan/rotate, per-frame data upload, and the pygfx render passes.
         """
+        self._advance_sim_time()
         self._update_frame()
         self._render_passes()
 
@@ -1387,32 +1400,18 @@ class RenderEngine:
 
     def play(self) -> None:
         self._playing = True
-        self._ensure_timer()
+        # Reset the wall-clock reference so the first post-play frame
+        # doesn't inherit a stale dt that would jump the sim forward.
         self._last_tick = None
-        self._timer.start(16)
 
     def pause(self) -> None:
         self._playing = False
-        if self._timer is not None:
-            self._timer.stop()
 
     def toggle_play(self) -> None:
         if self._playing:
             self.pause()
         else:
             self.play()
-
-    def _ensure_timer(self) -> None:
-        if self._timer is not None:
-            return
-        try:
-            from PyQt6.QtCore import QTimer
-        except ImportError:
-            self._timer = None
-            return
-        self._timer = QTimer(self._canvas_raw)
-        self._timer.timeout.connect(self._tick)
-        self._timer.setInterval(16)
 
     def set_speed(self, speed: float) -> None:
         self._anim_speed = max(0.001, speed)
