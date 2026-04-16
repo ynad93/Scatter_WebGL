@@ -56,8 +56,8 @@ class ControlPanel:
         # Control panel on the right (stretch factor 1)
         self._panel = QtWidgets.QScrollArea()
         self._panel.setWidgetResizable(True)
-        self._panel.setMinimumWidth(300)
-        self._panel.setMaximumWidth(400)
+        self._panel.setMinimumWidth(380)
+        self._panel.setMaximumWidth(520)
 
         panel_widget = QtWidgets.QWidget()
         self._panel_layout = QtWidgets.QVBoxLayout(panel_widget)
@@ -75,6 +75,12 @@ class ControlPanel:
 
         # Stretch at bottom
         self._panel_layout.addStretch()
+
+        # Route wheel events over interactive child widgets to the scroll
+        # area unless the widget is focused.  Without this, spinning the
+        # mouse wheel to scroll the panel instead nudges whichever
+        # slider/spinbox/combo happens to be under the cursor.
+        self._install_wheel_filter(panel_widget)
 
     def _apply_dark_theme(self) -> None:
         """Apply a dark theme stylesheet inspired by Windows 11 / Fluent."""
@@ -239,6 +245,35 @@ class ControlPanel:
         group.setLayout(layout)
         self._panel_layout.addWidget(group)
         return layout
+
+    def _install_wheel_filter(self, root) -> None:
+        """Install a wheel filter on interactive descendants of ``root``.
+
+        Wheel events that land on a spinbox, slider, or combo that isn't
+        keyboard-focused get forwarded to the scroll area's viewport so
+        the panel scrolls instead of the value changing.
+        """
+        from PyQt6 import QtCore, QtWidgets
+
+        panel = self._panel
+
+        class _WheelFilter(QtCore.QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QtCore.QEvent.Type.Wheel and not obj.hasFocus():
+                    QtWidgets.QApplication.sendEvent(panel.viewport(), event)
+                    return True
+                return False
+
+        self._wheel_filter = _WheelFilter(self._window)
+        targets = (
+            QtWidgets.QAbstractSpinBox,
+            QtWidgets.QAbstractSlider,
+            QtWidgets.QComboBox,
+        )
+        for widget in root.findChildren(QtWidgets.QWidget):
+            if isinstance(widget, targets):
+                widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+                widget.installEventFilter(self._wheel_filter)
 
     def _add_slider(
         self, layout, label: str, min_val: float, max_val: float,
@@ -420,6 +455,15 @@ class ControlPanel:
         )
         self._absolute_cb.toggled.connect(self._engine.set_sizing_mode)
         section.addWidget(self._absolute_cb)
+
+        # Equal sizes toggle
+        self._equal_cb = QtWidgets.QCheckBox("Equal Sizes")
+        self._equal_cb.setToolTip(
+            "Render every body at the same size, ignoring per-particle radii."
+        )
+        self._equal_cb.setChecked(self._engine._equal_sizes)
+        self._equal_cb.toggled.connect(self._engine.set_equal_sizes)
+        section.addWidget(self._equal_cb)
 
         # Depth scaling toggle (uses VisPy's native perspective scaling)
         self._depth_cb = QtWidgets.QCheckBox("Depth Scaling")
@@ -987,10 +1031,29 @@ class ControlPanel:
         row.addWidget(self._subview_center_combo)
         section.addLayout(row)
 
+        # Free zoom toggle (independent of main view)
+        self._subview_free_zoom_cb = QtWidgets.QCheckBox("Free Zoom")
+        self._subview_free_zoom_cb.setToolTip(
+            "Manual zoom control for the sub-view (scroll wheel over it).\n"
+            "Auto-enabled when you scroll over the sub-view."
+        )
+        self._subview_free_zoom_cb.toggled.connect(self._on_subview_free_zoom_toggle)
+        section.addWidget(self._subview_free_zoom_cb)
+
         # Auto-rotate
         self._subview_rotate_cb = QtWidgets.QCheckBox("Auto-Rotate")
         self._subview_rotate_cb.toggled.connect(self._on_subview_rotate_toggle)
         section.addWidget(self._subview_rotate_cb)
+
+        # Lock orientation between main view and sub-view (bidirectional)
+        self._subview_lock_cb = QtWidgets.QCheckBox("Lock Orientation to Main")
+        self._subview_lock_cb.setToolTip(
+            "Keep main and sub-view azimuth/elevation in sync.\n"
+            "Rotating either view drags the other with it."
+        )
+        self._subview_lock_cb.setChecked(self._engine._subview_lock_orientation)
+        self._subview_lock_cb.toggled.connect(self._engine.set_subview_lock_orientation)
+        section.addWidget(self._subview_lock_cb)
 
         self._add_slider(
             section, "Rot. Speed", 0.0, 5.0, _D.ROTATION_SPEED,
@@ -1011,6 +1074,15 @@ class ControlPanel:
             self._on_subview_framing_fraction_change,
             tooltip="Fraction of the screen's vertical half-extent\n"
                     "for framing in the sub-view.",
+        )
+
+        # Zoom memory (independent of main view)
+        self._subview_zoom_memory_frames = _D.ZOOM_MEMORY_FRAMES
+        self._add_slider(
+            section, "Zoom Memory", 10, 600, _D.ZOOM_MEMORY_FRAMES,
+            self._on_subview_zoom_memory_change,
+            tooltip="Rolling-average window (frames) for the sub-view zoom.\n"
+                    "Independent of the main view.",
         )
 
         # --- Appearance ---
@@ -1037,13 +1109,6 @@ class ControlPanel:
             tooltip="Global size multiplier for sub-view particles.",
         )
 
-        # Trail alpha
-        self._add_slider(
-            section, "Trail Alpha", 0.0, 1.0, _D.TRAIL_ALPHA,
-            self._set_subview_trail_alpha,
-            tooltip="Peak trail opacity in the sub-view.",
-        )
-
     def _on_subview_toggle(self, enabled: bool) -> None:
         """Enable or disable the sub-view.
 
@@ -1060,6 +1125,11 @@ class ControlPanel:
             self._on_subview_mode_change(self._subview_mode_combo.currentText())
             self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
             self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
+            self._on_subview_zoom_memory_change(self._subview_zoom_memory_frames)
+            self._on_subview_free_zoom_toggle(self._subview_free_zoom_cb.isChecked())
+            ctrl = self._engine._subview_camera_controller
+            if ctrl is not None:
+                ctrl._free_zoom_callbacks.append(self._on_subview_free_zoom_changed)
         else:
             self._engine.disable_subview()
 
@@ -1072,6 +1142,11 @@ class ControlPanel:
             self._on_subview_mode_change(self._subview_mode_combo.currentText())
             self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
             self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
+            self._on_subview_zoom_memory_change(self._subview_zoom_memory_frames)
+            self._on_subview_free_zoom_toggle(self._subview_free_zoom_cb.isChecked())
+            ctrl = self._engine._subview_camera_controller
+            if ctrl is not None:
+                ctrl._free_zoom_callbacks.append(self._on_subview_free_zoom_changed)
 
     def _on_subview_mode_change(self, text: str) -> None:
         """Set the sub-view camera mode.
@@ -1122,9 +1197,7 @@ class ControlPanel:
         Args:
             enabled: Whether closer particles appear larger.
         """
-        markers = self._engine._subview_markers
-        if markers is not None:
-            markers.scaling = "visual" if enabled else False
+        self._engine.set_subview_depth_scaling(enabled)
 
     def _on_subview_rotate_toggle(self, enabled: bool) -> None:
         """Toggle auto-rotation on the sub-view camera.
@@ -1135,6 +1208,18 @@ class ControlPanel:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
             ctrl.auto_rotate = enabled
+
+    def _on_subview_free_zoom_toggle(self, enabled: bool) -> None:
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is not None:
+            ctrl.free_zoom = enabled
+
+    def _on_subview_free_zoom_changed(self, value: bool) -> None:
+        """Sync the sub-view Free Zoom checkbox when the controller flips it."""
+        if self._subview_free_zoom_cb.isChecked() != value:
+            self._subview_free_zoom_cb.blockSignals(True)
+            self._subview_free_zoom_cb.setChecked(value)
+            self._subview_free_zoom_cb.blockSignals(False)
 
     def _set_subview_rotation_speed(self, value: float) -> None:
         ctrl = self._engine._subview_camera_controller
@@ -1160,6 +1245,19 @@ class ControlPanel:
             ctrl._framing_fraction = value
             ctrl._cache_fov_trig()
 
+    def _on_subview_zoom_memory_change(self, value: float) -> None:
+        """Resize the sub-view camera's rolling-average ring buffer."""
+        n = max(1, int(value))
+        self._subview_zoom_memory_frames = n
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is None:
+            return
+        avg = ctrl._smoothed_framing_radius
+        ctrl._zoom_memory_frames = n
+        ctrl._radius_ring = np.full(n, avg, dtype=np.float64)
+        ctrl._radius_ring_sum = avg * n
+        ctrl._radius_ring_idx = 0
+
     def _set_subview_point_alpha(self, value: float) -> None:
         markers = self._engine._subview_markers
         if markers is not None:
@@ -1169,11 +1267,10 @@ class ControlPanel:
         """Store the sub-view radius scale for use during set_data calls."""
         self._engine._subview_radius_scale = value
 
-    def _set_subview_trail_alpha(self, value: float) -> None:
-        self._engine._subview_trail_alpha = value
-
     def _build_export_controls(self) -> None:
         from PyQt6 import QtWidgets
+
+        from .. import defaults as _D
 
         section = self._add_section("Export")
 
@@ -1213,7 +1310,7 @@ class ControlPanel:
         row.addWidget(QtWidgets.QLabel("Duration (s)"))
         self._duration_spin = QtWidgets.QDoubleSpinBox()
         self._duration_spin.setRange(1.0, 300.0)
-        self._duration_spin.setValue(10.0)
+        self._duration_spin.setValue(_D.VIDEO_DURATION)
         row.addWidget(self._duration_spin)
         section.addLayout(row)
 
@@ -1221,7 +1318,7 @@ class ControlPanel:
         row.addWidget(QtWidgets.QLabel("FPS"))
         self._fps_spin = QtWidgets.QSpinBox()
         self._fps_spin.setRange(1, 120)
-        self._fps_spin.setValue(30)
+        self._fps_spin.setValue(_D.VIDEO_FPS)
         row.addWidget(self._fps_spin)
         section.addLayout(row)
 
@@ -1229,13 +1326,45 @@ class ControlPanel:
         row.addWidget(QtWidgets.QLabel("Resolution"))
         self._res_w = QtWidgets.QSpinBox()
         self._res_w.setRange(320, 7680)
-        self._res_w.setValue(2560)
+        self._res_w.setValue(_D.VIDEO_WIDTH)
         self._res_h = QtWidgets.QSpinBox()
         self._res_h.setRange(240, 4320)
-        self._res_h.setValue(1440)
+        self._res_h.setValue(_D.VIDEO_HEIGHT)
         row.addWidget(self._res_w)
         row.addWidget(QtWidgets.QLabel("x"))
         row.addWidget(self._res_h)
+        section.addLayout(row)
+
+        # Codec selector: maps display label -> ffmpeg codec name
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Codec"))
+        self._codec_combo = QtWidgets.QComboBox()
+        self._codec_map = {
+            "libx264 (CPU)": "libx264",
+            "h264_nvenc (NVIDIA GPU)": "h264_nvenc",
+            "hevc_nvenc (NVIDIA GPU, HEVC)": "hevc_nvenc",
+        }
+        for label in self._codec_map:
+            self._codec_combo.addItem(label)
+        self._codec_combo.setToolTip(
+            "Video encoder. NVENC uses the NVIDIA GPU and is typically\n"
+            "several times faster than libx264. Falls back to libx264 if\n"
+            "the NVIDIA encoder fails to initialize."
+        )
+        row.addWidget(self._codec_combo)
+        section.addLayout(row)
+
+        # Quality selector: maps to per-codec (preset, cq/crf) tuples
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Quality"))
+        self._quality_combo = QtWidgets.QComboBox()
+        for label in ("Fast", "Balanced", "Quality"):
+            self._quality_combo.addItem(label)
+        self._quality_combo.setCurrentText("Balanced")
+        self._quality_combo.setToolTip(
+            "Trade off encode speed vs. file size / visual fidelity."
+        )
+        row.addWidget(self._quality_combo)
         section.addLayout(row)
 
         self._record_btn = QtWidgets.QPushButton("Record Video (MP4)")
@@ -1289,17 +1418,39 @@ class ControlPanel:
         t_start = self._render_t_start.value()
         t_end = self._render_t_end.value()
 
+        codec = self._codec_map[self._codec_combo.currentText()]
+        codec_options = self._resolve_codec_options(
+            codec, self._quality_combo.currentText(),
+        )
+
         try:
             self._engine.render_video(
                 filepath, duration=duration, fps=fps, size=size,
                 t_start=t_start, t_end=t_end,
                 progress_callback=on_progress,
+                codec=codec, codec_options=codec_options,
             )
         except InterruptedError:
             pass
         finally:
             progress.close()
             self._engine._playing = was_playing
+
+    @staticmethod
+    def _resolve_codec_options(codec: str, quality: str) -> dict:
+        """Map (codec, quality level) to ffmpeg stream options."""
+        if codec == "libx264":
+            presets = {"Fast": "veryfast", "Balanced": "fast", "Quality": "medium"}
+            crfs = {"Fast": "23", "Balanced": "20", "Quality": "18"}
+            return {"preset": presets[quality], "crf": crfs[quality]}
+        if codec in ("h264_nvenc", "hevc_nvenc"):
+            # NVENC presets: p1 = fastest, p7 = slowest/best quality.
+            nv_presets = {"Fast": "p2", "Balanced": "p4", "Quality": "p6"}
+            cqs_h264 = {"Fast": "26", "Balanced": "23", "Quality": "19"}
+            cqs_hevc = {"Fast": "28", "Balanced": "25", "Quality": "21"}
+            cqs = cqs_hevc if codec == "hevc_nvenc" else cqs_h264
+            return {"preset": nv_presets[quality], "rc": "vbr", "cq": cqs[quality]}
+        return {}
 
     def show(self) -> None:
         """Show the main window and start Qt event loop."""

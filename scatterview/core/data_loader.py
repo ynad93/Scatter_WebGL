@@ -307,6 +307,7 @@ def _compute_valid_intervals(
 
 def load_hdf5(
     filepath: Path,
+    key: str | None = None,
     field_map: dict[str, str] | None = None,
 ) -> SimulationData:
     """Load simulation data from an HDF5 file.
@@ -322,17 +323,33 @@ def load_hdf5(
        zero-padded (snapshot_0000) and unpadded (snap_0, snap_1, ...,
        snap_102) names work correctly.
 
+    By default the loader assumes the chosen layout begins at the top
+    level of the file.  If ``key`` is given, that key is treated as the
+    effective root: pandas reads use ``pd.read_hdf(..., key=key)``, and
+    raw-h5py layouts look for ``positions`` / ``snapshot*`` groups inside
+    the ``key`` group.  If no layout matches, the loader raises a
+    ``ValueError`` rather than silently returning empty data.
+
     Args:
         filepath: Path to the HDF5 file.
+        key: Optional HDF5 key identifying the group (or pandas dataset)
+            that holds the phase-space data.  Required when the file
+            contains multiple pandas datasets or nests the data under a
+            non-root group.
         field_map: Optional mapping from standard names to HDF5 dataset paths.
     """
     import h5py
 
-    # Try multi-index DataFrame first (pandas HDF5 table format)
+    # Try multi-index DataFrame first (pandas HDF5 table format).
+    # If the user passed a key, trust it — let pandas errors propagate.
+    # If not, a failure here just means this file isn't a pandas table;
+    # fall through to the raw-h5py layouts.
     try:
-        return _load_hdf5_multiindex(filepath)
-    except (KeyError, ValueError, TypeError, ImportError):
-        pass
+        return _load_hdf5_multiindex(filepath, key=key)
+    except (KeyError, ValueError, TypeError, ImportError) as pandas_err:
+        if key is not None:
+            raise
+        pandas_error = pandas_err
 
     default_field_map = {
         "ids": "ids",
@@ -340,19 +357,39 @@ def load_hdf5(
         "positions": "positions",
         "velocities": "velocities",
         "masses": "masses",
+        "radii": "radii",
+        "startypes": "startypes",
     }
     if field_map is not None:
         default_field_map.update(field_map)
     fmap = default_field_map
 
     with h5py.File(filepath, "r") as f:
-        if fmap["positions"] in f:
-            return _load_hdf5_single(f, fmap)
-        else:
-            return _load_hdf5_snapshots(f, fmap)
+        root = f[key] if key is not None else f
+
+        if fmap["positions"] in root:
+            return _load_hdf5_single(root, fmap)
+
+        snap_groups = [
+            k for k in root.keys()
+            if k.startswith("snapshot") or k.startswith("snap_")
+        ]
+        if snap_groups:
+            return _load_hdf5_snapshots(root, fmap)
+
+        where = f"key {key!r}" if key is not None else "the top level"
+        raise ValueError(
+            f"HDF5 file '{filepath}' has no recognized ScatterView layout at "
+            f"{where}. Expected one of:\n"
+            f"  1. A pandas multi-index DataFrame (pass key= to select among "
+            f"multiple datasets)\n"
+            f"  2. A '{fmap['positions']}' dataset\n"
+            f"  3. Groups named 'snapshot*' or 'snap_*'\n"
+            f"Pandas load error was: {pandas_error}"
+        )
 
 
-def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
+def _load_hdf5_multiindex(filepath: Path, key: str | None = None) -> SimulationData:
     """Load from a pandas HDF5 table with multi-index (time, ID).
 
     Expected format: DataFrame written with ``df.to_hdf(path, key=...)``
@@ -375,7 +412,7 @@ def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
     Returns:
         SimulationData with all fields populated.
     """
-    df = pd.read_hdf(filepath)
+    df = pd.read_hdf(filepath) if key is None else pd.read_hdf(filepath, key=key)
 
     if not isinstance(df.index, pd.MultiIndex) or df.index.nlevels < 2:
         raise ValueError("HDF5 file does not contain a multi-index DataFrame")
@@ -438,8 +475,12 @@ def _load_hdf5_multiindex(filepath: Path) -> SimulationData:
     for raw_pid in raw_ids:
         pid_key = id_to_key[raw_pid]
 
-        # Slice this particle's data directly from the multi-index
-        particle_df = df.xs(raw_pid, level=1)
+        # Slice this particle's data directly from the multi-index, then
+        # reindex against the global times so that any (time, pid) rows the
+        # user omitted appear as NaN. This makes row omission semantically
+        # equivalent to NaN sentinels — the loader treats both as "particle
+        # absent at this timestep" and records the gap in valid_intervals.
+        particle_df = df.xs(raw_pid, level=1).reindex(times)
 
         pos_x = particle_df[x_col].values.astype(float)
         pos_y = particle_df[y_col].values.astype(float)
@@ -509,15 +550,24 @@ def _load_hdf5_single(f, fmap: dict[str, str]) -> SimulationData:
 
     has_vel = fmap["velocities"] in f
     has_mass = fmap["masses"] in f
+    has_rad = fmap["radii"] in f
+    has_kst = fmap["startypes"] in f
 
-    particle_ids = np.sort(np.unique(ids))
+    # Row order in pos_data / vel_data / mass_data / rad_data / kst_data is the
+    # user's intended particle order: row i is the trajectory of particle ids[i].
+    # Preserve it.
+    particle_ids = np.asarray(ids)
     positions = {}
     velocities = {} if has_vel else None
     masses = {} if has_mass else None
+    radii = {} if has_rad else None
+    startypes = {} if has_kst else None
     valid_intervals = {}
 
     vel_data = f[fmap["velocities"]][:] if has_vel else None
     mass_data = f[fmap["masses"]][:] if has_mass else None
+    rad_data = f[fmap["radii"]][:] if has_rad else None
+    kst_data = f[fmap["startypes"]][:] if has_kst else None
 
     for idx, pid in enumerate(particle_ids):
         pid_key = int(pid)
@@ -537,6 +587,12 @@ def _load_hdf5_single(f, fmap: dict[str, str]) -> SimulationData:
                 # Scalar mass per particle, broadcast across valid times
                 masses[pid_key] = np.full(valid_mask.sum(), mass_data[idx])
 
+        if has_rad and radii is not None and rad_data is not None:
+            radii[pid_key] = float(rad_data[idx])
+
+        if has_kst and startypes is not None and kst_data is not None:
+            startypes[pid_key] = int(kst_data[idx])
+
         valid_intervals[pid_key] = _compute_valid_intervals(times, valid_mask)
 
     return SimulationData(
@@ -545,6 +601,8 @@ def _load_hdf5_single(f, fmap: dict[str, str]) -> SimulationData:
         positions=positions,
         velocities=velocities,
         masses=masses,
+        radii=radii,
+        startypes=startypes,
         valid_intervals=valid_intervals,
     )
 
@@ -583,6 +641,15 @@ def _load_hdf5_snapshots(f, fmap: dict[str, str]) -> SimulationData:
         n_particles = first[fmap["positions"]].shape[0]
         particle_ids = np.arange(n_particles)
 
+    # Per-snapshot static per-particle data (radii, startypes) — values come
+    # from inside each snapshot group, aligned to that snapshot's `ids`. Each
+    # is collapsed to a single scalar per particle by recording the first value
+    # encountered as we iterate snapshots in time order.
+    has_rad = fmap["radii"] in first
+    has_kst = fmap["startypes"] in first
+    radii = {} if has_rad else None
+    startypes = {} if has_kst else None
+
     n_snaps = len(snap_groups)
     n_particles = len(particle_ids)
 
@@ -617,6 +684,10 @@ def _load_hdf5_snapshots(f, fmap: dict[str, str]) -> SimulationData:
         pos = g[fmap["positions"]][:]
         snap_ids = g[fmap["ids"]][:] if fmap["ids"] in g else np.arange(pos.shape[0])
 
+        # Read static per-particle datasets if present in this snapshot
+        snap_rad = g[fmap["radii"]][:] if (radii is not None and fmap["radii"] in g) else None
+        snap_kst = g[fmap["startypes"]][:] if (startypes is not None and fmap["startypes"] in g) else None
+
         for pi, pid in enumerate(snap_ids):
             idx = pid_to_idx.get(int(pid))
             if idx is not None:
@@ -629,6 +700,12 @@ def _load_hdf5_snapshots(f, fmap: dict[str, str]) -> SimulationData:
                         all_mass[idx, si] = float(m[()])
                     else:
                         all_mass[idx, si] = m[pi]
+
+                pid_int = int(pid)
+                if snap_rad is not None and pid_int not in radii:
+                    radii[pid_int] = float(snap_rad[pi])
+                if snap_kst is not None and pid_int not in startypes:
+                    startypes[pid_int] = int(snap_kst[pi])
 
     # Sort by time
     sort_idx = np.argsort(times)
@@ -666,5 +743,7 @@ def _load_hdf5_snapshots(f, fmap: dict[str, str]) -> SimulationData:
         positions=positions,
         velocities=velocities,
         masses=masses,
+        radii=radii,
+        startypes=startypes,
         valid_intervals=valid_intervals,
     )

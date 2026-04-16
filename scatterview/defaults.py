@@ -12,19 +12,20 @@ ANIM_SPEED = 0.01              # fraction of total sim duration advanced per sec
 
 # --- Appearance ---
 POINT_ALPHA = 1.0              # particle opacity (0 = invisible, 1 = opaque)
-TRAIL_ALPHA = 0.6              # peak trail opacity (at the head / newest point)
+TRAIL_ALPHA = 0.85             # peak trail opacity (at the head / newest point)
 TRAIL_LENGTH_FRAC = 0.005      # trail window as fraction of total simulation time
 
 # --- Particle sizing ---
-RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode (screen pixels)
-RELATIVE_SIZE_MAX_PX = 20.0    # largest particle in relative mode (screen pixels)
-DEFAULT_SIZE_PX = 10.0         # uniform size when no radii are provided
+RELATIVE_SIZE_MIN_PX = 3.0     # smallest particle in relative mode (screen pixels);
+                               # other particles scale up proportionally to cbrt(radius)
+DEFAULT_SIZE_PX = 10.0         # uniform size when no radii are provided, and the
+                               # per-particle pixel size used by the "Equal Sizes" toggle
 DEPTH_SCALING = False          # if True, closer particles appear larger (perspective)
 
 # --- Camera ---
 CAMERA_FOV = 45                # field of view in degrees
 ROTATION_SPEED = 0.5           # auto-rotate: degrees of azimuth per frame
-FRAMING_FRACTION = 0.90        # framed particles stay within this fraction
+FRAMING_FRACTION = 0.95        # framed particles stay within this fraction
                                # of the screen's vertical half-extent
 ZOOM_MEMORY_FRAMES = 60        # rolling-average window for framing radius (frames)
                                # camera distance tracks the mean radius over this
@@ -47,16 +48,17 @@ LIGHT_COLOR = "white"
 LIGHT_POSITION = (-0.5, -0.3, 1.0)  # world-space direction, upper-left offset from camera
 
 # --- Window ---
-WINDOW_WIDTH = 1280
-WINDOW_HEIGHT = 720
-SUBVIEW_FOV = 60
+WINDOW_WIDTH = 1920
+WINDOW_HEIGHT = 1080
 
 # --- Video export ---
-VIDEO_DURATION = 10.0          # default export duration in seconds
-VIDEO_FPS = 30                 # default export frame rate
+VIDEO_DURATION = 60.0          # default export duration in seconds
+VIDEO_FPS = 60                 # default export frame rate
+VIDEO_WIDTH = 2560             # default export width in pixels
+VIDEO_HEIGHT = 1440            # default export height in pixels
 
 # --- Trail refinement ---
-REFINE_ANGLE_DEG = 3.0         # maximum chord angle (degrees) between consecutive
+REFINE_ANGLE_DEG = 3.6         # maximum chord angle (degrees) between consecutive
                                # trail points; segments exceeding this get subdivided
                                # during precomputation
 

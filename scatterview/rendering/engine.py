@@ -341,6 +341,7 @@ class RenderEngine:
         self._radius_scale = 1.0
         self._per_particle_scale = np.ones(n, dtype=np.float32)
         self._depth_scaling = D.DEPTH_SCALING
+        self._equal_sizes = False   # toggle: render every particle at a uniform size
 
         if data.radii is not None:
             self._raw_radii = np.array(
@@ -428,6 +429,10 @@ class RenderEngine:
         self._subview_trail_alpha = D.TRAIL_ALPHA
         self._subview_point_alpha = D.POINT_ALPHA
         self._subview_depth_scaling = D.DEPTH_SCALING
+        # Bi-directional azimuth/elevation link between main and sub-view.
+        self._subview_lock_orientation = True
+        self._subview_lock_last_az = None
+        self._subview_lock_last_el = None
 
         # Main particle / trail / star pygfx objects (built later)
         self._particle_visual = None       # pygfx.Points (regular particles, Gaussian blobs)
@@ -718,14 +723,20 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _compute_relative_base_sizes(self) -> np.ndarray:
+        """Map particle radii to screen-pixel sizes.
+
+        Cube root compresses the dynamic range (proportional to
+        volume^(1/3)).  The smallest particle is pinned to ``MIN_PX``;
+        larger particles scale up proportionally with no upper cap, so
+        true mass ratios remain visible.
+        """
         n = len(self._data.particle_ids)
         if self._raw_radii is not None:
             compressed = np.cbrt(self._raw_radii)
-            max_c = compressed.max()
-            if max_c > 0:
-                normalized = compressed / max_c
-                rng = D.RELATIVE_SIZE_MAX_PX - D.RELATIVE_SIZE_MIN_PX
-                return (D.RELATIVE_SIZE_MIN_PX + normalized * rng).astype(np.float32)
+            positive = compressed[compressed > 0]
+            if positive.size > 0:
+                min_c = positive.min()
+                return (compressed / min_c * D.RELATIVE_SIZE_MIN_PX).astype(np.float32)
         return np.full(n, D.DEFAULT_SIZE_PX, dtype=np.float32)
 
     def _compute_absolute_base_sizes(self) -> np.ndarray:
@@ -742,7 +753,13 @@ class RenderEngine:
         return np.full(n, 2.0 * default_r, dtype=np.float32)
 
     def _recompute_sizes(self) -> None:
-        base = self._base_sizes_absolute if self._sizing_absolute else self._base_sizes_relative
+        if self._equal_sizes:
+            n = len(self._base_sizes_relative)
+            uniform = (self._base_sizes_absolute.mean()
+                       if self._sizing_absolute else D.DEFAULT_SIZE_PX)
+            base = np.full(n, uniform, dtype=np.float32)
+        else:
+            base = self._base_sizes_absolute if self._sizing_absolute else self._base_sizes_relative
         self._sizes = base * self._radius_scale * self._per_particle_scale
 
     # ------------------------------------------------------------------
@@ -1272,6 +1289,8 @@ class RenderEngine:
             self._camera_controller.update(self._current_sim_time, positions, mask)
         if self._subview_camera_controller is not None and self._subview_enabled:
             self._subview_camera_controller.update(self._current_sim_time, positions, mask)
+            if self._subview_lock_orientation:
+                self._sync_subview_orientation()
 
         self._upload_particle_frame(positions, mask)
         self._update_trails(self._current_sim_time, positions, mask)
@@ -1425,6 +1444,65 @@ class RenderEngine:
             return
         self._depth_scaling = enabled
         self._rebuild_particle_visual()
+
+    def set_equal_sizes(self, enabled: bool) -> None:
+        """Render every particle at a uniform size (ignores per-particle radii)."""
+        if enabled == self._equal_sizes:
+            return
+        self._equal_sizes = enabled
+        self._recompute_sizes()
+
+    def set_subview_depth_scaling(self, enabled: bool) -> None:
+        """Toggle perspective depth scaling on the sub-view markers."""
+        self._subview_depth_scaling = enabled
+        if self._subview_markers is not None:
+            self._subview_markers.scaling = "visual" if enabled else False
+
+    def set_subview_lock_orientation(self, enabled: bool) -> None:
+        """Bi-directionally link main and sub-view azimuth/elevation."""
+        self._subview_lock_orientation = enabled
+        # Re-seed the cache so the first post-toggle frame treats both
+        # cameras as already in sync (avoids a spurious snap).
+        self._subview_lock_last_az = None
+        self._subview_lock_last_el = None
+
+    def _sync_subview_orientation(self) -> None:
+        """Mirror rotations between main and sub-view cameras.
+
+        Whichever camera moved since the last sync wins; the other is
+        updated to match.  Handles drags on either view and auto-rotate
+        on either controller.
+        """
+        if self._subview_camera is None:
+            return
+        main_cam = self._view_camera
+        sub_cam = self._subview_camera
+        main_az, main_el = main_cam.azimuth, main_cam.elevation
+        sub_az, sub_el = sub_cam.azimuth, sub_cam.elevation
+
+        last_az = self._subview_lock_last_az
+        last_el = self._subview_lock_last_el
+        if last_az is None or last_el is None:
+            target_az, target_el = main_az, main_el
+        else:
+            main_moved = (main_az != last_az) or (main_el != last_el)
+            sub_moved = (sub_az != last_az) or (sub_el != last_el)
+            if main_moved:
+                target_az, target_el = main_az, main_el
+            elif sub_moved:
+                target_az, target_el = sub_az, sub_el
+            else:
+                target_az, target_el = main_az, main_el
+
+        if (main_az, main_el) != (target_az, target_el):
+            main_cam.azimuth = target_az
+            main_cam.elevation = target_el
+        if (sub_az, sub_el) != (target_az, target_el):
+            sub_cam.azimuth = target_az
+            sub_cam.elevation = target_el
+
+        self._subview_lock_last_az = target_az
+        self._subview_lock_last_el = target_el
 
     def set_black_hole(self, pid: int, is_bh: bool = True) -> None:
         idx = self._id_to_idx.get(pid)
@@ -1580,12 +1658,12 @@ class RenderEngine:
             "layout": layout, "pos": (sx, sy), "size": (sw, sh),
         }
 
-        # Sub-view camera
+        # Sub-view camera — shares the main view's FOV
         self._subview_pygfx_camera = gfx.PerspectiveCamera(
-            fov=D.SUBVIEW_FOV, aspect=max(sw, 1) / max(sh, 1),
+            fov=D.CAMERA_FOV, aspect=max(sw, 1) / max(sh, 1),
         )
         self._subview_camera = PygfxTurntableCamera(
-            self._subview_pygfx_camera, fov=D.SUBVIEW_FOV,
+            self._subview_pygfx_camera, fov=D.CAMERA_FOV,
             azimuth=0.0, elevation=30.0, distance=10.0,
         )
 
@@ -1773,8 +1851,18 @@ class RenderEngine:
         fps: int = D.VIDEO_FPS, size: tuple[int, int] | None = None,
         t_start: float | None = None, t_end: float | None = None,
         progress_callback=None,
+        codec: str = "libx264",
+        codec_options: dict | None = None,
     ) -> None:
-        """Render the simulation to a video file."""
+        """Render the simulation to a video file.
+
+        Args:
+            codec: ffmpeg encoder name (``libx264``, ``h264_nvenc``,
+                ``hevc_nvenc``, ...).  Falls back to libx264 on stream
+                init failure.
+            codec_options: ffmpeg stream options dict (preset, crf/cq,
+                rc, ...).  Per-codec defaults apply when omitted.
+        """
         import av
 
         t0 = t_start if t_start is not None else self._t_min
@@ -1787,6 +1875,15 @@ class RenderEngine:
         container = av.open(str(filepath), mode="w")
         stream = None
 
+        def _open_stream(chosen_codec: str, w: int, h: int):
+            s = container.add_stream(chosen_codec, rate=fps)
+            s.width = w
+            s.height = h
+            s.pix_fmt = "yuv420p"
+            if codec_options:
+                s.options = dict(codec_options)
+            return s
+
         try:
             for i, t in enumerate(frame_sim_times):
                 self._current_sim_time = float(t)
@@ -1796,10 +1893,15 @@ class RenderEngine:
 
                 if stream is None:
                     h, w = img.shape[:2]
-                    stream = container.add_stream("libx264", rate=fps)
-                    stream.width = w
-                    stream.height = h
-                    stream.pix_fmt = "yuv420p"
+                    try:
+                        stream = _open_stream(codec, w, h)
+                    except Exception:
+                        # Fall back to libx264 if the requested codec
+                        # (e.g. NVENC) fails to initialize.
+                        if codec != "libx264":
+                            stream = _open_stream("libx264", w, h)
+                        else:
+                            raise
 
                 frame = av.VideoFrame.from_ndarray(img, format="rgba")
                 for packet in stream.encode(frame):
