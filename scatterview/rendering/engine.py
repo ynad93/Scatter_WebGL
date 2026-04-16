@@ -379,6 +379,7 @@ class RenderEngine:
         self._star_max_particle_dist = 1.0
         self._star_shell_factor = D.STAR_SHELL_FACTOR
         self._star_min_shell_radius = 1.0
+        self._star_positions_dirty = True  # re-upload positions only on change
 
         # Black hole markers
         self._is_bh = np.zeros(n, dtype=bool)
@@ -395,8 +396,10 @@ class RenderEngine:
         # wall-clock inside the draw callback so playback speed stays
         # decoupled from render rate.  Keyboard pan/rotate and sim
         # advancement also happen inside the callback.
+        # max_fps=120 lifts the throttle so 120 Hz / 144 Hz monitors see
+        # smoother motion; vsync still caps at the monitor refresh.
         self._canvas_raw = QRenderCanvas(
-            size=size, title=title, update_mode="continuous", max_fps=60, vsync=True,
+            size=size, title=title, update_mode="continuous", max_fps=120, vsync=True,
         )
         self._canvas = _CanvasAdapter(self._canvas_raw)
         self._renderer = gfx.WgpuRenderer(self._canvas_raw)
@@ -493,6 +496,8 @@ class RenderEngine:
         # World-space light direction (unit vector)
         _lw = np.array(D.LIGHT_POSITION, dtype=np.float64)
         self._light_world = _lw / np.linalg.norm(_lw)
+        self._light_eye = (0.0, 0.0, 1.0)
+        self._light_eye_last = None  # cache to skip redundant uniform writes
 
         # Build initial visuals
         self._build_visuals()
@@ -1185,21 +1190,16 @@ class RenderEngine:
         )
         combined_colors[:, 3] = alpha_table[alpha_index] * self._trail_alpha
 
-        # Upload to pygfx — resize GPU buffer if needed.
+        # Upload to pygfx — resize GPU buffer if needed.  draw_range
+        # clips rendering to [0, total_pts) so we only need to upload the
+        # valid range; slots beyond total_pts won't be drawn.
         self._ensure_trail_geom(max(total_pts, 1))
         pos_buf = self._trail_geom.positions
         col_buf = self._trail_geom.colors
         pos_buf.data[:total_pts] = combined_pos
         col_buf.data[:total_pts] = combined_colors
-        # Zero out positions beyond the valid range so stray line segments
-        # aren't drawn to arbitrary previous values.  (We adjust draw_range
-        # below to actually stop drawing there.)
-        if total_pts < self._trail_gpu_capacity:
-            pos_buf.data[total_pts:] = 0.0
-            col_buf.data[total_pts:, 3] = 0.0
-        pos_buf.update_range(0, self._trail_gpu_capacity)
-        col_buf.update_range(0, self._trail_gpu_capacity)
-        # draw_range limits rendering to just the live vertices.
+        pos_buf.update_range(0, total_pts)
+        col_buf.update_range(0, total_pts)
         self._trail_geom.positions.draw_range = (0, total_pts)
         self._trail_line.visible = True
 
@@ -1215,11 +1215,8 @@ class RenderEngine:
             sc = self._subview_trail_geom.colors
             sp.data[:total_pts] = combined_pos
             sc.data[:total_pts] = sub_colors
-            if total_pts < self._trail_gpu_capacity:
-                sp.data[total_pts:] = 0.0
-                sc.data[total_pts:, 3] = 0.0
-            sp.update_range(0, self._trail_gpu_capacity)
-            sc.update_range(0, self._trail_gpu_capacity)
+            sp.update_range(0, total_pts)
+            sc.update_range(0, total_pts)
             self._subview_trail_geom.positions.draw_range = (0, total_pts)
             self._subview_trail_line.visible = True
 
@@ -1228,15 +1225,21 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _update_stars(self) -> None:
+        # Star positions only change when the shell radius changes
+        # (driven by the particle extent).  Skip GPU upload otherwise.
+        if not self._star_positions_dirty:
+            return
         np.multiply(self._star_directions, self._star_min_shell_radius,
                     out=self._star_positions)
+        n = len(self._star_positions)
         geom = self._star_visual.geometry
         geom.positions.data[:] = self._star_positions
-        geom.positions.update_range(0, len(self._star_positions))
+        geom.positions.update_range(0, n)
         if self._subview_stars is not None:
             sg = self._subview_stars.geometry
             sg.positions.data[:] = self._star_positions
-            sg.positions.update_range(0, len(self._star_positions))
+            sg.positions.update_range(0, n)
+        self._star_positions_dirty = False
 
     # ------------------------------------------------------------------
     # Frame update
@@ -1285,12 +1288,19 @@ class RenderEngine:
         eye_y = y * self._cos_el + z * self._sin_el
         eye_z = -y * self._sin_el + z * self._cos_el
         inv_norm = 1.0 / math.sqrt(x * x + eye_y * eye_y + eye_z * eye_z)
-        self._light_eye = (x * inv_norm, eye_y * inv_norm, eye_z * inv_norm)
+        new_light = (x * inv_norm, eye_y * inv_norm, eye_z * inv_norm)
+
+        # Skip GPU uniform write when direction hasn't changed (camera
+        # static + paused → steady light direction).
+        if new_light == self._light_eye_last:
+            return
+        self._light_eye = new_light
+        self._light_eye_last = new_light
 
         if self._particle_material is not None:
-            self._particle_material.light_dir = self._light_eye
+            self._particle_material.light_dir = new_light
         if self._subview_markers is not None and self._subview_markers._material is not None:
-            self._subview_markers._material.light_dir = self._light_eye
+            self._subview_markers._material.light_dir = new_light
 
     def _update_frame(self) -> None:
         """Compute one frame's state (no GPU present yet)."""
@@ -1626,6 +1636,7 @@ class RenderEngine:
         self._star_min_shell_radius = max(
             self._star_max_particle_dist * self._star_shell_factor, 1.0,
         )
+        self._star_positions_dirty = True
 
     def set_star_count(self, count: int) -> None:
         self._star_count = max(100, int(count))
