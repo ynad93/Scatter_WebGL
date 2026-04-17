@@ -307,6 +307,14 @@ class RenderEngine:
         self._canvas.events.key_release.connect(self._on_key_release)
         self._canvas.events.resize.connect(self._on_canvas_resize)
 
+        # _update_frame runs on the draw event (i.e. whenever the canvas
+        # is asked to repaint).  The timer requests repaints while
+        # playing; user-facing state changes request repaints via
+        # canvas.update() (directly or through VisPy visual updates).
+        # When paused and nothing has changed, no paints are scheduled
+        # and Qt's main thread is free for GUI interaction.
+        self._canvas.events.draw.connect(self._on_draw)
+
         # Keyboard pan/rotate: track which keys are held for smooth continuous movement
         self._pan_keys_held: set[str] = set()
         self._ctrl_held = False
@@ -1004,10 +1012,16 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def _on_timer(self, event) -> None:
-        """Advance animation and render a frame.
+        """Advance playback state and request a repaint.
+
+        The timer owns time-advance and held-key processing only.  The
+        heavy per-frame work (spline eval, GPU upload, lighting) runs
+        in _on_draw, triggered by canvas.update() below.  When paused
+        with no keys held we request no repaint at all — Qt's main
+        thread stays free for GUI interaction.
 
         Args:
-            event: VisPy timer event with `dt` attribute (seconds since last tick).
+            event: VisPy timer event with `dt` attribute.
         """
         if self._playing:
             dt = event.dt if hasattr(event, "dt") else 1.0 / 60.0
@@ -1017,8 +1031,16 @@ class RenderEngine:
                 self._trail_si[:] = -1
                 self._trail_ei[:] = -1
             self._current_sim_time = self._t_min + self._anim_time * self._time_range
+
+        if not self._playing and not self._pan_keys_held:
+            return
+
         self._apply_keyboard_pan()
         self._apply_keyboard_rotate()
+        self._canvas.update()
+
+    def _on_draw(self, _event) -> None:
+        """Canvas draw handler — runs _update_frame once per scheduled paint."""
         self._update_frame()
 
     def _update_light_direction(self) -> None:
@@ -1040,11 +1062,14 @@ class RenderEngine:
             self._subview_markers.light_position = light
 
     def _update_frame(self) -> None:
+        # Called from the canvas draw event, so we update visual data
+        # and return; calling canvas.update() here would schedule an
+        # immediate repaint and loop forever.  Callers that need a
+        # repaint request one via self._canvas.update().
         self._cache_camera_trig()
 
         positions, mask = self._interp.evaluate_batch(self._current_sim_time)
         if not mask.any():
-            self._canvas.update()
             return
 
         self._update_light_direction()
@@ -1084,8 +1109,6 @@ class RenderEngine:
             if text != self._time_text.text:
                 self._time_text.text = text
 
-        self._canvas.update()
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -1106,7 +1129,7 @@ class RenderEngine:
     def sim_time(self, value: float) -> None:
         self._current_sim_time = np.clip(value, self._t_min, self._t_max)
         self._anim_time = (self._current_sim_time - self._t_min) / self._time_range
-        self._update_frame()
+        self._canvas.update()
 
     @property
     def playing(self) -> bool:
@@ -1372,7 +1395,7 @@ class RenderEngine:
     # ------------------------------------------------------------------
 
     def enable_stars(self, enabled: bool = True) -> None:
-        """Toggle the background star field.
+        """Toggle the background star field in both main view and sub-view.
 
         Args:
             enabled: If True, show a spherical shell of background stars.
@@ -1397,6 +1420,24 @@ class RenderEngine:
             self._star_visual.order = -10
         if self._star_visual is not None:
             self._star_visual.visible = enabled
+
+        # Mirror the change into the sub-view (if one exists).  Create
+        # the sub-view star visual lazily when turning stars on after
+        # the sub-view was built without them.
+        if self._subview is not None:
+            if enabled and self._subview_star_visual is None and self._star_positions is not None:
+                self._subview_star_visual = scene.Markers(
+                    parent=self._subview.scene,
+                )
+                self._subview_star_visual.set_data(
+                    pos=self._star_positions,
+                    face_color=self._star_base_colors,
+                    size=self._star_base_sizes,
+                    edge_width=0,
+                )
+                self._subview_star_visual.order = -10
+            if self._subview_star_visual is not None:
+                self._subview_star_visual.visible = enabled
 
     def set_star_shell_factor(self, factor: float) -> None:
         """Set the star field shell radius as a multiple of the max particle distance.
@@ -1595,6 +1636,17 @@ class RenderEngine:
         self._timer.start()
         app.run()
 
+    def request_update(self) -> None:
+        """Schedule a repaint of the canvas.
+
+        Call this after mutating state that affects rendering but
+        doesn't go through a VisPy visual's ``set_data`` — e.g. camera
+        controller options like n_framed, framing fraction, center
+        mode.  Visual property setters (colors, sizes, alphas) already
+        trigger a repaint via VisPy's visual update mechanism.
+        """
+        self._canvas.update()
+
     def close(self) -> None:
         """Stop the frame timer and release the canvas.
 
@@ -1610,6 +1662,7 @@ class RenderEngine:
         self._canvas.events.key_press.disconnect(self._on_key_press)
         self._canvas.events.key_release.disconnect(self._on_key_release)
         self._canvas.events.resize.disconnect(self._on_canvas_resize)
+        self._canvas.events.draw.disconnect(self._on_draw)
         self._canvas.close()
 
     @contextlib.contextmanager

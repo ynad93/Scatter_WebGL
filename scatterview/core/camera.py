@@ -40,6 +40,7 @@ class CameraController:
         events=None,
         particle_ids: np.ndarray | None = None,
     ):
+        self._view = view
         self._camera = view.camera
         self._events = events or []
 
@@ -135,6 +136,7 @@ class CameraController:
     @mode.setter
     def mode(self, value: CameraMode) -> None:
         self._mode = value
+        self._camera.view_changed()
 
     @property
     def auto_rotate(self) -> bool:
@@ -143,6 +145,7 @@ class CameraController:
     @auto_rotate.setter
     def auto_rotate(self, value: bool) -> None:
         self._auto_rotate_enabled = value
+        self._camera.view_changed()
 
     @property
     def rotation_speed(self) -> float:
@@ -151,6 +154,7 @@ class CameraController:
     @rotation_speed.setter
     def rotation_speed(self, value: float) -> None:
         self._rotation_speed = value
+        self._camera.view_changed()
 
     @property
     def target_particle(self) -> int | None:
@@ -162,6 +166,7 @@ class CameraController:
         # Flag for the next update to jump to the target group
         # instead of slowly chasing from the current camera position
         self._target_needs_acquisition = pid is not None
+        self._camera.view_changed()
 
     @property
     def n_framed(self) -> int:
@@ -171,6 +176,7 @@ class CameraController:
     def n_framed(self, value: int) -> None:
         self._n_framed = max(1, value)
         self._target_needs_acquisition = True
+        self._camera.view_changed()
 
     @property
     def keep_all_in_frame(self) -> bool:
@@ -180,6 +186,7 @@ class CameraController:
     def keep_all_in_frame(self, value: bool) -> None:
         self._keep_all_in_frame = value
         self._target_needs_acquisition = True
+        self._camera.view_changed()
 
     @property
     def free_zoom(self) -> bool:
@@ -192,6 +199,7 @@ class CameraController:
         self._free_zoom = value
         for cb in self._free_zoom_callbacks:
             cb(value)
+        self._camera.view_changed()
 
     @property
     def use_group_center(self) -> bool:
@@ -201,6 +209,7 @@ class CameraController:
     def use_group_center(self, value: bool) -> None:
         self._use_group_center = value
         self._target_needs_acquisition = True
+        self._camera.view_changed()
 
     @property
     def mass_weighted_center(self) -> bool:
@@ -210,6 +219,7 @@ class CameraController:
     def mass_weighted_center(self, value: bool) -> None:
         self._mass_weighted_center = value
         self._target_needs_acquisition = True
+        self._camera.view_changed()
 
     @property
     def event_tracking(self) -> bool:
@@ -218,6 +228,40 @@ class CameraController:
     @event_tracking.setter
     def event_tracking(self, value: bool) -> None:
         self._event_tracking_enabled = value
+        self._camera.view_changed()
+
+    @property
+    def framing_fraction(self) -> float:
+        return self._framing_fraction
+
+    @framing_fraction.setter
+    def framing_fraction(self, value: float) -> None:
+        self._framing_fraction = value
+        self._cache_fov_trig()
+        self._camera.view_changed()
+
+    @property
+    def pan_deadzone_fraction(self) -> float:
+        return self._pan_deadzone_fraction
+
+    @pan_deadzone_fraction.setter
+    def pan_deadzone_fraction(self, value: float) -> None:
+        self._pan_deadzone_fraction = value
+        self._camera.view_changed()
+
+    @property
+    def zoom_memory_frames(self) -> int:
+        return self._zoom_memory_frames
+
+    @zoom_memory_frames.setter
+    def zoom_memory_frames(self, value: int) -> None:
+        n = max(1, int(value))
+        avg = self._smoothed_framing_radius
+        self._zoom_memory_frames = n
+        self._radius_ring = np.full(n, avg, dtype=np.float64)
+        self._radius_ring_sum = avg * n
+        self._radius_ring_idx = 0
+        self._camera.view_changed()
 
     # --- Core update ---
 
@@ -410,20 +454,42 @@ class CameraController:
     def _cache_fov_trig(self) -> None:
         """Recompute cached FOV-derived trig values.
 
-        Called once at init and whenever framing_fraction changes.
+        Caches only the vertical-FOV half-angle — the aspect-ratio
+        dependent parts are evaluated on demand in ``_tan_half_min_fov``
+        so they track viewport resizes without needing explicit
+        invalidation.
         """
-        half_fov = np.radians(self._camera.fov / 2)
-        self._tan_half_fov = np.tan(half_fov)
-        effective_angle = half_fov * self._framing_fraction
-        self._inv_tan_effective_fov = 1.0 / np.tan(effective_angle)
+        self._half_vert_fov = np.radians(self._camera.fov / 2)
+        self._tan_half_vert_fov = float(np.tan(self._half_vert_fov))
+
+    def _tan_half_min_fov(self) -> float:
+        """Tangent of the smaller half-FOV (vertical vs. horizontal).
+
+        TurntableCamera's ``fov`` is the vertical FOV.  The horizontal
+        half-FOV is ``atan(tan(half_vfov) * aspect)``.  Framing that
+        fits the full framed sphere on screen must use the *tighter*
+        of the two, otherwise particles spill off the narrow axis
+        (which is exactly what happens in a Split Left | Right sub-view:
+        the sub-view is narrower than it is tall, so horizontal is the
+        binding constraint).
+        """
+        vw, vh = self._view.size
+        if vh <= 0 or vw <= 0:
+            return self._tan_half_vert_fov
+        aspect = vw / vh
+        tan_half_horiz = self._tan_half_vert_fov * aspect
+        return min(self._tan_half_vert_fov, tan_half_horiz)
 
     def _ideal_distance(self, framing_radius: float) -> float:
         """Camera distance that places the farthest framed particle at
-        the framing fraction of the screen's vertical half-extent.
+        the framing fraction of the screen's smaller half-extent.
 
         Uses ``tan`` (not ``sin``) because the framing radius is a
         projected (on-screen-plane) distance, so the relationship is
-        ``tan(θ) = r / d``.
+        ``tan(θ) = r / d``.  Using the smaller of vertical/horizontal
+        half-FOV (adjusted for the viewport's aspect ratio) keeps the
+        framed group on screen regardless of viewport shape — critical
+        for split-screen sub-views.
 
         Args:
             framing_radius: Maximum effective projected distance from
@@ -432,7 +498,8 @@ class CameraController:
         Returns:
             Camera distance in world units.
         """
-        return framing_radius * self._inv_tan_effective_fov
+        tan_effective = self._tan_half_min_fov() * self._framing_fraction
+        return framing_radius / tan_effective
 
     def _compute_framing_radius(self, positions: np.ndarray, center: np.ndarray) -> float:
         """Maximum 3D distance from center to any framed particle.
@@ -469,7 +536,7 @@ class CameraController:
         Returns:
             (3,) updated smoothed camera center.
         """
-        visible_radius = float(self._camera.distance) * self._tan_half_fov
+        visible_radius = float(self._camera.distance) * self._tan_half_min_fov()
         deadzone_radius = visible_radius * self._pan_deadzone_fraction
 
         offset = target_position - self._smoothed_center

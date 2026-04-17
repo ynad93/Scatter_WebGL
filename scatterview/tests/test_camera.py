@@ -56,18 +56,45 @@ def _make_synthetic_data(
 
 
 class _FakeCamera:
-    """Minimal mock for VisPy TurntableCamera."""
+    """Minimal mock for VisPy TurntableCamera.
+
+    The real camera stores state in _center / _distance and exposes
+    matching public properties that update the same underlying value.
+    The controller writes to _center / _distance directly and calls
+    view_changed(); tests read via .center / .distance, so mirror the
+    public/private mapping.
+    """
     def __init__(self):
         self.fov = 45
-        self.center = (0, 0, 0)
-        self.distance = 10.0
+        self._center = (0, 0, 0)
+        self._distance = 10.0
         self.azimuth = 0.0
+
+    @property
+    def center(self):
+        return self._center
+
+    @center.setter
+    def center(self, value):
+        self._center = value
+
+    @property
+    def distance(self):
+        return self._distance
+
+    @distance.setter
+    def distance(self, value):
+        self._distance = value
+
+    def view_changed(self):
+        pass
 
 
 class _FakeView:
     """Minimal mock for VisPy ViewBox."""
     def __init__(self):
         self.camera = _FakeCamera()
+        self.size = (1280, 720)
 
 
 class TestFraming:

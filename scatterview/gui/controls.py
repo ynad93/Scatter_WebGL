@@ -327,6 +327,9 @@ class ControlPanel:
         slider.setValue(to_slider(value))
         if tooltip:
             slider.setToolTip(tooltip)
+        # Stash the current real value so callers can read the slider's
+        # logical value without duplicating the (log/linear) mapping.
+        slider._real_value = float(value)
 
         val_box = QtWidgets.QLineEdit(f"{value:.3g}")
         val_box.setFixedWidth(60)
@@ -334,6 +337,7 @@ class ControlPanel:
 
         def on_slider_change(v):
             real_val = to_real(v)
+            slider._real_value = float(real_val)
             val_box.blockSignals(True)
             val_box.setText(f"{real_val:.3g}")
             val_box.blockSignals(False)
@@ -345,6 +349,7 @@ class ControlPanel:
             except ValueError:
                 return
             real_val = max(min_val, min(max_val, real_val))
+            slider._real_value = float(real_val)
             slider.blockSignals(True)
             slider.setValue(to_slider(real_val))
             slider.blockSignals(False)
@@ -749,8 +754,8 @@ class ControlPanel:
 
         # Pan deadzone: fraction of visible radius where the center holds still
         self._add_slider(
-            section, "Pan Deadzone", 0.1, 0.8, self._camera._pan_deadzone_fraction,
-            lambda v: setattr(self._camera, "_pan_deadzone_fraction", v),
+            section, "Pan Deadzone", 0.1, 0.8, self._camera.pan_deadzone_fraction,
+            lambda v: setattr(self._camera, "pan_deadzone_fraction", v),
             tooltip="Panning deadzone as a fraction of the visible radius.\n"
                     "The camera center holds still while the tracked point\n"
                     "is within this fraction of the screen from center.\n"
@@ -817,8 +822,7 @@ class ControlPanel:
         Args:
             value: New framing fraction in [0, 1].
         """
-        self._camera._framing_fraction = value
-        self._camera._cache_fov_trig()
+        self._camera.framing_fraction = value
 
     def _on_zoom_memory_change(self, value: float) -> None:
         """Resize the rolling-average ring buffer for zoom memory.
@@ -826,14 +830,7 @@ class ControlPanel:
         Args:
             value: New window length in frames.
         """
-        n = max(1, int(value))
-        cam = self._camera
-        # Preserve the current average when resizing
-        avg = cam._smoothed_framing_radius
-        cam._zoom_memory_frames = n
-        cam._radius_ring = np.full(n, avg, dtype=np.float64)
-        cam._radius_ring_sum = avg * n
-        cam._radius_ring_idx = 0
+        self._camera.zoom_memory_frames = value
 
     def _on_center_mode_change(self, text: str) -> None:
         """Update camera center mode from the combo box selection.
@@ -1022,7 +1019,7 @@ class ControlPanel:
         section.addLayout(row)
 
         # Framed count
-        self._add_slider(
+        self._subview_framed_slider = self._add_slider(
             section, "Framed", 1, n_particles, n_particles,
             lambda v: self._set_subview_n_framed(int(v)),
             steps=max(1, n_particles - 1),
@@ -1063,21 +1060,21 @@ class ControlPanel:
         self._subview_lock_cb.toggled.connect(self._engine.set_subview_lock_orientation)
         section.addWidget(self._subview_lock_cb)
 
-        self._add_slider(
+        self._subview_rot_speed_slider = self._add_slider(
             section, "Rot. Speed", 0.0, 5.0, _D.ROTATION_SPEED,
             self._set_subview_rotation_speed,
             tooltip="Auto-rotation speed in degrees of azimuth per frame.",
         )
 
         # Pan deadzone
-        self._add_slider(
+        self._subview_pan_deadzone_slider = self._add_slider(
             section, "Pan Deadzone", 0.1, 0.8, _D.PAN_DEADZONE_FRACTION,
             self._set_subview_pan_deadzone,
             tooltip="Panning deadzone fraction for the sub-view camera.",
         )
 
         # Framing %
-        self._add_slider(
+        self._subview_framing_fraction_slider = self._add_slider(
             section, "Framing %", 0.3, 1.0, _D.FRAMING_FRACTION,
             self._on_subview_framing_fraction_change,
             tooltip="Fraction of the screen's vertical half-extent\n"
@@ -1086,7 +1083,7 @@ class ControlPanel:
 
         # Zoom memory (independent of main view)
         self._subview_zoom_memory_frames = _D.ZOOM_MEMORY_FRAMES
-        self._add_slider(
+        self._subview_zoom_memory_slider = self._add_slider(
             section, "Zoom Memory", 10, 600, _D.ZOOM_MEMORY_FRAMES,
             self._on_subview_zoom_memory_change,
             tooltip="Rolling-average window (frames) for the sub-view zoom.\n"
@@ -1104,14 +1101,14 @@ class ControlPanel:
         section.addWidget(self._subview_depth_cb)
 
         # Point alpha
-        self._add_slider(
+        self._subview_point_alpha_slider = self._add_slider(
             section, "Point Alpha", 0.0, 1.0, _D.POINT_ALPHA,
             self._set_subview_point_alpha,
             tooltip="Particle opacity in the sub-view.",
         )
 
         # Radius scale
-        self._add_slider(
+        self._subview_radius_scale_slider = self._add_slider(
             section, "Radius Scale", 0.1, 10.0, 1.0,
             self._set_subview_radius_scale, log=True,
             tooltip="Global size multiplier for sub-view particles.",
@@ -1126,18 +1123,7 @@ class ControlPanel:
         if enabled:
             layout = self._layout_combo.currentText()
             self._engine.enable_subview(layout=layout)
-            # Apply all saved settings to the fresh controller.
-            # Target must be set before mode so acquisition framing
-            # uses the correct reference particle.
-            self._on_subview_target_change(self._subview_target_combo.currentText())
-            self._on_subview_mode_change(self._subview_mode_combo.currentText())
-            self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
-            self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
-            self._on_subview_zoom_memory_change(self._subview_zoom_memory_frames)
-            self._on_subview_free_zoom_toggle(self._subview_free_zoom_cb.isChecked())
-            ctrl = self._engine._subview_camera_controller
-            if ctrl is not None:
-                ctrl._free_zoom_callbacks.append(self._on_subview_free_zoom_changed)
+            self._apply_all_subview_settings()
         else:
             self._engine.disable_subview()
 
@@ -1146,15 +1132,34 @@ class ControlPanel:
         if self._subview_cb.isChecked():
             self._engine.disable_subview()
             self._engine.enable_subview(layout=text)
-            self._on_subview_target_change(self._subview_target_combo.currentText())
-            self._on_subview_mode_change(self._subview_mode_combo.currentText())
-            self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
-            self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
-            self._on_subview_zoom_memory_change(self._subview_zoom_memory_frames)
-            self._on_subview_free_zoom_toggle(self._subview_free_zoom_cb.isChecked())
-            ctrl = self._engine._subview_camera_controller
-            if ctrl is not None:
-                ctrl._free_zoom_callbacks.append(self._on_subview_free_zoom_changed)
+            self._apply_all_subview_settings()
+
+    def _apply_all_subview_settings(self) -> None:
+        """Push every sub-view widget's current value into the fresh controller/visuals.
+
+        enable_subview builds a new CameraController and new visuals with
+        defaults; this resyncs them with whatever the GUI is currently
+        showing so toggling the sub-view off and on preserves settings.
+        Order matters: target before mode so acquisition framing uses
+        the right reference particle.
+        """
+        self._on_subview_target_change(self._subview_target_combo.currentText())
+        self._on_subview_mode_change(self._subview_mode_combo.currentText())
+        self._on_subview_center_change(self._subview_center_combo.currentText())
+        self._set_subview_n_framed(int(self._subview_framed_slider._real_value))
+        self._set_subview_rotation_speed(self._subview_rot_speed_slider._real_value)
+        self._set_subview_pan_deadzone(self._subview_pan_deadzone_slider._real_value)
+        self._on_subview_framing_fraction_change(self._subview_framing_fraction_slider._real_value)
+        self._on_subview_zoom_memory_change(self._subview_zoom_memory_slider._real_value)
+        self._on_subview_rotate_toggle(self._subview_rotate_cb.isChecked())
+        self._on_subview_depth_toggle(self._subview_depth_cb.isChecked())
+        self._on_subview_free_zoom_toggle(self._subview_free_zoom_cb.isChecked())
+        self._set_subview_point_alpha(self._subview_point_alpha_slider._real_value)
+        self._set_subview_radius_scale(self._subview_radius_scale_slider._real_value)
+        self._engine.set_subview_lock_orientation(self._subview_lock_cb.isChecked())
+        ctrl = self._engine._subview_camera_controller
+        if ctrl is not None:
+            ctrl._free_zoom_callbacks.append(self._on_subview_free_zoom_changed)
 
     def _on_subview_mode_change(self, text: str) -> None:
         """Set the sub-view camera mode.
@@ -1187,7 +1192,7 @@ class ControlPanel:
         """
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
-            ctrl._pan_deadzone_fraction = value
+            ctrl.pan_deadzone_fraction = value
 
     def _set_subview_n_framed(self, n: int) -> None:
         """Set how many particles are framed in the sub-view.
@@ -1250,21 +1255,15 @@ class ControlPanel:
     def _on_subview_framing_fraction_change(self, value: float) -> None:
         ctrl = self._engine._subview_camera_controller
         if ctrl is not None:
-            ctrl._framing_fraction = value
-            ctrl._cache_fov_trig()
+            ctrl.framing_fraction = value
 
     def _on_subview_zoom_memory_change(self, value: float) -> None:
         """Resize the sub-view camera's rolling-average ring buffer."""
         n = max(1, int(value))
         self._subview_zoom_memory_frames = n
         ctrl = self._engine._subview_camera_controller
-        if ctrl is None:
-            return
-        avg = ctrl._smoothed_framing_radius
-        ctrl._zoom_memory_frames = n
-        ctrl._radius_ring = np.full(n, avg, dtype=np.float64)
-        ctrl._radius_ring_sum = avg * n
-        ctrl._radius_ring_idx = 0
+        if ctrl is not None:
+            ctrl.zoom_memory_frames = n
 
     def _set_subview_point_alpha(self, value: float) -> None:
         markers = self._engine._subview_markers
