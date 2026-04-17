@@ -36,8 +36,16 @@ class ControlPanel:
         if self._app is None:
             self._app = QtWidgets.QApplication([])
 
-        # Main window
-        self._window = QtWidgets.QMainWindow()
+        # Main window — subclass to intercept close, so timers and the
+        # VisPy canvas are stopped before Qt destroys the GL widget.
+        panel = self
+
+        class _MainWindow(QtWidgets.QMainWindow):
+            def closeEvent(self, event):
+                panel._on_close()
+                super().closeEvent(event)
+
+        self._window = _MainWindow()
         self._window.setWindowTitle("ScatterView 2.0")
         self._window.resize(1400, 800)
         self._apply_dark_theme()
@@ -1458,6 +1466,11 @@ class ControlPanel:
         if self._engine._timer is not None:
             self._engine._timer.start()
         self._app.exec()
+
+    def _on_close(self) -> None:
+        """Stop timers and release the VisPy canvas before Qt tears it down."""
+        self._sync_timer.stop()
+        self._engine.close()
 
     @property
     def window(self):

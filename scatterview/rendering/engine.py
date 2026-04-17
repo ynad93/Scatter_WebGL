@@ -1595,6 +1595,23 @@ class RenderEngine:
         self._timer.start()
         app.run()
 
+    def close(self) -> None:
+        """Stop the frame timer and release the canvas.
+
+        Must be called before the embedding Qt window is torn down.
+        Otherwise the VisPy timer keeps firing into a destroyed GL widget
+        and the process segfaults during interpreter shutdown.
+        """
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer.disconnect()
+            self._timer = None
+        self._canvas.events.mouse_wheel.disconnect(self._on_mouse_wheel)
+        self._canvas.events.key_press.disconnect(self._on_key_press)
+        self._canvas.events.key_release.disconnect(self._on_key_release)
+        self._canvas.events.resize.disconnect(self._on_canvas_resize)
+        self._canvas.close()
+
     @contextlib.contextmanager
     def _canvas_resized_to(self, size: tuple[int, int] | None):
         """Temporarily spoof the canvas's reported size for offscreen renders.
